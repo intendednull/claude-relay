@@ -15,12 +15,16 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let config_path = cli.resolve_config_path()?;
-    let config = Config::load(&config_path)?;
-    let listen_addr: SocketAddr = config.listen_addr()?;
+    let loaded = Config::load(&config_path)?;
+    let listen_addr: SocketAddr = loaded.config.listen_addr()?;
 
     init_tracing();
 
-    let state = AppState::new(Arc::new(config), cli.capture_errors.clone())?;
+    let state = AppState::new(
+        Arc::new(loaded.config),
+        cli.capture_errors.clone(),
+        loaded.digest,
+    )?;
 
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;

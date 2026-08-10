@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -29,12 +30,33 @@ pub async fn serve(app: Router) -> SocketAddr {
 }
 
 pub async fn serve_relay(base_url: String) -> SocketAddr {
+    serve_relay_with_capture(base_url, None).await
+}
+
+pub async fn serve_relay_with_capture(
+    base_url: String,
+    capture_errors: Option<PathBuf>,
+) -> SocketAddr {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         anthropic: AnthropicConfig { base_url },
     };
-    let state = AppState::new(Arc::new(config), None).expect("failed to build app state");
+    let state = AppState::new(Arc::new(config), capture_errors, "test-digest".to_string())
+        .expect("failed to build app state");
     serve(build_router(state)).await
+}
+
+/// A directory under the OS temp dir that doesn't collide with other tests or
+/// runs; the caller creates it (or lets `Capture::new` create it) as needed.
+pub fn unique_temp_dir(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "relay-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos()
+    ))
 }
 
 /// An address nothing is listening on: bind a port, learn it, then release it.

@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use futures_core::Stream;
 use serde_json::json;
 
+use crate::capture::Capture;
 use crate::state::AppState;
 
 pub async fn forward(State(state): State<AppState>, request: Request) -> Response {
@@ -67,10 +68,23 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
         latency_ms: elapsed_ms(start),
     };
 
+    // 2xx responses are never captured, so they pay no clone/accumulate cost at all.
+    let capture = if status.is_success() {
+        None
+    } else {
+        state.capture.as_ref().map(|capture| PendingCapture {
+            capture: capture.clone(),
+            status,
+            headers: headers.clone(),
+            body: Vec::new(),
+        })
+    };
+
     let body = Body::from_stream(CountingStream {
         inner: Box::pin(upstream.bytes_stream()),
         response_bytes: 0,
         log: Some(log),
+        capture,
     });
 
     let mut response = Response::new(body);
@@ -111,13 +125,26 @@ struct RequestLog {
     latency_ms: u64,
 }
 
+/// A non-2xx response's status/headers plus the body bytes accumulated so far,
+/// so a fixture can be written once the stream ends without holding up any
+/// chunk on its way to the client.
+struct PendingCapture {
+    capture: Capture,
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
 /// Passes upstream bytes straight through, tallying them so the per-request log
 /// line can be emitted once the body ends — including when the client hangs up
-/// early and the stream is dropped mid-flight.
+/// early and the stream is dropped mid-flight. When `capture` is set, each
+/// chunk is also copied into it so a `--capture-errors` fixture can be written
+/// on the same terminal events as the log line, without delaying forwarding.
 struct CountingStream {
     inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
     response_bytes: u64,
     log: Option<RequestLog>,
+    capture: Option<PendingCapture>,
 }
 
 impl CountingStream {
@@ -134,6 +161,15 @@ impl CountingStream {
             "proxied request"
         );
     }
+
+    fn finish_capture(&mut self) {
+        let Some(pending) = self.capture.take() else {
+            return;
+        };
+        pending
+            .capture
+            .write_fixture(pending.status, &pending.headers, &pending.body);
+    }
 }
 
 impl Stream for CountingStream {
@@ -144,16 +180,21 @@ impl Stream for CountingStream {
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 this.response_bytes += chunk.len() as u64;
+                if let Some(pending) = &mut this.capture {
+                    pending.body.extend_from_slice(&chunk);
+                }
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(err))) => {
                 this.emit();
+                this.finish_capture();
                 // Same reason as the handler's error path: whatever renders this
                 // error must not be handed a URL that may carry credentials.
                 Poll::Ready(Some(Err(err.without_url())))
             }
             Poll::Ready(None) => {
                 this.emit();
+                this.finish_capture();
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -164,6 +205,7 @@ impl Stream for CountingStream {
 impl Drop for CountingStream {
     fn drop(&mut self) {
         self.emit();
+        self.finish_capture();
     }
 }
 

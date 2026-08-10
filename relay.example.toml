@@ -1,0 +1,8 @@
+# Milestone 1 config shape. Later milestones add `state_file`,
+# `[profiles.*]`, `[policy]`, `[detect]`, and `[notify]` sections (see
+# docs/spec.md §8) — not implemented yet, so don't add them here.
+
+listen = "127.0.0.1:8484"
+
+[anthropic]
+base_url = "https://api.anthropic.com"
