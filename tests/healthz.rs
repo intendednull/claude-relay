@@ -12,10 +12,7 @@ async fn healthz_returns_200_ok() {
             base_url: "https://api.anthropic.com".to_string(),
         },
     };
-    let state = AppState {
-        config: Arc::new(config),
-        capture_errors: None,
-    };
+    let state = AppState::new(Arc::new(config), None).expect("failed to build app state");
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

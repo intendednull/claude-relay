@@ -20,10 +20,7 @@ async fn main() -> Result<()> {
 
     init_tracing();
 
-    let state = AppState {
-        config: Arc::new(config),
-        capture_errors: cli.capture_errors.clone(),
-    };
+    let state = AppState::new(Arc::new(config), cli.capture_errors.clone())?;
 
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
