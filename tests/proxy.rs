@@ -10,7 +10,7 @@ use axum::response::Response;
 use axum::routing::any;
 use tokio::task::JoinSet;
 
-use common::{closed_port, dripped_body, serve, serve_relay};
+use common::{closed_port, dripped_body, serve, serve_relay, truncated_body};
 
 const MOCK_BODY: &str = r#"{"id":"msg_mock","content":[{"type":"text","text":"hi"}]}"#;
 
@@ -259,6 +259,41 @@ async fn slow_streams_are_served_concurrently() {
     assert!(
         total < Duration::from_millis(1200),
         "10 concurrent slow streams took {total:?}, which looks serialized"
+    );
+}
+
+/// The upstream dying after headers cannot become a 502 — those are already
+/// sent. What must hold is that the client's stream ends in an error rather
+/// than a silent truncation or a hang.
+#[tokio::test]
+async fn upstream_dying_mid_stream_fails_the_client_stream() {
+    let upstream = serve(Router::new().route(
+        "/v1/messages",
+        any(|| async { Response::new(truncated_body("event: a\n")) }),
+    ))
+    .await;
+    let relay = serve_relay(format!("http://{upstream}")).await;
+
+    let mut response = reqwest::Client::new()
+        .post(format!("http://{relay}/v1/messages"))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let first = response
+        .chunk()
+        .await
+        .expect("first chunk should arrive before the upstream dies")
+        .expect("stream ended before the first chunk");
+    assert_eq!(first, "event: a\n".as_bytes());
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), response.chunk())
+        .await
+        .expect("client stream hung after the upstream died");
+    assert!(
+        outcome.is_err(),
+        "a truncated upstream body must surface as a client error, not a clean end: {outcome:?}"
     );
 }
 

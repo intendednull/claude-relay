@@ -148,7 +148,9 @@ impl Stream for CountingStream {
             }
             Poll::Ready(Some(Err(err))) => {
                 this.emit();
-                Poll::Ready(Some(Err(err)))
+                // Same reason as the handler's error path: whatever renders this
+                // error must not be handed a URL that may carry credentials.
+                Poll::Ready(Some(Err(err.without_url())))
             }
             Poll::Ready(None) => {
                 this.emit();

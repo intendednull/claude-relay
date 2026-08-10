@@ -5,6 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
+use axum::body::Body;
+use axum::extract::Request;
+use axum::response::Response;
 use axum::routing::any;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -59,6 +62,26 @@ async fn logs_containing(buffer: &Buffer, needle: &str) -> String {
     );
 }
 
+/// Reports back the secret headers the upstream actually received, so the test
+/// can show they were in flight rather than merely absent from the logs.
+async fn echo_secrets(request: Request) -> Response {
+    let seen = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("<none>")
+            .to_string()
+    };
+
+    Response::builder()
+        .header("x-saw-authorization", seen("authorization"))
+        .header("x-saw-x-api-key", seen("x-api-key"))
+        .header("x-saw-anthropic-beta", seen("anthropic-beta"))
+        .body(Body::from("ok"))
+        .expect("failed to build mock response")
+}
+
 /// One test per binary: the subscriber is process-global, so a second test in
 /// this file would interleave its own output into the buffer.
 #[tokio::test]
@@ -70,7 +93,7 @@ async fn secret_header_values_never_reach_the_logs() {
         .with_ansi(false)
         .init();
 
-    let upstream = serve(Router::new().route("/v1/messages", any(|| async { "ok" }))).await;
+    let upstream = serve(Router::new().route("/v1/messages", any(echo_secrets))).await;
     let relay = serve_relay(format!("http://{upstream}")).await;
     let dead_relay = serve_relay(format!("http://{}", closed_port().await)).await;
 
@@ -90,6 +113,12 @@ async fn secret_header_values_never_reach_the_logs() {
         .await
         .expect("request failed");
     assert_eq!(response.status(), 200);
+
+    // The absence assertions below are only meaningful if the secrets were
+    // really in flight: prove the upstream received all three verbatim first.
+    assert_eq!(response.headers()["x-saw-authorization"], AUTHORIZATION);
+    assert_eq!(response.headers()["x-saw-x-api-key"], API_KEY);
+    assert_eq!(response.headers()["x-saw-anthropic-beta"], BETA);
     response.bytes().await.expect("failed to read body");
 
     let response = authenticated(format!("http://{dead_relay}/v1/messages"))

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::convert::Infallible;
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -65,10 +65,23 @@ pub fn dripped_body(chunks: Vec<&'static str>, delay: Duration) -> Body {
     Body::from_stream(ChannelStream(rx))
 }
 
-struct ChannelStream(mpsc::Receiver<Result<Bytes, Infallible>>);
+/// A response body that delivers one chunk and then fails, so the upstream
+/// connection dies mid-body rather than ending cleanly.
+pub fn truncated_body(chunk: &'static str) -> Body {
+    let (tx, rx) = mpsc::channel(1);
+    tokio::spawn(async move {
+        let _ = tx.send(Ok(Bytes::from_static(chunk.as_bytes()))).await;
+        let _ = tx
+            .send(Err(io::Error::other("mock upstream died mid-body")))
+            .await;
+    });
+    Body::from_stream(ChannelStream(rx))
+}
+
+struct ChannelStream(mpsc::Receiver<Result<Bytes, io::Error>>);
 
 impl Stream for ChannelStream {
-    type Item = Result<Bytes, Infallible>;
+    type Item = Result<Bytes, io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.0.poll_recv(cx)
