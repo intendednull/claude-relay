@@ -59,6 +59,11 @@ three tasks:
    no third party to protect against yet (contrast with the fallback route
    in Milestone 3, which spec §7b requires to strip auth headers — not
    built here).
+8. **Minimize doc comments.** Rustdoc/`///` comments and explanatory blocks
+   only where a WHY is genuinely non-obvious (a subtle invariant, a
+   workaround, something that would surprise a reader) — not on every
+   struct/field/function. This code goes to human review; keep diffs fast
+   to scan, not narrated.
 
 ## Task 1: Project setup, config, CLI, logging skeleton
 
