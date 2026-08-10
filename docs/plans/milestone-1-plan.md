@@ -11,8 +11,9 @@ this milestone), §5 (limit-detection's `--capture-errors` debug flag), §7b
 > direct; subscription billing confirmed intact.
 
 This milestone has **no fallback routing** — every request goes to
-Anthropic. Router/state-machine/failover/translation (spec §4, §6, §7a,
-§7c) are out of scope; do not build toward them ahead of need.
+Anthropic. Router/state-machine/failover/translation/name-based-routing
+(spec §4, §6, §7a, §7c, §7d) are out of scope; do not build toward them
+ahead of need.
 
 ## Global Constraints
 
