@@ -69,8 +69,12 @@ impl Capture {
     }
 }
 
+/// `HeaderMap` iteration yields one entry per *value*, so a repeated header
+/// name (e.g. multiple `Set-Cookie`s) must accumulate rather than overwrite —
+/// a single `.insert()` per name would silently drop all but the last value.
+/// Single-valued headers stay a plain string; repeated ones become an array.
 fn redacted_headers(headers: &HeaderMap) -> Value {
-    let mut map = Map::new();
+    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
     for (name, value) in headers {
         let name = name.as_str();
         let value = if REDACTED_HEADERS.contains(&name) {
@@ -81,8 +85,23 @@ fn redacted_headers(headers: &HeaderMap) -> Value {
                 .unwrap_or("<non-utf8-header-value>")
                 .to_string()
         };
-        map.insert(name.to_string(), Value::String(value));
+        match grouped.iter_mut().find(|(seen, _)| seen == name) {
+            Some((_, values)) => values.push(value),
+            None => grouped.push((name.to_string(), vec![value])),
+        }
     }
+
+    let map = grouped
+        .into_iter()
+        .map(|(name, mut values)| {
+            let value = if values.len() == 1 {
+                Value::String(values.remove(0))
+            } else {
+                Value::Array(values.into_iter().map(Value::String).collect())
+            };
+            (name, value)
+        })
+        .collect();
     Value::Object(map)
 }
 
@@ -112,6 +131,27 @@ mod tests {
         assert_eq!(redacted["cookie"], REDACTED);
         assert_eq!(redacted["retry-after"], "42");
         assert_eq!(redacted["anthropic-ratelimit-requests-remaining"], "10");
+    }
+
+    #[test]
+    fn redacted_headers_preserves_all_values_for_repeated_header_names() {
+        let mut headers = HeaderMap::new();
+        headers.append("set-cookie", HeaderValue::from_static("a=1"));
+        headers.append("set-cookie", HeaderValue::from_static("b=2"));
+        headers.append("x-request-id", HeaderValue::from_static("req-1"));
+        headers.append("x-request-id", HeaderValue::from_static("req-2"));
+
+        let redacted = redacted_headers(&headers);
+
+        assert_eq!(
+            redacted["set-cookie"],
+            serde_json::json!([REDACTED, REDACTED]),
+            "each occurrence of a redacted header must still redact, not just the first"
+        );
+        assert_eq!(
+            redacted["x-request-id"],
+            serde_json::json!(["req-1", "req-2"])
+        );
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

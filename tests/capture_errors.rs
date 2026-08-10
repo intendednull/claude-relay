@@ -35,6 +35,17 @@ async fn ok(_req: Request) -> Response {
         .expect("failed to build mock response")
 }
 
+async fn rate_limited_with_duplicate_headers(_req: Request) -> Response {
+    Response::builder()
+        .status(429)
+        .header("x-request-id", "req-1")
+        .header("x-request-id", "req-2")
+        .header("set-cookie", "a=1")
+        .header("set-cookie", "b=2")
+        .body(Body::from(RATE_LIMITED_BODY))
+        .expect("failed to build mock response")
+}
+
 /// Fixture writing happens after the stream reports its end, which is itself
 /// ordered before the client sees end-of-body — but poll under a small retry
 /// budget anyway, consistent with this repo's other async-completion tests.
@@ -112,6 +123,44 @@ async fn non_2xx_response_writes_a_redacted_fixture() {
     assert_eq!(
         fixture["headers"]["authorization"], "[REDACTED]",
         "authorization value must be redacted even on a response"
+    );
+
+    let _ = std::fs::remove_dir_all(&capture_dir);
+}
+
+#[tokio::test]
+async fn repeated_response_headers_all_survive_in_the_fixture() {
+    let upstream =
+        serve(Router::new().route("/v1/messages", any(rate_limited_with_duplicate_headers))).await;
+    let capture_dir = unique_temp_dir("capture-duplicate-headers-test");
+    let relay =
+        serve_relay_with_capture(format!("http://{upstream}"), Some(capture_dir.clone())).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{relay}/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(response.status(), 429);
+    response
+        .bytes()
+        .await
+        .expect("failed to read response body");
+
+    let fixture_path = wait_for_fixture(&capture_dir).await;
+    let contents = std::fs::read_to_string(&fixture_path).expect("failed to read fixture");
+    let fixture: Value = serde_json::from_str(&contents).expect("fixture is not valid json");
+
+    assert_eq!(
+        fixture["headers"]["x-request-id"],
+        serde_json::json!(["req-1", "req-2"]),
+        "a repeated non-sensitive header must not collapse to its last value"
+    );
+    assert_eq!(
+        fixture["headers"]["set-cookie"],
+        serde_json::json!(["[REDACTED]", "[REDACTED]"]),
+        "a repeated sensitive header must redact every occurrence, not collapse to one"
     );
 
     let _ = std::fs::remove_dir_all(&capture_dir);
