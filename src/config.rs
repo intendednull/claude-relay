@@ -6,12 +6,14 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: String,
     pub anthropic: AnthropicConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnthropicConfig {
     pub base_url: String,
 }
@@ -60,6 +62,34 @@ mod tests {
         let raw = r#"listen = "127.0.0.1:8484""#;
         let err = Config::from_toml_str(raw).expect_err("should fail to parse");
         assert!(err.to_string().contains("anthropic"));
+    }
+
+    #[test]
+    fn unknown_top_level_field_is_a_parse_error() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+            mystery_field = "oops"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+        "#;
+        let err = Config::from_toml_str(raw).expect_err("should fail to parse");
+        assert!(err.to_string().contains("mystery_field"));
+    }
+
+    #[test]
+    fn unplanned_section_is_a_parse_error() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [some_unplanned_section]
+            foo = "bar"
+        "#;
+        let err = Config::from_toml_str(raw).expect_err("should fail to parse");
+        assert!(err.to_string().contains("some_unplanned_section"));
     }
 
     #[test]
