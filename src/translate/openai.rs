@@ -1,0 +1,214 @@
+//! OpenAI chat-completions wire types: what the translator writes on the
+//! request side, and what it reads back on the response side.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::anthropic::null_as_default;
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct ChatRequest {
+    pub model: String,
+    pub messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<Tool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    pub stream: bool,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct Message {
+    pub role: &'static str,
+    /// Always present, `null` included: OpenAI's own documented shape for an
+    /// assistant turn that is nothing but tool calls is `"content": null`.
+    pub content: Content,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+}
+
+impl Message {
+    pub fn new(role: &'static str, content: Content) -> Self {
+        Self {
+            role,
+            content,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<Part>),
+    Null,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Part {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: FunctionDef,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct FunctionDef {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: Value,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(&'static str),
+    Function {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        function: NamedFunction,
+    },
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct NamedFunction {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatCompletion {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub choices: Vec<Choice>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Choice {
+    #[serde(default)]
+    pub message: ResponseMessage,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ResponseMessage {
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub tool_calls: Vec<ResponseToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResponseToolCall {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub function: ResponseFunction,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ResponseFunction {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default)]
+    pub completion_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatCompletionChunk {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub choices: Vec<ChunkChoice>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChunkChoice {
+    #[serde(default)]
+    pub delta: Delta,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct Delta {
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub tool_calls: Vec<ToolCallDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToolCallDelta {
+    /// Which tool call this fragment belongs to, when a turn calls several in
+    /// parallel. Absent on providers that only ever stream one.
+    #[serde(default)]
+    pub index: Option<u32>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub function: Option<FunctionDelta>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct FunctionDelta {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
+}

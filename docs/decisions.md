@@ -211,3 +211,72 @@ in milliseconds is not a bound at all: large enough and `detect::bounded`'s
 `checked_add` returns `None`, silently disabling every marked classification;
 merely huge and `/status` reports `LIMITED` with a `limited_until` too far out
 for RFC3339 to render, which is a stuck route with nothing to read.
+
+## 2026-08-11 — What the OpenAI translator cannot carry, and what it refuses to guess
+
+Milestone 3 Task 2 (`src/translate/`). Spec §7c's table is the contract; this
+records where the table is silent and a choice had to be made. **None of it is
+verified against Together's actual API** — no credential exists in this
+environment (Milestone 3 plan, Global Constraint 10), so every "the provider
+does X" below is generic OpenAI chat-completions behavior, assumed compatible
+because `docs/decisions.md`'s Together entry says the endpoint is
+OpenAI-format. The spec's own requirement — golden-file tests against recorded
+real traffic — is still outstanding and is the thing that would falsify any of
+this.
+
+**Fidelity gaps, in the order they will bite.**
+
+- **`thinking` / `redacted_thinking` blocks are dropped** (spec says to; OpenAI
+  has no equivalent). A `--continue`d session that crossed the boundary loses
+  the assistant's prior reasoning, exactly as spec §11's risk table anticipates.
+  Dropped silently and without error, which is the point — a history full of
+  them must still translate.
+- **`is_error` on a `tool_result` is dropped.** OpenAI's `role: "tool"` message
+  has no failure flag; the error text itself still reaches the model as the
+  message content.
+- **An image returned inside a `tool_result` moves.** A tool message's content
+  is a string, so the image cannot ride inside it; it is carried into the user
+  message that follows the tool results instead. The alternative was to drop it,
+  which loses a screenshot the model was meant to look at.
+- **Tool results are reordered ahead of text that shared their turn.** OpenAI
+  requires `role: "tool"` messages to follow the assistant turn that made the
+  calls with nothing in between, so a turn holding both cannot keep its original
+  order.
+- **`top_k`, `metadata`, and `tool_choice.disable_parallel_tool_use` are
+  dropped.** No OpenAI equivalent for the first two;
+  `parallel_tool_calls: false` exists for the third but is not sent, on the same
+  reasoning as `stream_options` below.
+- **Object key order inside tool-call arguments is not preserved.**
+  `serde_json`'s `Map` is a `BTreeMap` here, so re-encoding an Anthropic
+  `tool_use.input` as an OpenAI `arguments` string sorts its keys. JSON says
+  that is the same document and the round-trip test asserts semantic equality
+  for that reason. It only affects history sent *upstream*: a tool call coming
+  *back* streams through as raw fragments and is never re-encoded.
+
+**Refusals, i.e. where a wrong guess would be silent corruption.** A content
+block type the table has no row for (`document`, a server-tool block), a tool
+with no `input_schema` (Anthropic's server-side tools), a tool call whose
+arguments are not a JSON object, and a streamed tool call that never carries a
+function name or an id — all fail loudly rather than translating into something
+plausible. The asymmetry is deliberate: a dropped `document` block is invisible,
+while a failed request says why.
+
+**`stream_options: {"include_usage": true}` is deliberately not sent.** It is
+how OpenAI asks for token counts on a streamed response, and without it the
+synthesized `message_delta` reports whatever usage the provider volunteers, or
+zeroes. Sending an unknown parameter to a provider that rejects unknown
+parameters would break *every* streamed request; the cost of omitting it is a
+cosmetic token count. If Together turns out to accept it, this is a one-line
+change worth making.
+
+**A failed fallback stream ends cleanly, with an `error` event.** Spec §6 says a
+mid-stream failure terminates the stream with an error event. That only works if
+the body then ends *properly*: an earlier version propagated the upstream error
+to axum after emitting the event, and the client never received the event at all
+— the aborted body discarded it (observed in `tests/translate_stream.rs`, not
+assumed). So `translate::sse_stream` yields an infallible stream: every failure
+becomes an in-band Anthropic `error` event. The upstream error object therefore
+does not come back out of the translator, and its text is never interpolated
+into the event either, since a `reqwest` error can carry the upstream URL and a
+profile's `base_url` is a place a credential could hide. A caller wanting the
+error's details in its logs should inspect the upstream stream on the way in.

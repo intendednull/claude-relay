@@ -9,6 +9,7 @@ pub mod route_updates;
 pub mod router;
 pub mod state;
 pub mod status;
+pub mod translate;
 
 use axum::Router;
 use axum::routing::{any, get};
