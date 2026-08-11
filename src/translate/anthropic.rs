@@ -107,13 +107,22 @@ const KNOWN_BLOCK_TYPES: [&str; 6] = [
     "redacted_thinking",
 ];
 
+/// The two block types whose payload carries the tool-call linkage the
+/// provider validates. A `tool_use` missing its id, or a `tool_result` missing
+/// the id it answers, cannot be replaced by a note: the message it pairs with
+/// would be left referring to a call that no longer exists, and the provider
+/// rejects *that* with an error far less legible than this one. Every other
+/// block is ordinary content and degrades instead.
+const LINKAGE_BLOCK_TYPES: [&str; 2] = ["tool_use", "tool_result"];
+
 impl Block {
-    /// Whether the mapping table has no row for this block type at all, as
-    /// opposed to a type it does map that failed to parse or turned up where
-    /// it cannot appear. Only the former degrades to a placeholder; the rest
-    /// are malformed requests and fail.
-    pub fn is_unmappable_type(&self) -> bool {
-        matches!(self, Block::Unknown(_)) && !KNOWN_BLOCK_TYPES.contains(&self.type_name())
+    /// Whether this block can be replaced by a placeholder rather than failing
+    /// the request. True for anything that did not parse into a modelled shape
+    /// — a type with no row in the table *and* a type that has one but arrived
+    /// in a shape this translator does not model (an `image` sourced from
+    /// Anthropic's Files API, say) — except the linkage types above.
+    pub fn is_unmappable(&self) -> bool {
+        matches!(self, Block::Unknown(_)) && !LINKAGE_BLOCK_TYPES.contains(&self.type_name())
     }
 
     /// Why this block could not be translated, for the error message. A block
@@ -143,7 +152,7 @@ impl Block {
             Block::Unknown(value) => value
                 .get("type")
                 .and_then(Value::as_str)
-                .unwrap_or("<no type field>"),
+                .unwrap_or("untyped"),
         }
     }
 }

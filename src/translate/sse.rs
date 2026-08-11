@@ -254,6 +254,9 @@ impl SseTranslator {
             }
         }
         self.tool_bytes += retained;
+        if !self.retained_within_cap(out) {
+            return;
+        }
         if self.tools.len() > MAX_TOOL_SLOTS {
             self.fail(
                 "upstream opened more parallel tool calls than the relay will track",
@@ -307,12 +310,20 @@ impl SseTranslator {
             .pending
             .push_str(fragment);
         self.tool_bytes += fragment.len();
-        if self.tool_bytes > BUFFER_CAP {
-            self.fail(
-                "upstream tool call arguments exceeded the relay's buffer cap",
-                out,
-            );
+        self.retained_within_cap(out);
+    }
+
+    /// Fails the stream when the slots retain more than the cap allows.
+    /// Called from *every* path that grows `tool_bytes`, not just the buffered
+    /// arguments: ids and names are retained exactly as arguments are, and a
+    /// run of frames carrying a large id and no arguments would otherwise
+    /// never reach a check at all.
+    fn retained_within_cap(&mut self, out: &mut Vec<u8>) -> bool {
+        if self.tool_bytes <= BUFFER_CAP {
+            return true;
         }
+        self.fail("upstream tool calls exceeded the relay's buffer cap", out);
+        false
     }
 
     /// Opens `slot`'s `tool_use` block and replays whatever it buffered. The
@@ -1206,6 +1217,40 @@ mod tests {
                     tool_chunk(json!({
                         "index": index, "id": format!("call_{index}"),
                         "function": {"name": "Bash", "arguments": filler},
+                    }))
+                    .as_bytes(),
+                ),
+            );
+            if translator.is_done() {
+                break;
+            }
+        }
+
+        let events = events(&out);
+        assert_eq!(events.last().unwrap().0, "error");
+        assert!(
+            events.last().unwrap().1["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("buffer cap"),
+            "unexpected: {:?}",
+            events.last().unwrap().1
+        );
+    }
+
+    /// The cap has to hold on the paths that grow the total *without* buffering
+    /// arguments: ids and names are retained the same way, and a frame carrying
+    /// only a large id never reaches the buffered-arguments path at all.
+    #[test]
+    fn ids_and_names_alone_are_bounded_in_aggregate() {
+        let mut translator = SseTranslator::new();
+        let mut out = Vec::new();
+        let long_id = "i".repeat(1024 * 1024);
+        for index in 0..8u32 {
+            out.extend(
+                translator.push(
+                    tool_chunk(json!({
+                        "index": index, "id": format!("{long_id}{index}"),
                     }))
                     .as_bytes(),
                 ),

@@ -74,7 +74,7 @@ fn system_text(system: &SystemPrompt) -> Result<Option<String>> {
                     Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {
                         note_dropped_thinking(block)
                     }
-                    other if other.is_unmappable_type() => texts.push(dropped_block_note(other)),
+                    other if other.is_unmappable() => texts.push(dropped_block_note(other)),
                     other => bail!("{} block in the system prompt", other.problem()),
                 }
             }
@@ -122,7 +122,7 @@ fn user_messages(content: &MessageContent) -> Result<Vec<Message>> {
             Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {
                 note_dropped_thinking(block)
             }
-            other if other.is_unmappable_type() => parts.push(Part::Text {
+            other if other.is_unmappable() => parts.push(Part::Text {
                 text: dropped_block_note(other),
             }),
             other => bail!("{} block in a user message", other.problem()),
@@ -169,7 +169,7 @@ fn assistant_message(content: &MessageContent) -> Result<Message> {
             Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {
                 note_dropped_thinking(block)
             }
-            other if other.is_unmappable_type() => texts.push(dropped_block_note(other)),
+            other if other.is_unmappable() => texts.push(dropped_block_note(other)),
             other => bail!("{} block in an assistant message", other.problem()),
         }
     }
@@ -200,7 +200,7 @@ fn tool_result_content(content: Option<&ToolResultContent>) -> Result<(String, V
                     Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {
                         note_dropped_thinking(block)
                     }
-                    other if other.is_unmappable_type() => texts.push(dropped_block_note(other)),
+                    other if other.is_unmappable() => texts.push(dropped_block_note(other)),
                     other => bail!("{} block in a tool_result", other.problem()),
                 }
             }
@@ -216,14 +216,32 @@ fn tool_result_content(content: Option<&ToolResultContent>) -> Result<(String, V
 /// session the fallback route exists to rescue. A block type the table does
 /// cover still fails, because that is a malformed request rather than a gap.
 fn dropped_block_note(block: &Block) -> String {
+    let block_type = safe_type_name(block.type_name());
     tracing::warn!(
-        block_type = block.type_name(),
+        block_type,
         "dropping a content block with no OpenAI equivalent"
     );
     format!(
-        "[relay: a {:?} content block was dropped here; the fallback provider has no equivalent]",
-        block.type_name()
+        "[relay: a {block_type:?} content block was dropped here; \
+         the fallback provider has no equivalent]"
     )
+}
+
+/// A block's `type` is client-controlled and unbounded, and this one reaches
+/// both a log line and text the model reads, so it is clipped to something a
+/// type name could plausibly be before either sees it.
+fn safe_type_name(name: &str) -> String {
+    const MAX_TYPE_NAME: usize = 64;
+    let clipped: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .take(MAX_TYPE_NAME)
+        .collect();
+    if clipped.is_empty() {
+        "unnamed".to_string()
+    } else {
+        clipped
+    }
 }
 
 /// Dropping these is spec §7c's instruction rather than a surprise, and a
@@ -231,7 +249,7 @@ fn dropped_block_note(block: &Block) -> String {
 /// where the other drop is `warn`.
 fn note_dropped_thinking(block: &Block) {
     tracing::debug!(
-        block_type = block.type_name(),
+        block_type = safe_type_name(block.type_name()),
         "dropping a thinking block, which OpenAI has no equivalent for"
     );
 }
@@ -573,6 +591,29 @@ mod tests {
     }
 
     #[test]
+    fn a_recovered_image_follows_the_text_that_may_be_referring_to_it() {
+        let out = translate(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_01", "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "AAAA",
+                    }},
+                ]},
+                {"type": "text", "text": "the screenshot above shows the bug"},
+            ]}],
+        }));
+
+        assert_eq!(
+            out["messages"][1]["content"],
+            json!([
+                {"type": "text", "text": "the screenshot above shows the bug"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ]),
+            "the turn's own text has to come first for its reference to make sense"
+        );
+    }
+
+    #[test]
     fn an_empty_tool_result_becomes_empty_string_content() {
         let out = translate(json!({
             "messages": [{"role": "user", "content": [
@@ -738,6 +779,81 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("search_result")
+        );
+    }
+
+    /// The same defect as an unknown block type, reached through the other
+    /// door: `image` *is* in the table, but this source shape is not modelled
+    /// (Anthropic's Files API), so it lands in `Unknown` under a known name.
+    /// Failing on it would break the session just as permanently.
+    #[test]
+    fn a_known_block_type_in_an_unmodelled_shape_also_becomes_a_placeholder() {
+        let out = translate(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is in this?"},
+                {"type": "image", "source": {"type": "file", "file_id": "file_abc"}},
+            ]}],
+        }));
+
+        let content = out["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("[relay: a \"image\" content block was dropped here"),
+            "unexpected content: {content}"
+        );
+    }
+
+    /// The linkage types are the exception: replacing one with a note leaves
+    /// the message it pairs with referring to a call that no longer exists,
+    /// which the provider rejects far less legibly than this does.
+    #[test]
+    fn a_malformed_tool_use_or_tool_result_still_fails_rather_than_degrading() {
+        let missing_name = error(json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_01", "input": {}},
+            ]}],
+        }));
+        assert!(
+            missing_name.contains("malformed \"tool_use\""),
+            "unexpected error: {missing_name}"
+        );
+
+        let missing_link = error(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "content": "orphaned"},
+            ]}],
+        }));
+        assert!(
+            missing_link.contains("malformed \"tool_result\""),
+            "unexpected error: {missing_link}"
+        );
+    }
+
+    #[test]
+    fn a_placeholder_never_carries_the_dropped_blocks_payload() {
+        let out = translate(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "some_new_block", "data": "secret-token-value", "url": "s3://bucket"},
+            ]}],
+        }));
+        let content = out["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            !content.contains("secret-token-value") && !content.contains("s3://bucket"),
+            "the note must name the type and nothing else: {content}"
+        );
+        assert!(content.contains("some_new_block"));
+    }
+
+    #[test]
+    fn a_hostile_block_type_reaches_the_model_clipped_and_stripped() {
+        let out = translate(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": format!("{}\n\ninjected instruction", "x".repeat(500))},
+            ]}],
+        }));
+        let content = out["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            !content.contains("injected instruction") && content.len() < 200,
+            "unbounded client text reached the note: {content}"
         );
     }
 

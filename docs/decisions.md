@@ -229,15 +229,19 @@ this.
 - **`thinking` / `redacted_thinking` blocks are dropped** (spec says to; OpenAI
   has no equivalent). A `--continue`d session that crossed the boundary loses
   the assistant's prior reasoning, exactly as spec §11's risk table anticipates.
-  Dropped silently and without error, which is the point — a history full of
-  them must still translate.
+  Dropped without failing the request, which is the point — a history full of
+  them must still translate — and logged at `debug` rather than `warn`, since a
+  thinking-enabled session carries them in every turn and a `warn` per block
+  would teach the operator to ignore the level the real gaps are reported at.
 - **`is_error` on a `tool_result` is dropped.** OpenAI's `role: "tool"` message
   has no failure flag; the error text itself still reaches the model as the
   message content.
 - **An image returned inside a `tool_result` moves.** A tool message's content
   is a string, so the image cannot ride inside it; it is carried into the user
   message that follows the tool results instead. The alternative was to drop it,
-  which loses a screenshot the model was meant to look at.
+  which loses a screenshot the model was meant to look at. It lands *after* that
+  turn's own text rather than before, because the text is the part liable to be
+  referring to it ("the screenshot above shows…").
 - **Tool results are reordered ahead of text that shared their turn.** OpenAI
   requires `role: "tool"` messages to follow the assistant turn that made the
   calls with nothing in between, so a turn holding both cannot keep its original
@@ -262,20 +266,46 @@ cover arriving malformed or somewhere it cannot appear — all fail loudly rathe
 than translating into something plausible. Each is a tool contract this
 translator cannot honour halfway.
 
-**Amended after review: a content block type the table has no row for does
-*not* fail.** It was in the list above, on the reasoning that a failed request
-says why while a dropped block is invisible. That missed where such a block
-lives: a `document` (a read PDF) or a `server_tool_use`/`web_search_tool_result`
-(Claude Code's WebSearch) sits in the conversation *history*, so failing on it
-breaks not just the request carrying it but every later request in that session
-— permanently, and starting the moment Anthropic rate-limits the user, which is
+**Amended after review: a content block this translator cannot map does *not*
+fail.** That covers both a `type` with no row in the table at all and a `type`
+that has one but arrived in a shape this translator does not model — an `image`
+sourced from Anthropic's Files API rather than base64 or a URL. The second door
+reaches the same defect as the first and was missed on the first attempt at
+this.
+
+Failing was in the list above, on the reasoning that a failed request says why
+while a dropped block is invisible. That missed where such a block lives: a
+`document` (a read PDF) or a `server_tool_use`/`web_search_tool_result` (Claude
+Code's WebSearch) sits in the conversation *history*, so failing on it breaks
+not just the request carrying it but every later request in that session —
+permanently, and starting the moment Anthropic rate-limits the user, which is
 the session the fallback exists to rescue. It also was not the two-way choice it
 looked like. Such a block now becomes a placeholder text block (`[relay: a
 "document" content block was dropped here; …]`) plus a `tracing::warn!` naming
 the type: visible to the model and to the operator, without making a session
-un-fallback-able. Dropped `thinking` blocks log at `debug` rather than `warn` —
-they are spec §7c's own instruction, and a thinking-enabled session carries them
-in every turn.
+un-fallback-able. The type name is client-controlled, so it is clipped and
+stripped to a plausible identifier before it reaches either the note or the log.
+
+**`tool_use` and `tool_result` are the two exceptions.** A malformed one of
+those still fails, because a note cannot stand in for it: the message it pairs
+with is left referring to a call that no longer exists, and the provider rejects
+*that* with an error far less legible than this one. Every other block type is
+ordinary content, and content degrades.
+
+**Still open — the same defect through a third door, deliberately not changed
+here.** An Anthropic *server tool* in the request's `tools` array —
+`{"type": "web_search_20250305", "name": "web_search"}`, which Claude Code sends
+on every request when WebSearch is enabled — has no `input_schema`, and that
+still fails the translation outright. It is the reviewed and twice-confirmed
+decision for tool-contract violations, but it has exactly the property this
+amendment exists to remove: `tools` is re-sent on *every* request, so a session
+with WebSearch enabled can never reach the fallback route at all. Dropping such a
+tool instead would now be coherent — the matching `server_tool_use` history
+blocks degrade to placeholders, so nothing is left dangling, and the provider
+could not have served the tool regardless. Left alone rather than widened
+unilaterally, because this is the one case where "fail loudly" and "never strand
+a session" genuinely conflict and the call is not the implementer's to make
+quietly.
 
 **One tool call streams at a time; the rest wait, buffered.** Anthropic allows a
 single open content block, and OpenAI's `delta.tool_calls` is an array precisely
