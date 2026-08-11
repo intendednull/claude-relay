@@ -54,8 +54,14 @@ Copy these verbatim into every task reviewer's context:
 4. **Stack:** no new heavyweight dependency without a stated reason. State
    persistence is a small JSON file (`serde_json`, already a dependency) —
    do not add a database or embedded KV store for this. A file-execution
-   notifier hook uses `tokio::process::Command` (already available via
-   tokio) — no new process-spawning crate.
+   notifier hook spawns a process — no new process-spawning crate needed
+   either way (`std::process::Command` needs nothing extra; `tokio::process::Command`
+   would require enabling tokio's `process` and `time` features, which
+   Milestone 1's `Cargo.toml` does not have — this text originally assumed
+   they were already on, which was wrong; Task 3 correctly used
+   `std::process::Command` on its own thread instead, avoiding both the new
+   features and a tokio-runtime dependency in the otherwise runtime-free
+   state machine).
 5. **Config additions** (extending Milestone 1's `Config`/`AnthropicConfig`
    subset): `state_file` (optional top-level string), `[detect]` (rule
    data — status/body-matcher/reset-extraction, format TBD by Task 2's
@@ -186,8 +192,11 @@ transition. A 2xx response while `Probing` flips to `Active`.
 
 Depends on Task 1 (state transition events to notify on).
 
-- Exec hook: `notify.command` from config, invoked via
-  `tokio::process::Command` on state transitions. Events per spec §4:
+- Exec hook: `notify.command` from config, invoked as a subprocess on state
+  transitions (as landed: `std::process::Command` on the notifier's own
+  thread — see Global Constraint 4's note; the transition hook point runs
+  on a plain thread with no tokio runtime, so a tokio-based approach would
+  have needed extra plumbing for no benefit). Events per spec §4:
   `failover_engaged` (fires on `Active -> Limited`, with `reset_at`) and
   `recovered` (fires on `-> Active` from a non-`Active` state). (spec §4
   also lists `fallback_error` — that event requires an actual fallback
