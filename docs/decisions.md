@@ -257,14 +257,15 @@ this.
   for that reason. It only affects history sent *upstream*: a tool call coming
   *back* streams through as raw fragments and is never re-encoded.
 
-**Refusals, i.e. where a wrong guess would be silent corruption.** A tool with
-no `input_schema` (Anthropic's server-side tools), a tool call whose arguments
-are not a JSON object, a streamed tool call that never carries a function name
-or an id, a call resuming after its content block closed, an upstream tool-call
-`index` with no successor left in `u32`, and a block of a type the table *does*
-cover arriving malformed or somewhere it cannot appear — all fail loudly rather
-than translating into something plausible. Each is a tool contract this
-translator cannot honour halfway.
+**Refusals, i.e. where a wrong guess would be silent corruption.** A tool call
+whose arguments are not a JSON object, a streamed tool call that never carries a
+function name or an id, a call resuming after its content block closed, an
+upstream tool-call `index` with no successor left in `u32`, and a block of a
+type the table *does* cover arriving malformed or somewhere it cannot appear —
+all fail loudly rather than translating into something plausible. Each is a tool
+contract this translator cannot honour halfway. (A tool *definition* with no
+`input_schema` was on this list and is not any more — see the resolution
+below.)
 
 **Amended after review: a content block this translator cannot map does *not*
 fail.** That covers both a `type` with no row in the table at all and a `type`
@@ -323,10 +324,28 @@ an OpenAI-format provider does not validate historical `tool_calls` in the
 message history against the current `tools` list. That is how OpenAI's own API
 behaves; Together is assumed to match, like everything else in this module.
 
-If dropping every tool empties the list, `tool_choice` is dropped with it — some
-providers reject a `tool_choice` with nothing to choose from. Only when *this*
-removed the last tool: a client that sent a `tool_choice` and no tools to begin
-with still gets it forwarded, exactly as before.
+A `tool_choice` the remaining tools can no longer satisfy is dropped with them:
+either because the list is now empty, or because the choice names a specific
+function that did not survive. Both are requests OpenAI-format providers reject
+by contract, and dropping a tool is what newly makes either reachable. Only what
+*this* broke is compensated for — a `tool_choice` naming a tool the client never
+sent, or arriving with no tools at all, was already the client's own doing and is
+forwarded unchanged, since the proxy does not validate requests on the provider's
+behalf.
+
+**Where the "nothing refers to a tool definition" reasoning does not fully
+reach.** It holds for `web_search`, whose calls appear as `server_tool_use`
+blocks that degrade to placeholders. Anthropic's *client-executed* tools —
+`computer_*`, `bash_*`, `text_editor_*` — are different: they also carry no
+`input_schema`, so their definitions are dropped too, but they are invoked
+through ordinary `tool_use`/`tool_result` blocks, which translate into a real
+`tool_calls` entry naming a tool the outgoing `tools` list no longer offers. That
+is fine under the assumption recorded above (a provider does not validate
+historical calls against the current list) and is exactly what
+`a_prior_call_to_a_dropped_tool_still_translates_intact` pins down — but if that
+assumption turns out false for Together, this tool family is the case that breaks
+and the test that would need to change. Not live today: Claude Code's own Bash /
+Read / Edit tools are ordinary schema-carrying tools, not this family.
 
 **One tool call streams at a time; the rest wait, buffered.** Anthropic allows a
 single open content block, and OpenAI's `delta.tool_calls` is an array precisely

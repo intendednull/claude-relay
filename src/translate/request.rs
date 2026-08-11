@@ -51,8 +51,11 @@ fn convert(request: MessagesRequest, target_model: &str, stream: bool) -> Result
     }
 
     let tools = tools(&request.tools);
-    let dropped_every_tool = !request.tools.is_empty() && tools.is_empty();
-    let tool_choice = request.tool_choice.as_ref().and_then(tool_choice);
+    let tool_choice = request
+        .tool_choice
+        .as_ref()
+        .and_then(tool_choice)
+        .filter(|choice| still_satisfiable(choice, &request.tools, &tools));
     Ok(ChatRequest {
         model: target_model.to_string(),
         messages,
@@ -61,11 +64,7 @@ fn convert(request: MessagesRequest, target_model: &str, stream: bool) -> Result
         top_p: request.top_p,
         stop: stop_sequences(&request.stop_sequences),
         tools,
-        // A `tool_choice` with nothing left to choose from is a request some
-        // providers reject outright. Only compensated for when *this* dropped
-        // the last tool: a client that sent a `tool_choice` and no tools in the
-        // first place gets it forwarded, as it would have been before.
-        tool_choice: tool_choice.filter(|_| !dropped_every_tool),
+        tool_choice,
         stream,
     })
 }
@@ -337,6 +336,32 @@ fn tools(tools: &[super::anthropic::Tool]) -> Vec<openai::Tool> {
             })
         })
         .collect()
+}
+
+/// Whether the translated `tools` list can still satisfy this `tool_choice`.
+/// Forcing a function the list no longer offers, or requiring a call with no
+/// tools left at all, is a request OpenAI-format providers reject outright —
+/// and dropping an untranslatable tool is what newly makes either reachable.
+///
+/// Both arms ask only whether *this translator* broke it. A `tool_choice` that
+/// named a tool the client never sent, or that came with no tools in the first
+/// place, is the client's own doing and is forwarded exactly as it was before
+/// any of this: the proxy does not validate requests on the provider's behalf.
+fn still_satisfiable(
+    choice: &openai::ToolChoice,
+    requested: &[super::anthropic::Tool],
+    translated: &[openai::Tool],
+) -> bool {
+    match choice {
+        openai::ToolChoice::Function { function, .. } => {
+            let was_requested = requested.iter().any(|tool| tool.name == function.name);
+            let survived = translated
+                .iter()
+                .any(|tool| tool.function.name == function.name);
+            survived || !was_requested
+        }
+        openai::ToolChoice::Mode(_) => !translated.is_empty() || requested.is_empty(),
+    }
 }
 
 fn tool_choice(choice: &ToolChoice) -> Option<openai::ToolChoice> {
@@ -723,9 +748,113 @@ mod tests {
         );
     }
 
-    /// The history side of the same session: a `server_tool_use` block and its
-    /// result degrade to placeholders, so nothing refers to the tool that was
-    /// dropped from the definitions.
+    #[test]
+    fn a_tool_choice_naming_a_dropped_tool_is_dropped_with_it() {
+        let out = translate(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "tool", "name": "web_search"},
+            "tools": [
+                {"name": "Bash", "input_schema": {"type": "object", "properties": {}}},
+                {"type": "web_search_20250305", "name": "web_search"},
+            ],
+        }));
+
+        assert_eq!(
+            out["tools"].as_array().unwrap().len(),
+            1,
+            "the translatable tool survives"
+        );
+        assert!(
+            out.get("tool_choice").is_none(),
+            "forcing a function the translated tools no longer offer is rejected by contract"
+        );
+    }
+
+    #[test]
+    fn a_tool_choice_naming_a_surviving_tool_is_kept() {
+        let out = translate(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "tool", "name": "Bash"},
+            "tools": [
+                {"name": "Bash", "input_schema": {"type": "object", "properties": {}}},
+                {"type": "web_search_20250305", "name": "web_search"},
+            ],
+        }));
+        assert_eq!(
+            out["tool_choice"],
+            json!({"type": "function", "function": {"name": "Bash"}})
+        );
+    }
+
+    /// Only what *this* broke is compensated for. A `tool_choice` naming a tool
+    /// the client never sent was already the client's own doing, and the proxy
+    /// does not validate requests on the provider's behalf.
+    #[test]
+    fn a_tool_choice_naming_a_tool_that_was_never_sent_is_forwarded_unchanged() {
+        let out = translate(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "tool", "name": "NeverSent"},
+            "tools": [{"name": "Bash", "input_schema": {"type": "object", "properties": {}}}],
+        }));
+        assert_eq!(
+            out["tool_choice"],
+            json!({"type": "function", "function": {"name": "NeverSent"}})
+        );
+    }
+
+    /// The load-bearing half of the tool-drop decision: history translation has
+    /// to be genuinely independent of what is left in `tools`, not merely free
+    /// of anything that could have referred to it. So this fixture makes a real
+    /// `tool_use` call to the very tool whose definition gets dropped — the
+    /// shape Anthropic's client-executed tools (`bash_*`, `computer_*`) take —
+    /// and the call must survive intact.
+    #[test]
+    fn a_prior_call_to_a_dropped_tool_still_translates_intact() {
+        let out = translate(json!({
+            "tools": [
+                {"type": "bash_20241022", "name": "bash"},
+                {"name": "Read", "input_schema": {"type": "object", "properties": {}}},
+            ],
+            "messages": [
+                {"role": "user", "content": "list the repo"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01", "name": "bash",
+                     "input": {"command": "ls -la"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01", "content": "total 0"},
+                ]},
+            ],
+        }));
+
+        let tool_names: Vec<&str> = out["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(tool_names, vec!["Read"], "the schema-less tool is dropped");
+
+        assert_eq!(
+            out["messages"][1],
+            json!({"role": "assistant", "content": Value::Null, "tool_calls": [
+                {"id": "toolu_01", "type": "function", "function": {
+                    "name": "bash", "arguments": "{\"command\":\"ls -la\"}",
+                }},
+            ]}),
+            "the historical call keeps its id, name and arguments although the \
+             definition is gone"
+        );
+        assert_eq!(
+            out["messages"][2],
+            json!({"role": "tool", "content": "total 0", "tool_call_id": "toolu_01"}),
+            "and its result still pairs with it"
+        );
+    }
+
+    /// The history side of a WebSearch session: `server_tool_use` and its
+    /// result degrade to placeholders, so the assistant turn produces no
+    /// `tool_calls` at all.
     #[test]
     fn a_websearch_session_translates_end_to_end_with_nothing_dangling() {
         let out = translate(json!({
