@@ -105,8 +105,9 @@ impl Notifier {
         let timeout = Duration::from_secs(config.timeout_secs);
         let (events, inbox) = mpsc::channel::<NotifyEvent>();
         thread::spawn(move || {
-            // Ends when the last `Notifier` — and so the applier thread that
-            // owns it — is dropped.
+            // Ends when every clone of this `Notifier` is dropped — `AppState`
+            // holds one directly and hands another to `RouteUpdates`, both the
+            // same underlying `Sender`, so this outlives either alone.
             while let Ok(event) = inbox.recv() {
                 // A panic here would otherwise end the thread, and every later
                 // event would vanish into a channel nobody reads.

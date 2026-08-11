@@ -85,7 +85,8 @@ under a different status code goes unnoticed until `detect.status` names it. A
 match moves the route to `LIMITED` until the reported reset plus
 `policy.reset_jitter_secs` of jitter (default 15–60s); the window elapsing
 moves it to `PROBING`; the next successful response moves it back to
-`ACTIVE`. `GET /status` reports the current state and `limited_until`.
+`ACTIVE`. `GET /status` reports the current state, `limited_until`, and
+`active_profile` (spec §8b, see Control API below).
 
 `min_reset_horizon_secs`, `max_reset_horizon_secs` and `reset_jitter_secs`
 live under `[policy]`, not `[detect]` — see `relay.example.toml`.
@@ -115,17 +116,49 @@ live under `[policy]`, not `[detect]` — see `relay.example.toml`.
   `br`, `zstd`, or a doubly-compressed body — logs a warning and passes through
   unclassified rather than being guessed at.
 
+## Control API
+
+`GET /control/profiles` and `POST /control/profile` (spec §8b) switch which
+profile new requests fail over to, at runtime, without touching the config
+file or restarting:
+
+```
+curl http://127.0.0.1:8484/control/profiles
+curl -X POST http://127.0.0.1:8484/control/profile -d '{"name":"deepseek"}'
+```
+
+`GET /control/profiles` lists every configured profile's `name`, `format`,
+`serves`, `model_map` and `api_key_env` (the env var *name*, never its
+value), marking which one is active. `POST /control/profile` returns 404 on
+a name nothing configured claims, and leaves the active profile untouched
+when it does.
+
+- **Ephemeral by design.** A switch lives only in the running process; a
+  restart goes back to `policy.active_profile`. Edit the config file if you
+  want a change to stick.
+- **Applies to new requests only.** A request already in flight finishes on
+  the profile it started with, even if a switch lands mid-response.
+- **Loopback-only, code-enforced.** Disabled outright if `listen` is ever
+  non-loopback. Independently of that, every request must also carry a
+  loopback (or `localhost`) `Host` header — otherwise DNS rebinding (an
+  attacker's own domain resolving to 127.0.0.1) could reach this from a
+  browser tab despite the bind being loopback. Either check failing looks
+  like the route was never registered (404), not a permission error.
+- Fires the notifier's `profile_switched` event (below) — but only when the
+  switch is a real change; switching to the profile that is already active,
+  or a rejected switch, notifies nothing.
+
 ## Notifications
 
-Set `notify.command` to be told when the route state changes instead of
-polling `/status`. The command runs through `sh -c` and gets the event in its
-environment:
+Set `notify.command` to be told when the route state changes, or a profile is
+switched, instead of polling `/status`. The command runs through `sh -c` and
+gets the event in its environment:
 
 | Variable | Value |
 |---|---|
-| `RELAY_EVENT` | `failover_engaged` when the route becomes `LIMITED`, `recovered` when it returns to `ACTIVE` |
+| `RELAY_EVENT` | `failover_engaged` when the route becomes `LIMITED`, `recovered` when it returns to `ACTIVE`, `profile_switched` on a real `POST /control/profile` switch |
 | `RELAY_RESET_AT` | RFC3339 end of the window on `failover_engaged`, the same value `/status` reports as `limited_until`; empty otherwise |
-| `RELAY_DETAIL` | A one-line human-readable summary |
+| `RELAY_DETAIL` | A one-line human-readable summary — for `profile_switched`, this is the only place the switched-to profile's name appears; there is no separate `RELAY_PROFILE` variable |
 
 ```toml
 [notify]
@@ -148,6 +181,13 @@ nothing to say, so a hook can run under `set -u`.
 - It inherits the relay's environment, which a desktop notifier needs
   (`DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`), and writes to the relay's own
   stdout/stderr.
+- **That environment includes every configured profile's API key value** —
+  the relay does not filter its own environment before spawning the hook. A
+  hook that itself logs or dumps its environment (`env > debug.log` and
+  similar) will write those keys to wherever it sends them. This was already
+  true before the control API existed; `POST /control/profile` now runs the
+  hook on demand from any loopback caller rather than only on a rare state
+  transition, so it is worth knowing if you write a debugging hook.
 
 ## Logging
 

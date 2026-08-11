@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -107,6 +108,29 @@ pub fn dripped_body(chunks: Vec<&'static str>, delay: Duration) -> Body {
             }
             tokio::time::sleep(delay).await;
         }
+    });
+    Body::from_stream(ChannelStream(rx))
+}
+
+/// A response body whose second chunk waits for `ready` to become `true`
+/// instead of a fixed delay, so a test can prove "this arrived after that
+/// happened" deterministically rather than racing a `Duration`. Polls rather
+/// than blocks on a signal, matching this suite's `wait_for_file`-style
+/// convention elsewhere.
+pub fn gated_body(first: &'static str, second: &'static str, ready: Arc<AtomicBool>) -> Body {
+    let (tx, rx) = mpsc::channel(1);
+    tokio::spawn(async move {
+        if tx
+            .send(Ok(Bytes::from_static(first.as_bytes())))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        while !ready.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = tx.send(Ok(Bytes::from_static(second.as_bytes()))).await;
     });
     Body::from_stream(ChannelStream(rx))
 }

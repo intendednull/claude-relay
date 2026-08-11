@@ -1,12 +1,11 @@
 //! The `/control/*` half of Global Constraint 2: this surface must never
 //! read, let alone return or log, a profile's API key *value* — only its
-//! `api_key_env` name, which is not a secret. A separate binary from
-//! `log_hygiene.rs`/`log_hygiene_fallback.rs` for the same reason those two
-//! are already split: the tracing subscriber is process-global.
+//! `api_key_env` name, which is not a secret — and it must not leak a second
+//! credential-bearing field, `base_url`'s userinfo, either. A separate binary
+//! from `log_hygiene.rs`/`log_hygiene_fallback.rs` for the same reason those
+//! two are already split: the tracing subscriber is process-global.
 
 mod common;
-
-use std::net::SocketAddr;
 
 use axum::http::StatusCode;
 use indexmap::IndexMap;
@@ -20,10 +19,18 @@ const KEYED_SECRET: &str = "tgp-DO-NOT-LEAK-THIS-CONTROL-SECRET";
 /// Deliberately never set: proves `/control/*` does not need the value to
 /// exist at all, which it would if any handler read it.
 const UNSET_ENV: &str = "RELAY_TEST_LOG_HYGIENE_CONTROL_KEY_NEVER_SET";
+/// Embedded in a profile's `base_url` userinfo — a second, independent place
+/// a real credential travels (`docs/decisions.md`), distinct from
+/// `api_key_env`'s value above. `ProfileConfig::validate` checks `base_url`'s
+/// scheme and host but never inspects userinfo, so `http://user:<secret>@host`
+/// is a legal configured value, not a fixture that could never occur — and
+/// `ProfileView` (`src/control.rs`) must keep `base_url` out of its response
+/// entirely, not merely redact it.
+const URL_SECRET: &str = "sk-DO-NOT-LEAK-THIS-URL-SECRET";
 
-fn profile(base: SocketAddr, api_key_env: &str) -> ProfileConfig {
+fn profile(base_url: String, api_key_env: &str) -> ProfileConfig {
     ProfileConfig {
-        base_url: format!("http://{base}"),
+        base_url,
         api_key_env: api_key_env.to_string(),
         format: "anthropic".to_string(),
         serves: Vec::new(),
@@ -31,7 +38,7 @@ fn profile(base: SocketAddr, api_key_env: &str) -> ProfileConfig {
     }
 }
 
-async fn get(relay: SocketAddr, path: &str) -> (StatusCode, String) {
+async fn get(relay: std::net::SocketAddr, path: &str) -> (StatusCode, String) {
     let response = reqwest::Client::new()
         .get(format!("http://{relay}{path}"))
         .send()
@@ -42,7 +49,7 @@ async fn get(relay: SocketAddr, path: &str) -> (StatusCode, String) {
     (status, body)
 }
 
-async fn post(relay: SocketAddr, path: &str, body: Value) -> (StatusCode, String) {
+async fn post(relay: std::net::SocketAddr, path: &str, body: Value) -> (StatusCode, String) {
     // `reqwest`'s `json` feature isn't enabled here (see `Cargo.toml`), and
     // axum's `Json` extractor requires the content-type header regardless.
     let response = reqwest::Client::new()
@@ -75,8 +82,14 @@ async fn control_never_requires_or_leaks_a_profiles_api_key_value() {
     let b = common::closed_port().await;
     let mut config = relay_config(format!("http://{anthropic}"));
     let mut profiles = IndexMap::new();
-    profiles.insert("keyed".to_string(), profile(a, KEYED_ENV));
-    profiles.insert("unkeyed".to_string(), profile(b, UNSET_ENV));
+    profiles.insert(
+        "keyed".to_string(),
+        profile(format!("http://user:{URL_SECRET}@{a}"), KEYED_ENV),
+    );
+    profiles.insert(
+        "unkeyed".to_string(),
+        profile(format!("http://{b}"), UNSET_ENV),
+    );
     config.profiles = profiles;
     config.policy.active_profile = Some("keyed".to_string());
     let relay = serve_relay_with(config, None).await;
@@ -92,6 +105,10 @@ async fn control_never_requires_or_leaks_a_profiles_api_key_value() {
         !listing.contains(KEYED_SECRET),
         "GET /control/profiles leaked the API key value: {listing}"
     );
+    assert!(
+        !listing.contains(URL_SECRET),
+        "GET /control/profiles leaked base_url's userinfo: {listing}"
+    );
 
     // Switching to (and listing while active) the profile whose key does not
     // even exist must succeed — proof the handler never reads the value at
@@ -100,18 +117,26 @@ async fn control_never_requires_or_leaks_a_profiles_api_key_value() {
     let (status, switch_body) = post(relay, "/control/profile", json!({"name": "unkeyed"})).await;
     assert_eq!(status, StatusCode::OK, "{switch_body}");
     assert!(!switch_body.contains(KEYED_SECRET));
+    assert!(!switch_body.contains(URL_SECRET));
 
     let (status, listing) = get(relay, "/control/profiles").await;
     assert_eq!(status, StatusCode::OK);
     assert!(!listing.contains(KEYED_SECRET));
+    assert!(!listing.contains(URL_SECRET));
 
     let (status, switch_body) = post(relay, "/control/profile", json!({"name": "keyed"})).await;
     assert_eq!(status, StatusCode::OK, "{switch_body}");
     assert!(!switch_body.contains(KEYED_SECRET));
+    assert!(!switch_body.contains(URL_SECRET));
 
+    // Honesty check on the assertion below: `src/control.rs` emits no
+    // `tracing` calls at all today, so nothing in this test's own request
+    // path could make this buffer non-empty in the first place. This is a
+    // forward guard against a future regression (someone adding a debug log
+    // of a profile's full config, `base_url` included) rather than coverage
+    // of anything currently logged — the response-body assertions above are
+    // this test's real evidence.
     let logs = buffer.contents();
-    assert!(
-        !logs.contains(KEYED_SECRET),
-        "captured logs leaked the API key value:\n{logs}"
-    );
+    assert!(!logs.contains(KEYED_SECRET));
+    assert!(!logs.contains(URL_SECRET));
 }

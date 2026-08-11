@@ -10,6 +10,7 @@ mod common;
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,7 @@ use axum::routing::any;
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 
-use common::{dripped_body, relay_config, serve, serve_relay_with, unique_temp_dir};
+use common::{gated_body, relay_config, serve, serve_relay_with, unique_temp_dir};
 use relay::build_router;
 use relay::config::{Config, NotifyConfig, ProfileConfig};
 use relay::state::AppState;
@@ -221,25 +222,33 @@ async fn post_control_profile_404s_on_an_unknown_name_and_does_not_change_anythi
 }
 
 /// The one genuinely tricky property (spec §8b): a switch applies to *new*
-/// requests only. Built as a real race rather than an assertion on final
-/// state — the mock upstream paces its body over real wall-clock time so the
-/// switch genuinely lands while the first request is still receiving bytes,
-/// not merely queued behind it.
+/// requests only. The second half of the mock's body is gated on a signal
+/// this test only raises after the switch POST has returned — so "the tail
+/// of this response was produced after the switch landed" is guaranteed by
+/// construction, not by outrunning a `Duration` under CI load. The assertion
+/// at the end pins the *exact* reassembled body, not merely that it contains
+/// a marker string that was already true before the switch: a mutation that
+/// truncates every in-flight body after the first chunk must fail this,
+/// which "contains" alone would not have caught (see the fix-round notes).
 #[tokio::test]
 async fn an_in_flight_request_finishes_on_the_profile_it_started_on_even_if_switched_mid_stream() {
-    let chunk_delay = Duration::from_millis(200);
-    let dripped = Router::new().route(
-        "/v1/messages",
-        any(move || async move {
-            Response::new(dripped_body(
-                vec![
-                    r#"{"id":"from-profile-a","#,
-                    r#""type":"message","content":[]}"#,
-                ],
-                chunk_delay,
-            ))
-        }),
-    );
+    let switch_landed = Arc::new(AtomicBool::new(false));
+    let dripped = {
+        let switch_landed = switch_landed.clone();
+        Router::new().route(
+            "/v1/messages",
+            any(move || {
+                let switch_landed = switch_landed.clone();
+                async move {
+                    Response::new(gated_body(
+                        r#"{"id":"from-profile-a","#,
+                        r#""type":"message","content":[]}"#,
+                        switch_landed,
+                    ))
+                }
+            }),
+        )
+    };
     let relay = two_profile_relay_with(dripped).await;
 
     let mut in_flight = client()
@@ -257,21 +266,25 @@ async fn an_in_flight_request_finishes_on_the_profile_it_started_on_even_if_swit
         .await
         .expect("read failed")
         .expect("stream ended before any chunk arrived");
-    assert!(String::from_utf8_lossy(&first).contains("from-profile-a"));
+    assert_eq!(first.as_ref(), br#"{"id":"from-profile-a","#);
 
     let (switch_status, _) =
         post_json(relay, "/control/profile", json!({"name": "profile-b"})).await;
     assert_eq!(switch_status, StatusCode::OK);
+
+    // Only now may the mock's second chunk be produced — after the switch
+    // has already returned 200, not merely likely to have by this point.
+    switch_landed.store(true, Ordering::Release);
 
     let mut rest = Vec::new();
     while let Some(chunk) = in_flight.chunk().await.expect("read failed") {
         rest.extend_from_slice(&chunk);
     }
     let full = [first.as_ref(), rest.as_slice()].concat();
-    assert!(
-        String::from_utf8_lossy(&full).contains("from-profile-a"),
-        "an in-flight request must complete on the profile it started with: {}",
-        String::from_utf8_lossy(&full)
+    assert_eq!(
+        String::from_utf8_lossy(&full),
+        r#"{"id":"from-profile-a","type":"message","content":[]}"#,
+        "an in-flight request must complete on the profile it started with, whole and unaltered"
     );
 
     assert_eq!(
@@ -287,12 +300,22 @@ async fn an_in_flight_request_finishes_on_the_profile_it_started_on_even_if_swit
 /// switch lives only in the `AppState` the first one owned, never in
 /// `Config` or on disk, so a fresh `AppState` from the same `Config` is
 /// exactly what a real restart produces.
+///
+/// `state_file` is set to a real path here on purpose: the requirement under
+/// test is "never written to `state_file`", which is only observable at all
+/// if a state file exists for a violation to write into. With
+/// `state_file: None` (this fixture's default), a version of
+/// `set_active_profile` that persisted the switch straight into a fabricated
+/// path off of `state_file` would leave this test unable to tell — proven by
+/// mutation, see the fix-round notes.
 #[tokio::test]
 async fn a_runtime_switch_does_not_persist_across_a_simulated_restart() {
     let anthropic = common::closed_port().await;
     let a = serve(upstream_ok(BODY_A)).await;
     let b = serve(upstream_ok(BODY_B)).await;
-    let cfg = config(anthropic, a, b);
+    let mut cfg = config(anthropic, a, b);
+    let state_file = unique_temp_dir("control-restart").with_extension("json");
+    cfg.state_file = Some(state_file.clone());
 
     let relay = serve_relay_with(cfg.clone(), None).await;
     post_json(relay, "/control/profile", json!({"name": "profile-b"})).await;
@@ -307,6 +330,8 @@ async fn a_runtime_switch_does_not_persist_across_a_simulated_restart() {
         "profile-a",
         "a fresh AppState must read policy.active_profile again, not the switched value"
     );
+
+    let _ = std::fs::remove_file(&state_file);
 }
 
 #[tokio::test]
@@ -339,6 +364,38 @@ async fn wait_for_file(path: &Path, timeout: Duration) -> String {
     }
 }
 
+async fn wait_for_lines(path: &Path, count: usize) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let lines: Vec<String> = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        if lines.len() >= count {
+            return lines;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {count} line(s), got {lines:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// `wait_for_lines` returns the instant it sees enough lines, so a count
+/// asserted on its result cannot catch a spurious extra one landing just
+/// after — this settles past that window before the final count is read, the
+/// same reasoning `tests/notify.rs::hook_lines_after_settling` uses.
+async fn lines_after_settling(path: &Path) -> Vec<String> {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
 /// Mirrors `tests/notify.rs`'s pattern for the route-transition events: a
 /// hook that dumps spec §4's three env vars, run for real.
 #[tokio::test]
@@ -365,6 +422,134 @@ async fn post_control_profile_fires_the_profile_switched_notifier_event() {
         "profile_switched||active profile switched to profile-b"
     );
     let _ = std::fs::remove_file(&log);
+}
+
+/// A switch that changes nothing — the target is already active, or the name
+/// is rejected before anything changes — must not queue a notifier event
+/// (matches `notify.rs`'s own "only real changes are reported" rule; a hook
+/// firing for a no-op switch would be a lie to whatever it tells the
+/// operator). Proven by a later, real switch: the notifier drains one FIFO
+/// queue serially, so anything wrongly queued by the two no-op attempts below
+/// would already be in the log by the time the real switch's own line
+/// appears, and `lines_after_settling` gives it a further window to show up.
+#[tokio::test]
+async fn a_switch_that_changes_nothing_fires_no_notifier_event() {
+    let log = unique_temp_dir("control-notify-noop").with_extension("log");
+    let anthropic = common::closed_port().await;
+    let a = serve(upstream_ok(BODY_A)).await;
+    let b = serve(upstream_ok(BODY_B)).await;
+    let mut cfg = config(anthropic, a, b);
+    cfg.notify = NotifyConfig {
+        command: Some(format!(
+            r#"printf '%s\n' "$RELAY_DETAIL" >> {}"#,
+            log.display()
+        )),
+        timeout_secs: 5,
+    };
+    let relay = serve_relay_with(cfg, None).await;
+
+    // Already-active: no real change (I2).
+    let (status, _) = post_json(relay, "/control/profile", json!({"name": "profile-a"})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Unknown name: rejected before anything changes (M8).
+    let (status, _) = post_json(relay, "/control/profile", json!({"name": "ghost"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The one real switch, whose notification is the only one that should exist.
+    let (status, _) = post_json(relay, "/control/profile", json!({"name": "profile-b"})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    wait_for_lines(&log, 1).await;
+    let lines = lines_after_settling(&log).await;
+    assert_eq!(
+        lines,
+        vec!["active profile switched to profile-b"],
+        "the two no-op switches above must not have notified"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+/// DNS rebinding defeats "loopback bind implies local operator only" unless
+/// the control surface also checks `Host`: an attacker's own domain can
+/// resolve to 127.0.0.1, making a same-origin browser request carry a `Host`
+/// the relay must not trust just because the TCP connection itself arrived
+/// over loopback.
+#[tokio::test]
+async fn control_routes_reject_a_forged_host_header() {
+    let relay = two_profile_relay().await;
+
+    let get = client()
+        .get(format!("http://{relay}/control/profiles"))
+        .header("host", "evil.example")
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+
+    let post = client()
+        .post(format!("http://{relay}/control/profile"))
+        .header("host", "evil.example")
+        .header("content-type", "application/json")
+        .body(r#"{"name":"profile-b"}"#)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(post.status(), StatusCode::NOT_FOUND);
+
+    // The gate isn't blanket-denying: a genuine loopback Host still works.
+    let profiles = get_json(relay, "/control/profiles").await;
+    assert_eq!(
+        profiles["profiles"].as_array().expect("array").len(),
+        2,
+        "an honest Host header must still reach the handler"
+    );
+}
+
+/// M2: a malformed body gets the same JSON error envelope every other
+/// rejection on this surface uses, not axum's default plain-text rejection.
+#[tokio::test]
+async fn post_control_profile_with_a_malformed_body_returns_the_json_envelope() {
+    let relay = two_profile_relay().await;
+
+    let response = client()
+        .post(format!("http://{relay}/control/profile"))
+        .header("content-type", "application/json")
+        .body("not json at all")
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("error body must be JSON, not axum's default plain-text rejection");
+    assert_eq!(body["error"], "invalid_request_body");
+}
+
+/// M1: an unrecognized field is a client mistake worth surfacing rather than
+/// silently discarding — relevant once Milestone 4 adds `POST /control/mode`,
+/// so a request meant for the wrong endpoint doesn't half-succeed.
+#[tokio::test]
+async fn post_control_profile_rejects_an_unknown_field() {
+    let relay = two_profile_relay().await;
+
+    let response = client()
+        .post(format!("http://{relay}/control/profile"))
+        .header("content-type", "application/json")
+        .body(r#"{"name":"profile-b","mode":"all"}"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // And the switch must not have applied "the part it understood".
+    let profiles = get_json(relay, "/control/profiles").await;
+    assert_eq!(
+        by_name(profiles["profiles"].as_array().expect("array"), "profile-a")["active"],
+        true,
+        "a rejected request must not partially apply"
+    );
 }
 
 /// Spec §8b, code-enforced: a non-loopback `listen` must disable `/control/*`

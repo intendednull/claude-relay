@@ -105,7 +105,9 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
         // and whatever the policy mode. Anything else may, and that one *is*
         // remapped (§7a).
         Ok(RouteDecision::Anthropic) if count_tokens => None,
-        Ok(RouteDecision::Anthropic) => failover(&state, &view).await.map(|name| (name, true)),
+        Ok(RouteDecision::Anthropic) => failover(&state, &view, active_profile)
+            .await
+            .map(|name| (name, true)),
         // Global Constraint 7 from the other side: a name nothing claims has
         // no route but Anthropic's, and a count is pinned there regardless.
         // Answering the relay's own 400 would put the relay's opinion of the
@@ -263,11 +265,19 @@ fn counts_tokens(state: &AppState, profile: &str) -> bool {
 /// router already pointed at Anthropic. `Some(profile)` fails it over;
 /// `None` leaves it on Anthropic, where a limit error passes through to the
 /// client as the visible failure the mode asked for.
-async fn failover(state: &AppState, view: &RoutingView) -> Option<String> {
-    // Same one-read-per-request rule as the name-routing call site above:
-    // `active_profile()` folds in a `/control/profile` switch, read exactly
-    // once, before the eligibility and state checks below.
-    let active = state.active_profile()?;
+///
+/// `active_profile` is a parameter, not a second call to
+/// `state.active_profile()`: the caller already read it once, at the single
+/// point this request's route is decided, and passing it in makes "read
+/// exactly once per request" structural rather than something that happens
+/// to hold because the other branch that would re-read it is unreachable
+/// from here.
+async fn failover(
+    state: &AppState,
+    view: &RoutingView,
+    active_profile: Option<String>,
+) -> Option<String> {
+    let active = active_profile?;
     let policy = &state.config.policy;
     let eligible = match policy.mode.as_str() {
         "all" => true,

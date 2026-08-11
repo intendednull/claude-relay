@@ -32,29 +32,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A request dying at almost exactly this mark is this constant, not the network.
 const READ_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Runtime override for `policy.active_profile`, set by `POST /control/profile`
-/// (spec §8b). `None` until a switch happens, so a request falls through to
-/// the startup default until then; never persisted, so a restart drops it and
-/// reads `policy.active_profile` fresh — "ephemeral by design", per spec.
-///
-/// Wrapped rather than a bare `Mutex<Option<String>>` field on `AppState` so
-/// the only way to read or write it is `AppState::active_profile`/
-/// `set_active_profile`, which is what keeps "read once per request, at
-/// routing time" a property of the API rather than a convention callers have
-/// to remember.
-#[derive(Debug, Default)]
-struct ActiveProfileOverride(Mutex<Option<String>>);
-
-impl ActiveProfileOverride {
-    fn get(&self) -> Option<String> {
-        self.0.lock().expect("active profile lock poisoned").clone()
-    }
-
-    fn set(&self, name: String) {
-        *self.0.lock().expect("active profile lock poisoned") = Some(name);
-    }
-}
-
 /// Shared application state handed to axum handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -85,7 +62,16 @@ pub struct AppState {
     /// 8 MiB fixture. Deliberately not a config key: no deployment should need
     /// it changed.
     pub routing_body_cap: usize,
-    active_profile_override: Arc<ActiveProfileOverride>,
+    /// Runtime override for `policy.active_profile`, set by
+    /// `POST /control/profile` (spec §8b). `None` until a switch happens, so a
+    /// request falls through to the startup default until then; never
+    /// persisted, so a restart drops it and reads `policy.active_profile`
+    /// fresh — "ephemeral by design", per spec. Private, unlike every other
+    /// field here: the only way to read or write it is `active_profile`/
+    /// `set_active_profile`, which is what makes "read once per request, at
+    /// routing time" a property of the API rather than a convention callers
+    /// have to remember.
+    active_profile_override: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -134,7 +120,7 @@ impl AppState {
             notifier,
             fallback_requests_served: Arc::new(AtomicU64::new(0)),
             routing_body_cap: crate::proxy::ROUTING_BODY_CAP,
-            active_profile_override: Arc::new(ActiveProfileOverride::default()),
+            active_profile_override: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -146,16 +132,34 @@ impl AppState {
     /// profile it started with even if a switch lands mid-stream.
     pub fn active_profile(&self) -> Option<String> {
         self.active_profile_override
-            .get()
+            .lock()
+            .expect("active profile lock poisoned")
+            .clone()
             .or_else(|| self.config.policy.active_profile.clone())
     }
 
-    /// Sets the runtime override read by `active_profile`. Trusts `name` the
+    /// Sets the runtime override read by `active_profile`, returning whether
+    /// the *effective* active profile actually changed. Trusts `name` the
     /// same way `router::route` trusts its `active_profile` parameter: the
     /// caller — `/control/profile`'s 404 check — has already validated it
     /// names a configured profile, so this never re-checks.
-    pub fn set_active_profile(&self, name: String) {
-        self.active_profile_override.set(name);
+    ///
+    /// The return value matters: `/control/profile` fires a `profile_switched`
+    /// notification only when this is `true`, matching the notifier's own
+    /// "only real changes are reported" rule (`notify.rs`) — switching to the
+    /// name that is already active must not queue an event.
+    #[must_use]
+    pub fn set_active_profile(&self, name: String) -> bool {
+        let mut guard = self
+            .active_profile_override
+            .lock()
+            .expect("active profile lock poisoned");
+        let previous = guard
+            .clone()
+            .or_else(|| self.config.policy.active_profile.clone());
+        let changed = previous.as_deref() != Some(name.as_str());
+        *guard = Some(name);
+        changed
     }
 }
 
@@ -301,13 +305,40 @@ mod tests {
         let state =
             AppState::new(Arc::new(wired), None, "digest".to_string()).expect("should build");
 
-        state.set_active_profile("kimi".to_string());
+        let _ = state.set_active_profile("kimi".to_string());
 
         assert_eq!(state.active_profile(), Some("kimi".to_string()));
         assert_eq!(
             state.active_profile(),
             Some("kimi".to_string()),
             "a second read must see the same switch, not consume it"
+        );
+    }
+
+    /// `/control/profile` fires a notification only when this returns `true`
+    /// (`src/control.rs`) — so it has to be right for both the policy-default
+    /// baseline and the override baseline, not just distinguish "changed" from
+    /// "unchanged" in one of them.
+    #[test]
+    fn set_active_profile_reports_whether_it_actually_changed() {
+        let mut wired = config(DetectConfig::default(), NotifyConfig::default());
+        wired.profiles.insert("deepseek".to_string(), profile());
+        wired.profiles.insert("kimi".to_string(), profile());
+        wired.policy.active_profile = Some("deepseek".to_string());
+        let state =
+            AppState::new(Arc::new(wired), None, "digest".to_string()).expect("should build");
+
+        assert!(
+            !state.set_active_profile("deepseek".to_string()),
+            "switching to the already-active startup default is not a change"
+        );
+        assert!(
+            state.set_active_profile("kimi".to_string()),
+            "switching to a different profile is a change"
+        );
+        assert!(
+            !state.set_active_profile("kimi".to_string()),
+            "switching to the already-active override is not a change"
         );
     }
 
@@ -323,7 +354,7 @@ mod tests {
             AppState::new(Arc::new(wired), None, "digest".to_string()).expect("should build");
         let cloned = state.clone();
 
-        cloned.set_active_profile("deepseek".to_string());
+        let _ = cloned.set_active_profile("deepseek".to_string());
 
         assert_eq!(state.active_profile(), Some("deepseek".to_string()));
     }

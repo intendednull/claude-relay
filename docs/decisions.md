@@ -113,6 +113,22 @@ notifier filters `RELAY_*_KEY`-shaped variables out of the child's
 environment, weighed against the inheritance a desktop notifier needs
 (`DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`).
 
+**Resolved 2026-08-11, Milestone 3 Task 4 fix round 1:** not filtered.
+Documented instead — README's Notifications section now says outright that
+the hook's environment carries every profile's key value, since Task 4's
+`POST /control/profile` changed the exposure from "an occasional, upstream-
+driven state transition" to "on demand, from any loopback caller, including
+a debugging hook someone reaches for and forgets is on this path." Filtering
+was considered and set aside: the set of variable *names* worth stripping
+isn't fixed by this project (`api_key_env` is operator-chosen per profile,
+not a `RELAY_*`-prefixed convention), so a filter would need an allowlist of
+what to keep (`DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `PATH`, …) rather than a
+denylist of what to drop — a bigger change than this fix round's scope, and
+one that risks quietly breaking an operator's existing hook. Restricting
+`profile_switched` to real changes only (the 2026-08-11 fix-round entry
+further below) already closes most of the on-demand angle by making a flood
+of no-op switches free rather than N hook invocations.
+
 ## 2026-08-10 — Anthropic gzips its error bodies, so detection decompresses its own copy
 
 **Confirmed, not hypothesised:** an unauthenticated request to
@@ -578,3 +594,53 @@ manufacturing a fake `RouteTransition` to smuggle it through. `Notifier`
 itself is now `Clone` (`mpsc::Sender<T>` is `Clone` regardless of `T`), so
 `AppState` can hold one end for `/control/profile` while `RouteUpdates` holds
 the other, both backed by the same channel.
+
+## 2026-08-11 — Task 4 fix round 1: the deviation made explicit, and why `Host` is checked
+
+Recorded per the fix round's own instruction, so none of this reads as a later
+surprise.
+
+**Spec §8b's literal text is not what this ships, and that is a deliberate,
+ruled-on deviation, not an oversight.** §8b says a non-loopback `listen` "must
+require a token"; no token mechanism exists this milestone (out of scope by
+the plan), so `docs/spec.md`'s Task 4 brief authorized "disable `/control/*`
+entirely" as the milestone-3-correct substitute, and the orchestrator
+confirmed that reading. `control::enabled` and `control::routes` implement
+the authorized substitute, not the spec's literal words — anyone reading §8b
+against this code should read this entry first, not conclude the two
+disagree by accident.
+
+**`Host` is now checked, on top of the bind check, because the bind check
+alone doesn't deliver what its own premise promises.** The whole point of
+"loopback bind implies local operator only" is that nothing off-host can
+reach the control surface. That premise is false as shipped without a `Host`
+check: DNS rebinding lets an attacker's own domain resolve to `127.0.0.1`,
+so a browser tab on that domain reaches the relay as a same-origin request
+whose `Host` header the browser still renders as the attacker's domain — the
+TCP connection is loopback, but the caller is not "local" in any sense worth
+trusting. This was outside the brief's literal requirement (bind-address
+enforcement) and outside the peer-address check the implementer explicitly
+flagged and deferred — a second reviewer surfaced it, and the orchestrator
+ruled to fix it anyway, since the cost (one `Authority`-parse comparison) is
+far below the payoff (silent redirection of the user's LLM traffic to an
+attacker-chosen profile, from a page the user never knowingly gave this port
+to). `control::routes` applies it as middleware over both endpoints, in the
+same function that owns the bind gate, so a route added to this module later
+inherits both automatically rather than needing to remember either.
+
+**`profile_switched`'s `RELAY_DETAIL` packing (recorded above) stands, with
+one addendum:** a Milestone 4 `relay ctl` CLI wrapper parsing hook output
+programmatically may want the switched-to name in a structured field rather
+than free text. Noted for whoever builds that wrapper — nothing here commits
+to `RELAY_PROFILE` or against it, only that the tradeoff should be revisited
+once there's a concrete parser wanting the value, rather than guessed at now.
+
+**A switch that changes nothing does not notify** (already-active target, or
+a 404'd unknown name) — `AppState::set_active_profile` returns whether the
+*effective* active profile actually changed, and `/control/profile` fires
+`profile_switched` only then. Matches `notify.rs`'s pre-existing "only real
+changes are reported" rule for route transitions; before this fix, every
+switch notified unconditionally, which meant a rapid run of no-op switches
+(the same name, or a client retrying a typo'd one) could queue ahead of a
+real `failover_engaged` on the notifier's single FIFO queue and delay it by
+the timeout of every wedged hook in front of it.
