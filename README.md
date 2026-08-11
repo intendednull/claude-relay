@@ -79,8 +79,8 @@ to be left on across restarts — fixtures accumulate rather than overwrite.
 
 Anthropic responses carrying the status named by the `[detect]` rule in the
 config file — 429 by default; see `relay.example.toml`, which spells out every
-built-in default — are classified against the rest of that rule. They are also
-the only responses whose bodies the relay buffers at all, so a limit returned
+built-in default — are classified against the rest of that rule, and they are
+the only responses the relay buffers for classification, so a limit returned
 under a different status code goes unnoticed until `detect.status` names it. A
 match moves the route to `LIMITED` until the reported reset plus 15–60s of
 jitter; the window elapsing moves it to `PROBING`; the next successful response
