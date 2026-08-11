@@ -1,5 +1,13 @@
 # Milestone 2 implementation plan — limit detection, state machine, notifier, persistence
 
+**Status: complete**, merged to `main` at `b564c81`. All 3 tasks landed,
+each reviewed twice with fix rounds; two full whole-branch review rounds
+(2 reviewers each, the second round finding and fixing a real
+production-breaking bug — see `docs/decisions.md`) before merge. Review
+history lived in `.superpowers/sdd/milestone-2-plan/` during execution —
+removed after merge per the subagent-driven-development skill's
+convention; git history is the record now.
+
 Source of truth: `docs/spec.md`, specifically §3 (Architecture — Limit
 Detector, State Store, Notifier components), §4 (Route state machine), §5
 (Limit detection — config-driven rules, conservative classification), §8
