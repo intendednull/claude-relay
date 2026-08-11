@@ -87,6 +87,10 @@ current state and `limited_until`.
 - **Non-matches never move state.** A per-minute burst 429 needs either an
   explicit subscription marker in the message or a reset further out than
   `min_reset_horizon_secs` (default 5 minutes) before it counts.
+- **The window is bounded at both ends.** It is never shorter than
+  `min_reset_horizon_secs` nor longer than `max_reset_horizon_secs` (default 7
+  days), so neither a stale reset time nor one reported in the wrong unit can
+  produce a window that expires instantly or never elapses at all.
 - **The default rule is a guess** from spec §5's expected shape, not from a
   real limit response (`docs/decisions.md`). Catch one with
   `--capture-errors` and re-derive the rule from the fixture; it is config,

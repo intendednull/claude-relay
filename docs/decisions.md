@@ -44,3 +44,17 @@ anticipates it: detection rules are config data, not code, specifically so
 <dir>` against real traffic and actually hits the subscription limit, the
 captured fixture should replace the guessed `[detect]` defaults — a config
 edit, per the design's own intent, not a code change.
+
+**Check `content-encoding` on that fixture first.** The proxy forwards the
+client's `accept-encoding` upstream (it is not a hop-by-hop header) and
+reqwest is built with no decompression feature, deliberately — so *asking*
+Anthropic to compress is the default behavior, and a compressed error body is
+opaque bytes to the detector. Milestone 2 handles this honestly rather than
+silently: it logs `limit detection skipped: the upstream error body is
+compressed` and passes the response through. But if real error bodies do come
+back compressed, detection is inert in production with only that log line as
+the symptom, and it becomes a design question for whoever does this
+follow-up — add a decompression dependency for the classification path, or
+stop forwarding the client's `accept-encoding` on the Anthropic route. A
+fixture with `"body_base64"` instead of `"body"` (see the README) is the
+tell.

@@ -85,15 +85,20 @@ impl Config {
         Ok(url)
     }
 
-    /// Spec §8's own example writes `state_file = "~/.local/state/..."`, and
-    /// nothing here expands `~` — left alone it would silently create a
-    /// directory literally named `~` next to wherever the relay was started.
+    /// Both ways a state file silently ends up somewhere the operator didn't
+    /// mean: spec §8's own example writes `~/.local/state/...` and nothing here
+    /// expands `~`, so it would become a directory literally named `~`; and a
+    /// relative path resolves against whatever directory the relay happened to
+    /// be started from.
     pub fn state_file(&self) -> Result<Option<PathBuf>> {
         let Some(path) = &self.state_file else {
             return Ok(None);
         };
-        if path.starts_with("~") {
-            bail!("`state_file` must be an absolute path: `~` is not expanded");
+        if !path.is_absolute() {
+            bail!(
+                "`state_file` must be an absolute path (`~` is not expanded): {}",
+                path.display()
+            );
         }
         Ok(Some(path.clone()))
     }
@@ -178,20 +183,29 @@ mod tests {
         assert!(err.to_string().contains("jsonpath"));
     }
 
-    /// Copying spec §8's example verbatim otherwise creates a directory named
-    /// `~` wherever the relay happens to be started.
+    /// A tilde path (spec §8's own example) would become a directory named `~`,
+    /// and a relative one lands wherever the relay happened to be started —
+    /// both are silent, and both put route state somewhere unintended.
     #[test]
-    fn a_tilde_state_file_is_rejected_rather_than_taken_literally() {
-        let raw = r#"
-            listen = "127.0.0.1:8484"
-            state_file = "~/.local/state/relay/state.json"
+    fn a_state_file_that_is_not_absolute_is_rejected() {
+        for state_file in [
+            "~/.local/state/relay/state.json",
+            "state.json",
+            "./state.json",
+        ] {
+            let raw = format!(
+                r#"
+                listen = "127.0.0.1:8484"
+                state_file = "{state_file}"
 
-            [anthropic]
-            base_url = "https://api.anthropic.com"
-        "#;
-        let config = Config::from_toml_str(raw).expect("should parse");
-        let err = config.state_file().expect_err("should reject");
-        assert!(err.to_string().contains("state_file"));
+                [anthropic]
+                base_url = "https://api.anthropic.com"
+                "#
+            );
+            let config = Config::from_toml_str(&raw).expect("should parse");
+            let err = config.state_file().expect_err(state_file).to_string();
+            assert!(err.contains("state_file"), "{state_file}: {err}");
+        }
     }
 
     #[test]

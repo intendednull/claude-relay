@@ -188,11 +188,13 @@ impl PersistedState {
             (PersistedKind::Active, _) => RouteState::Active,
             (PersistedKind::Probing, _) => RouteState::Probing,
             (PersistedKind::Limited, Some(secs)) => {
-                let until = UNIX_EPOCH + Duration::from_secs(secs);
-                if SystemTime::now() >= until {
-                    RouteState::Active
-                } else {
-                    RouteState::Limited { until }
+                // `secs` comes off disk, where it can have been corrupted or
+                // hand-edited into a value `SystemTime` cannot represent —
+                // plain addition would panic there, turning a corrupt file
+                // into a failed startup, which is what `load` exists to avoid.
+                match UNIX_EPOCH.checked_add(Duration::from_secs(secs)) {
+                    Some(until) if SystemTime::now() < until => RouteState::Limited { until },
+                    _ => RouteState::Active,
                 }
             }
             (PersistedKind::Limited, None) => RouteState::Active,
@@ -455,6 +457,19 @@ mod tests {
         }
     }
 
+    /// `SystemTime + Duration` panics on overflow, and `reset_at` is derived
+    /// from an upstream-supplied reset time. A panic here would kill the thread
+    /// that applies transitions, silently ending state tracking for the process.
+    #[test]
+    fn add_jitter_saturates_instead_of_panicking_at_the_edge_of_representable_time() {
+        let edge = UNIX_EPOCH + Duration::from_secs(i64::MAX as u64 - 10);
+        assert_eq!(
+            add_jitter(edge),
+            edge,
+            "no jitter fits, so the un-jittered time stands"
+        );
+    }
+
     #[test]
     fn on_limit_detected_applies_jitter_via_the_machine() {
         let machine = RouteStateMachine::new(None).unwrap();
@@ -588,6 +603,23 @@ mod tests {
 
         let machine =
             RouteStateMachine::new(Some(path.clone())).expect("a corrupt file must not error");
+        assert_eq!(machine.current_state(), RouteState::Active);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Same fail-open rule as a corrupt file: an `until` too large for
+    /// `SystemTime` must not panic the process at startup.
+    #[test]
+    fn state_file_with_an_unrepresentable_until_fails_open_to_active() {
+        let path = unique_temp_path("unrepresentable-until");
+        fs::write(
+            &path,
+            br#"{"state": "LIMITED", "until": 18446744073709551615}"#,
+        )
+        .unwrap();
+
+        let machine =
+            RouteStateMachine::new(Some(path.clone())).expect("an absurd `until` must not error");
         assert_eq!(machine.current_state(), RouteState::Active);
         let _ = fs::remove_file(&path);
     }

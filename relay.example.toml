@@ -31,8 +31,16 @@ match_body = { "error.type" = "rate_limit_error" }
 marker_field = "error.message"
 markers = ["usage limit", "subscription"]
 # Without a marker, the reset must be further out than this to count as the
-# subscription limit rather than an ordinary per-minute burst 429.
+# subscription limit rather than an ordinary per-minute burst 429. It is also
+# the floor under every window detection produces, so a stale reset time can't
+# yield one that has already expired.
 min_reset_horizon_secs = 300
+# The ceiling on that window — a units sanity check, not a claim about how long
+# Anthropic's windows are. A reset read in the wrong unit (epoch milliseconds
+# through a rule expecting seconds) lands ~55,000 years out; unbounded, such a
+# window is persisted, survives every restart and never elapses. A marked limit
+# past this ceiling is capped to it; an unmarked one is not believed at all.
+max_reset_horizon_secs = 604800   # 7 days: Claude limits include weekly windows
 
 # Reset-time sources in preference order: the first that yields a time wins.
 # `from` is header | body (body names are dotted paths), and `format` is

@@ -36,9 +36,18 @@ pub struct DetectConfig {
     #[serde(default = "default_reset")]
     pub reset: Vec<ResetSource>,
     /// Without a marker, a reset horizon must exceed this to count as the
-    /// subscription limit rather than a burst 429 (spec §5).
+    /// subscription limit rather than a burst 429 (spec §5). It is also the
+    /// floor every classified window gets, so no match ever produces one that
+    /// has already expired.
     #[serde(default = "default_min_reset_horizon_secs")]
     pub min_reset_horizon_secs: u64,
+    /// The ceiling on a classified window. This is a units/format sanity check,
+    /// not a judgement about how long Anthropic's windows are: a reset read in
+    /// the wrong unit (epoch *milliseconds* through a rule expecting seconds)
+    /// lands ~55,000 years out, and without a ceiling that window is persisted,
+    /// survives every restart, and never elapses.
+    #[serde(default = "default_max_reset_horizon_secs")]
+    pub max_reset_horizon_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -103,6 +112,14 @@ fn default_min_reset_horizon_secs() -> u64 {
     300
 }
 
+/// A week. Claude subscription limits include weekly windows, so a tighter
+/// ceiling would reject a legitimate reset — and it costs nothing against what
+/// the ceiling is actually for, since every wrong-unit or garbage value is
+/// orders of magnitude past it.
+fn default_max_reset_horizon_secs() -> u64 {
+    7 * 24 * 60 * 60
+}
+
 impl Default for DetectConfig {
     fn default() -> Self {
         Self {
@@ -112,6 +129,7 @@ impl Default for DetectConfig {
             markers: default_markers(),
             reset: default_reset(),
             min_reset_horizon_secs: default_min_reset_horizon_secs(),
+            max_reset_horizon_secs: default_max_reset_horizon_secs(),
         }
     }
 }
@@ -125,6 +143,13 @@ impl DetectConfig {
             bail!(
                 "`detect.status` must be a 4xx or 5xx status code, got {}",
                 self.status
+            );
+        }
+        if self.min_reset_horizon_secs > self.max_reset_horizon_secs {
+            bail!(
+                "`detect.min_reset_horizon_secs` ({}) must not exceed `detect.max_reset_horizon_secs` ({})",
+                self.min_reset_horizon_secs,
+                self.max_reset_horizon_secs
             );
         }
         Ok(())
@@ -152,11 +177,8 @@ impl DetectConfig {
         // The proxy carries no decompression (see Cargo.toml), so a compressed
         // error body is opaque bytes here. Saying so is the difference between
         // a known gap and detection that silently never fires.
-        if let Some(encoding) = content_encoding(headers) {
-            tracing::warn!(
-                encoding = %encoding,
-                "limit detection skipped: upstream error body is compressed"
-            );
+        if is_compressed(headers) {
+            tracing::warn!("limit detection skipped: the upstream error body is compressed");
             return None;
         }
 
@@ -173,18 +195,33 @@ impl DetectConfig {
             .find_map(|source| source.extract(headers, &json, now));
 
         match (self.marker_matches(&json), reset_at) {
-            (true, Some(reset_at)) => Some(reset_at),
-            // An explicit marker is the signature on its own; only the window
-            // length is unknown, so take the shortest one that still counts as
-            // a limit. Guessing short is self-correcting — the probe after it
+            // An explicit marker is the signature on its own, so the response
+            // is a limit whatever the reported reset says — but a stale one
+            // would expire the window immediately and a wrong-unit one would
+            // never expire it, so the window is held inside the configured
+            // bounds. Guessing short is self-correcting: the probe after it
             // re-detects and re-limits.
-            (true, None) => now.checked_add(Duration::from_secs(self.min_reset_horizon_secs)),
+            (true, Some(reset_at)) => self.bounded(reset_at, now),
+            (true, None) => self.bounded(now, now),
+            // Without a marker the horizon *is* the evidence, so an
+            // implausible one is a reason to disbelieve the classification
+            // rather than to clamp it: pass the response through untouched.
             (false, Some(reset_at)) => {
-                let horizon = reset_at.duration_since(now).ok()?;
-                (horizon.as_secs() > self.min_reset_horizon_secs).then_some(reset_at)
+                let horizon = reset_at.duration_since(now).ok()?.as_secs();
+                (horizon > self.min_reset_horizon_secs && horizon <= self.max_reset_horizon_secs)
+                    .then_some(reset_at)
             }
             (false, None) => None,
         }
+    }
+
+    /// `max`/`min` rather than `clamp`, which panics when the bounds cross —
+    /// `validate` rejects that config, but a panic here would be in the request
+    /// path.
+    fn bounded(&self, reset_at: SystemTime, now: SystemTime) -> Option<SystemTime> {
+        let floor = now.checked_add(Duration::from_secs(self.min_reset_horizon_secs))?;
+        let ceiling = now.checked_add(Duration::from_secs(self.max_reset_horizon_secs))?;
+        Some(reset_at.max(floor).min(ceiling))
     }
 
     fn marker_matches(&self, json: &Value) -> bool {
@@ -227,9 +264,15 @@ impl ResetSource {
     }
 }
 
-fn content_encoding(headers: &HeaderMap) -> Option<&str> {
-    let encoding = headers.get("content-encoding")?.to_str().ok()?.trim();
-    (!encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity")).then_some(encoding)
+/// The value is deliberately not returned, and not logged: this proxy does not
+/// log header values, and knowing *that* a body is compressed is the whole
+/// diagnostic.
+fn is_compressed(headers: &HeaderMap) -> bool {
+    headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
 }
 
 fn lookup<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
@@ -271,6 +314,19 @@ mod tests {
             .as_secs()
     }
 
+    fn unix_secs(time: SystemTime) -> String {
+        time.duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_secs()
+            .to_string()
+    }
+
+    /// Horizons are measured against a `now` taken a moment after the one the
+    /// classifier used, so they land just under the expected value.
+    fn near(actual: u64, expected: u64) -> bool {
+        (expected.saturating_sub(5)..=expected).contains(&actual)
+    }
+
     // --- the positive signature ---
 
     #[test]
@@ -281,19 +337,101 @@ mod tests {
     }
 
     /// The marker is the signature on its own (spec §5), so a short window
-    /// alongside it must not disqualify it.
+    /// alongside it must not disqualify it — but the window it produces is
+    /// floored, or the route would recover before it ever stopped anything.
     #[test]
-    fn marker_with_a_short_retry_after_still_classifies() {
+    fn marker_with_a_short_retry_after_classifies_and_is_floored() {
         let reset_at =
             classify(LIMIT_BODY, &[("retry-after", "12")]).expect("a marker alone is enough");
-        assert!(horizon_secs(reset_at) <= 12);
+        assert!(near(
+            horizon_secs(reset_at),
+            default_min_reset_horizon_secs()
+        ));
+    }
+
+    /// A stale reset — an old `anthropic-ratelimit-*` value, or plain clock
+    /// skew — would otherwise produce a window that has already expired, so a
+    /// genuine limit would go entirely unprotected.
+    #[test]
+    fn marker_with_a_reset_in_the_past_is_floored_rather_than_expiring_at_once() {
+        let stale = unix_secs(SystemTime::now() - Duration::from_secs(600));
+        let reset_at = classify(LIMIT_BODY, &[("anthropic-ratelimit-unified-reset", &stale)])
+            .expect("a marker alone is enough");
+        assert!(near(
+            horizon_secs(reset_at),
+            default_min_reset_horizon_secs()
+        ));
     }
 
     #[test]
     fn marker_without_any_reset_source_falls_back_to_the_minimum_horizon() {
         let reset_at = classify(LIMIT_BODY, &[]).expect("a marker alone is enough");
-        let expected = default_min_reset_horizon_secs();
-        assert!((expected - 5..=expected).contains(&horizon_secs(reset_at)));
+        assert!(near(
+            horizon_secs(reset_at),
+            default_min_reset_horizon_secs()
+        ));
+    }
+
+    // --- the ceiling on a classified window ---
+
+    /// The failure this ceiling exists for: a reset read in the wrong unit
+    /// (epoch milliseconds through a seconds rule) is ~55,000 years out. Left
+    /// alone it is persisted, survives every restart, and never elapses — and
+    /// `/status` cannot even render it, so nothing says why the route is stuck.
+    #[test]
+    fn a_wrong_unit_reset_is_clamped_when_marked_and_rejected_when_not() {
+        let epoch_millis = (unix_secs(SystemTime::now()) + "000").to_string();
+        let source = [("anthropic-ratelimit-unified-reset", epoch_millis.as_str())];
+
+        let reset_at = classify(LIMIT_BODY, &source).expect("the marker still classifies");
+        assert!(
+            near(horizon_secs(reset_at), default_max_reset_horizon_secs()),
+            "a marked limit keeps a usable window, capped at the ceiling"
+        );
+
+        assert!(
+            classify(BURST_BODY, &source).is_none(),
+            "without a marker the horizon is the evidence, and an implausible one is no evidence"
+        );
+    }
+
+    #[test]
+    fn a_decade_long_horizon_is_clamped_when_marked_and_rejected_when_not() {
+        let decade = (10 * 365 * 24 * 60 * 60).to_string();
+        let source = [("retry-after", decade.as_str())];
+
+        let reset_at = classify(LIMIT_BODY, &source).expect("the marker still classifies");
+        assert!(near(
+            horizon_secs(reset_at),
+            default_max_reset_horizon_secs()
+        ));
+        assert!(classify(BURST_BODY, &source).is_none());
+    }
+
+    /// Large enough to survive `checked_add` on this platform, so the ceiling —
+    /// not the overflow guard — is what has to catch it.
+    #[test]
+    fn a_reset_near_the_end_of_representable_time_never_escapes_the_ceiling() {
+        let absurd = (i64::MAX as u64 / 2).to_string();
+        let source = [("anthropic-ratelimit-unified-reset", absurd.as_str())];
+
+        let reset_at = classify(LIMIT_BODY, &source).expect("the marker still classifies");
+        assert!(near(
+            horizon_secs(reset_at),
+            default_max_reset_horizon_secs()
+        ));
+        assert!(classify(BURST_BODY, &source).is_none());
+    }
+
+    #[test]
+    fn a_horizon_exactly_at_the_ceiling_still_classifies() {
+        let ceiling = default_max_reset_horizon_secs().to_string();
+        let reset_at = classify(BURST_BODY, &[("retry-after", &ceiling)])
+            .expect("the ceiling is inclusive, unlike the floor");
+        assert!(near(
+            horizon_secs(reset_at),
+            default_max_reset_horizon_secs()
+        ));
     }
 
     /// No marker, but a window far past the burst threshold: the other half of
@@ -465,17 +603,25 @@ mod tests {
             }],
             ..DetectConfig::default()
         };
+        // Inside the ceiling, so this checks the parse rather than the clamp.
+        let at = SystemTime::now() + Duration::from_secs(7200);
+        let seconds: i64 = unix_secs(at).parse().expect("valid seconds");
+        let text = OffsetDateTime::from_unix_timestamp(seconds)
+            .expect("representable")
+            .format(&Rfc3339)
+            .expect("formattable");
+
         let reset_at = config
             .classify(
-                &headers(&[("anthropic-ratelimit-requests-reset", "2030-01-01T00:00:00Z")]),
+                &headers(&[("anthropic-ratelimit-requests-reset", &text)]),
                 LIMIT_BODY.as_bytes(),
                 false,
                 now(),
             )
             .expect("should classify");
         assert_eq!(
-            reset_at.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            1_893_456_000
+            reset_at.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+            seconds
         );
     }
 
@@ -522,7 +668,10 @@ mod tests {
             );
             let reset_at = classify(LIMIT_BODY, &[(header, &huge)])
                 .expect("the marker still classifies without a usable reset source");
-            assert!(horizon_secs(reset_at) <= default_min_reset_horizon_secs());
+            assert!(near(
+                horizon_secs(reset_at),
+                default_min_reset_horizon_secs()
+            ));
         }
     }
 
@@ -543,6 +692,7 @@ mod tests {
             Some("rate_limit_error")
         );
         assert_eq!(config.min_reset_horizon_secs, 300);
+        assert_eq!(config.max_reset_horizon_secs, 7 * 24 * 60 * 60);
         assert_eq!(config.reset.len(), 2);
     }
 
@@ -594,6 +744,19 @@ mod tests {
             );
         }
         assert!(DetectConfig::default().validate().is_ok());
+    }
+
+    /// Crossed bounds would make every classified window collapse onto the
+    /// ceiling; catching it at startup keeps `bounded` out of that situation.
+    #[test]
+    fn validate_rejects_crossed_horizon_bounds() {
+        let config = DetectConfig {
+            min_reset_horizon_secs: 900,
+            max_reset_horizon_secs: 300,
+            ..DetectConfig::default()
+        };
+        let err = config.validate().expect_err("should reject");
+        assert!(err.to_string().contains("max_reset_horizon_secs"));
     }
 
     #[test]

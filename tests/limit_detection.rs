@@ -26,6 +26,19 @@ const SERVER_ERROR_BODY: &str =
 
 const LIMIT_RETRY_AFTER: u64 = 3600;
 const BURST_RETRY_AFTER: u64 = 12;
+/// `detect.max_reset_horizon_secs`'s default, restated so the test fails if it
+/// changes silently.
+const MAX_RESET_HORIZON_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// A reset time in epoch *milliseconds*, which the default rule reads as
+/// seconds — the units mistake the ceiling exists to survive.
+fn epoch_millis_reset() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_secs();
+    format!("{secs}000")
+}
 
 fn error_response(status: StatusCode, retry_after: u64, body: &'static str) -> Response {
     Response::builder()
@@ -50,6 +63,17 @@ fn upstream() -> Router {
             "/v1/burst",
             any(|| async {
                 error_response(StatusCode::TOO_MANY_REQUESTS, BURST_RETRY_AFTER, BURST_BODY)
+            }),
+        )
+        .route(
+            "/v1/wrong-unit",
+            any(|| async {
+                Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("content-type", "application/json")
+                    .header("anthropic-ratelimit-unified-reset", epoch_millis_reset())
+                    .body(Body::from(LIMIT_BODY))
+                    .expect("failed to build mock response")
             }),
         )
         .route(
@@ -162,12 +186,38 @@ async fn a_limit_shaped_429_flips_the_route_to_limited() {
     assert_eq!(retry_after.as_deref(), Some("3600"));
 
     let status_body = wait_for_state(relay, "LIMITED").await;
+    assert!(
+        !status_body["limited_until"].is_null(),
+        "LIMITED without a limited_until leaves an operator no way to see the window"
+    );
     let horizon = horizon_secs(&status_body["limited_until"]);
     assert!(
         (LIMIT_RETRY_AFTER as i64 + 10..=LIMIT_RETRY_AFTER as i64 + 60).contains(&horizon),
         "limited_until should be the reported reset plus 15-60s of jitter, got {horizon}s"
     );
     assert_eq!(status_body["fallback_requests_served"], 0);
+}
+
+/// The wrong-unit case end to end: epoch *milliseconds* read by a rule
+/// expecting seconds is ~55,000 years out. Unbounded it would be persisted,
+/// outlive every restart, never elapse, and show up as `LIMITED` with a
+/// `limited_until` too far out for `/status` to even render.
+#[tokio::test]
+async fn a_wrong_unit_reset_still_produces_a_window_an_operator_can_read() {
+    let relay = relay_over(serve(upstream()).await).await;
+
+    call(relay, "/v1/wrong-unit").await;
+
+    let body = wait_for_state(relay, "LIMITED").await;
+    assert!(
+        !body["limited_until"].is_null(),
+        "a bounded window must always render"
+    );
+    let horizon = horizon_secs(&body["limited_until"]);
+    assert!(
+        horizon <= MAX_RESET_HORIZON_SECS as i64 + 60,
+        "the window must be capped at the configured ceiling, got {horizon}s"
+    );
 }
 
 /// The negative case Global Constraint 6 is about. The proof that the burst was

@@ -48,10 +48,21 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
 
 /// Whole seconds, because that is the resolution `state_file` persists: any
 /// finer and the same window reads differently before and after a restart.
+///
+/// `LIMITED` always carries a `limited_until` in practice — detection bounds
+/// every window it produces — so the only way to `None` is a hand-edited state
+/// file naming a year RFC3339 cannot express. Failing that silently is what
+/// would leave an operator with a stuck route and nothing to read.
 fn rfc3339(time: SystemTime) -> Option<String> {
-    let secs = time.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    OffsetDateTime::from_unix_timestamp(secs as i64)
-        .ok()?
-        .format(&Rfc3339)
+    let rendered = time
+        .duration_since(UNIX_EPOCH)
         .ok()
+        .and_then(|since_epoch| {
+            OffsetDateTime::from_unix_timestamp(since_epoch.as_secs() as i64).ok()
+        })
+        .and_then(|time| time.format(&Rfc3339).ok());
+    if rendered.is_none() {
+        tracing::warn!("route state `until` is outside the representable range");
+    }
+    rendered
 }

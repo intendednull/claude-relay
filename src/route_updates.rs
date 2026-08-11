@@ -1,3 +1,4 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
@@ -31,16 +32,25 @@ impl RouteUpdates {
             // Ends when the last `RouteUpdates` clone — and so the last
             // `AppState` — is dropped.
             while let Ok(outcome) = inbox.recv() {
-                apply(&machine, outcome);
+                // A panic here would otherwise end the thread, and every
+                // outcome after it would vanish into a channel nobody reads
+                // while the relay went on looking healthy.
+                if catch_unwind(AssertUnwindSafe(|| apply(&machine, outcome))).is_err() {
+                    tracing::error!("route state update panicked; route state may now be stale");
+                }
             }
         });
         Self { outcomes }
     }
 
     /// Never blocks and never fails a request: if the applier is gone, route
-    /// state stops tracking, which is not a reason to break a response.
+    /// state stops tracking, which is not a reason to break a response — but it
+    /// is a reason to say so, since nothing else about the relay would look
+    /// wrong.
     pub fn record(&self, outcome: RequestOutcome) {
-        let _ = self.outcomes.send(outcome);
+        if self.outcomes.send(outcome).is_err() {
+            tracing::error!("route state applier is gone; limit detection is no longer tracked");
+        }
     }
 }
 
