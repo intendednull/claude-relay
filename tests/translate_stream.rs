@@ -57,6 +57,20 @@ fn translating_upstream(delay: Duration) -> Router {
     )
 }
 
+/// An upstream that finishes its message and then keeps the connection open,
+/// dripping more frames it has no business sending.
+fn talkative_upstream(delay: Duration) -> Router {
+    Router::new().route(
+        "/v1/chat/completions",
+        any(move || async move {
+            let mut chunks = vec![CHUNKS[0], "data: [DONE]\n\n"];
+            chunks.extend(std::iter::repeat_n(CHUNKS[0], 20));
+            let upstream = dripped_body(chunks, delay).into_data_stream();
+            Response::new(Body::from_stream(sse_stream(upstream)))
+        }),
+    )
+}
+
 fn events(bytes: &[u8]) -> Vec<(String, Value)> {
     std::str::from_utf8(bytes)
         .expect("translated output must be UTF-8")
@@ -230,5 +244,53 @@ async fn an_upstream_that_dies_mid_stream_ends_with_an_error_event() {
     assert!(
         !message.contains("http://"),
         "the error event must not carry an upstream URL: {message}"
+    );
+}
+
+/// Spec §6 is satisfied at the event level by emitting `message_stop`, but a
+/// client reads to end-of-body — so the body has to actually end, rather than
+/// waiting on an upstream that is under no obligation to hang up.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_body_ends_at_the_terminal_event_not_when_the_upstream_hangs_up() {
+    let chunk_delay = Duration::from_millis(100);
+    let upstream = serve(talkative_upstream(chunk_delay)).await;
+
+    let start = Instant::now();
+    let mut response = reqwest::Client::new()
+        .post(format!("http://{upstream}/v1/chat/completions"))
+        .send()
+        .await
+        .expect("request failed");
+
+    let mut collected = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .expect("the translated body must end cleanly")
+    {
+        collected.extend_from_slice(&chunk);
+    }
+    let elapsed = start.elapsed();
+
+    let events = events(&collected);
+    assert_eq!(
+        events
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    // The upstream has 20 more frames to dribble, one per `chunk_delay`.
+    assert!(
+        elapsed < 10 * chunk_delay,
+        "the body waited on the upstream instead of ending at message_stop \
+         ({elapsed:?})"
     );
 }

@@ -108,16 +108,25 @@ const KNOWN_BLOCK_TYPES: [&str; 6] = [
 ];
 
 impl Block {
+    /// Whether the mapping table has no row for this block type at all, as
+    /// opposed to a type it does map that failed to parse or turned up where
+    /// it cannot appear. Only the former degrades to a placeholder; the rest
+    /// are malformed requests and fail.
+    pub fn is_unmappable_type(&self) -> bool {
+        matches!(self, Block::Unknown(_)) && !KNOWN_BLOCK_TYPES.contains(&self.type_name())
+    }
+
     /// Why this block could not be translated, for the error message. A block
     /// that fell through to `Unknown` under a type this translator does map is
-    /// malformed rather than unsupported, and saying so is the difference
-    /// between looking at the client and looking at the mapping table.
+    /// malformed rather than misplaced, and saying so is the difference
+    /// between looking at the client's payload and looking at the position it
+    /// arrived in.
     pub fn problem(&self) -> String {
         match self {
             Block::Unknown(_) if KNOWN_BLOCK_TYPES.contains(&self.type_name()) => {
                 format!("malformed {:?}", self.type_name())
             }
-            _ => format!("unsupported {:?}", self.type_name()),
+            _ => format!("misplaced {:?}", self.type_name()),
         }
     }
 

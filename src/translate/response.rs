@@ -1,19 +1,25 @@
 //! OpenAI `chat.completion` → Anthropic Messages response (non-streaming).
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use super::openai::{ChatCompletion, ResponseToolCall};
+use super::openai::{ChatCompletion, ResponseToolCall, TextContent};
+use super::parse_failure;
 
 pub fn response_to_anthropic(body: &[u8]) -> Result<Vec<u8>> {
-    let completion: ChatCompletion =
-        serde_json::from_slice(body).context("upstream response is not a chat completion")?;
+    let completion: ChatCompletion = serde_json::from_slice(body)
+        .map_err(|err| parse_failure("upstream response is not a chat completion", &err))?;
     let Some(choice) = completion.choices.into_iter().next() else {
         bail!("upstream response carried no choices");
     };
 
     let mut content = Vec::new();
-    if let Some(text) = choice.message.content.filter(|text| !text.is_empty()) {
+    let text = choice
+        .message
+        .content
+        .map(TextContent::into_text)
+        .filter(|text| !text.is_empty());
+    if let Some(text) = text {
         content.push(json!({"type": "text", "text": text}));
     }
     for call in &choice.message.tool_calls {
@@ -60,8 +66,12 @@ pub(super) fn tool_arguments(arguments: &str, id: &str) -> Result<Value> {
     if arguments.trim().is_empty() {
         return Ok(json!({}));
     }
-    let value: Value = serde_json::from_str(arguments)
-        .map_err(|err| anyhow::anyhow!("tool call {id}: arguments are not valid JSON ({err})"))?;
+    let value: Value = serde_json::from_str(arguments).map_err(|err| {
+        parse_failure(
+            &format!("tool call {id}: arguments are not valid JSON"),
+            &err,
+        )
+    })?;
     if !value.is_object() {
         bail!("tool call {id}: arguments are valid JSON but not an object");
     }
@@ -270,6 +280,28 @@ mod tests {
     fn a_response_without_choices_is_an_error_not_a_panic() {
         let message = error(json!({"id": "chatcmpl-1", "model": "m", "choices": []}));
         assert!(message.contains("no choices"), "unexpected: {message}");
+    }
+
+    #[test]
+    fn a_null_message_is_tolerated_rather_than_failing_the_response() {
+        let out = translate(json!({
+            "id": "chatcmpl-1", "model": "m",
+            "choices": [{"index": 0, "message": Value::Null, "finish_reason": "stop"}],
+        }));
+        assert_eq!(out["content"], json!([]));
+        assert_eq!(out["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn message_content_as_a_parts_array_is_read_as_text() {
+        let out = translate(completion(
+            json!({"role": "assistant", "content": [{"type": "text", "text": "Hello there."}]}),
+            "stop",
+        ));
+        assert_eq!(
+            out["content"],
+            json!([{"type": "text", "text": "Hello there."}])
+        );
     }
 
     #[test]

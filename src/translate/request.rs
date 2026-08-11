@@ -2,7 +2,6 @@
 
 use anyhow::{Context as _, Result, bail};
 
-use super::BLOCK_JOIN;
 use super::anthropic::{
     Block, ImageSource, KnownBlock, MessageContent, MessagesRequest, SystemPrompt, ToolChoice,
     ToolResultContent,
@@ -11,6 +10,7 @@ use super::openai::{
     self, ChatRequest, Content, FunctionCall, FunctionDef, ImageUrl, Message, NamedFunction, Part,
     ToolCall,
 };
+use super::{BLOCK_JOIN, parse_failure};
 
 #[derive(Debug)]
 pub struct TranslatedRequest {
@@ -24,8 +24,8 @@ pub struct TranslatedRequest {
 /// `model_map`): a translator has no business deciding which model a request
 /// runs on, but it must not be possible to forget to substitute it either.
 pub fn request_to_openai(body: &[u8], target_model: &str) -> Result<TranslatedRequest> {
-    let request: MessagesRequest =
-        serde_json::from_slice(body).context("request body is not a valid Anthropic message")?;
+    let request: MessagesRequest = serde_json::from_slice(body)
+        .map_err(|err| parse_failure("request body is not a valid Anthropic message", &err))?;
     let stream = request.stream.unwrap_or(false);
     let translated = convert(request, target_model, stream)?;
     Ok(TranslatedRequest {
@@ -56,7 +56,7 @@ fn convert(request: MessagesRequest, target_model: &str, stream: bool) -> Result
         max_tokens: request.max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
-        stop: request.stop_sequences.clone(),
+        stop: stop_sequences(&request.stop_sequences),
         tools: tools(&request.tools)?,
         tool_choice: request.tool_choice.as_ref().and_then(tool_choice),
         stream,
@@ -70,8 +70,11 @@ fn system_text(system: &SystemPrompt) -> Result<Option<String>> {
             let mut texts = Vec::new();
             for block in blocks {
                 match block {
-                    Block::Known(KnownBlock::Text { text }) => texts.push(text.as_str()),
-                    Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {}
+                    Block::Known(KnownBlock::Text { text }) => texts.push(text.clone()),
+                    Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {
+                        note_dropped_thinking(block)
+                    }
+                    other if other.is_unmappable_type() => texts.push(dropped_block_note(other)),
                     other => bail!("{} block in the system prompt", other.problem()),
                 }
             }
@@ -116,7 +119,12 @@ fn user_messages(content: &MessageContent) -> Result<Vec<Message>> {
                 });
                 recovered_images.extend(images);
             }
-            Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {}
+            Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {
+                note_dropped_thinking(block)
+            }
+            other if other.is_unmappable_type() => parts.push(Part::Text {
+                text: dropped_block_note(other),
+            }),
             other => bail!("{} block in a user message", other.problem()),
         }
     }
@@ -124,8 +132,9 @@ fn user_messages(content: &MessageContent) -> Result<Vec<Message>> {
     let mut messages = tool_messages;
     // A `role: "tool"` message's content is a string, so an image returned by a
     // tool cannot ride along inside it; it is carried into the user turn that
-    // follows instead, which is the nearest place it survives at all.
-    let parts: Vec<Part> = recovered_images.into_iter().chain(parts).collect();
+    // follows instead, which is the nearest place it survives at all. It goes
+    // *after* the turn's own text, which may well be referring to it.
+    let parts: Vec<Part> = parts.into_iter().chain(recovered_images).collect();
     if !parts.is_empty() {
         messages.push(Message::new("user", collapse(parts)));
     }
@@ -144,7 +153,7 @@ fn assistant_message(content: &MessageContent) -> Result<Message> {
     let mut tool_calls = Vec::new();
     for block in blocks {
         match block {
-            Block::Known(KnownBlock::Text { text }) => texts.push(text.as_str()),
+            Block::Known(KnownBlock::Text { text }) => texts.push(text.clone()),
             Block::Known(KnownBlock::ToolUse { id, name, input }) => tool_calls.push(ToolCall {
                 id: id.clone(),
                 kind: "function",
@@ -157,7 +166,10 @@ fn assistant_message(content: &MessageContent) -> Result<Message> {
                     },
                 },
             }),
-            Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {}
+            Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {
+                note_dropped_thinking(block)
+            }
+            other if other.is_unmappable_type() => texts.push(dropped_block_note(other)),
             other => bail!("{} block in an assistant message", other.problem()),
         }
     }
@@ -183,15 +195,58 @@ fn tool_result_content(content: Option<&ToolResultContent>) -> Result<(String, V
             let mut images = Vec::new();
             for block in blocks {
                 match block {
-                    Block::Known(KnownBlock::Text { text }) => texts.push(text.as_str()),
+                    Block::Known(KnownBlock::Text { text }) => texts.push(text.clone()),
                     Block::Known(KnownBlock::Image { source }) => images.push(image_part(source)),
-                    Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {}
+                    Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {
+                        note_dropped_thinking(block)
+                    }
+                    other if other.is_unmappable_type() => texts.push(dropped_block_note(other)),
                     other => bail!("{} block in a tool_result", other.problem()),
                 }
             }
             Ok((texts.join(BLOCK_JOIN), images))
         }
     }
+}
+
+/// A block type with no row in the mapping table becomes a visible note
+/// rather than either vanishing or failing the request. Failing would be worse
+/// than it looks: an unmappable block sits in the conversation *history*, so it
+/// would break not just this request but every later one in the session — the
+/// session the fallback route exists to rescue. A block type the table does
+/// cover still fails, because that is a malformed request rather than a gap.
+fn dropped_block_note(block: &Block) -> String {
+    tracing::warn!(
+        block_type = block.type_name(),
+        "dropping a content block with no OpenAI equivalent"
+    );
+    format!(
+        "[relay: a {:?} content block was dropped here; the fallback provider has no equivalent]",
+        block.type_name()
+    )
+}
+
+/// Dropping these is spec §7c's instruction rather than a surprise, and a
+/// thinking-enabled session carries them in every turn — so this is `debug`,
+/// where the other drop is `warn`.
+fn note_dropped_thinking(block: &Block) {
+    tracing::debug!(
+        block_type = block.type_name(),
+        "dropping a thinking block, which OpenAI has no equivalent for"
+    );
+}
+
+/// OpenAI documents a limit of four stop sequences and rejects more; Anthropic
+/// does not have that limit.
+fn stop_sequences(requested: &[String]) -> Vec<String> {
+    const MAX_STOP_SEQUENCES: usize = 4;
+    if requested.len() > MAX_STOP_SEQUENCES {
+        tracing::warn!(
+            requested = requested.len(),
+            "truncating stop_sequences to the four OpenAI accepts"
+        );
+    }
+    requested.iter().take(MAX_STOP_SEQUENCES).cloned().collect()
 }
 
 fn image_part(source: &ImageSource) -> Part {
@@ -637,17 +692,90 @@ mod tests {
         assert_eq!(out["messages"][0]["content"], json!(""));
     }
 
+    /// Failing on these would break not just the request carrying one but
+    /// every later request in the session, since it stays in the history —
+    /// and that is the session the fallback route exists to rescue.
     #[test]
-    fn an_unmappable_block_type_fails_loudly_rather_than_vanishing() {
-        let message = error(json!({
+    fn an_unmappable_block_type_becomes_a_visible_placeholder() {
+        let out = translate(json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what does this say?"},
+                    {"type": "document", "source": {"type": "base64", "data": "JVBER"}},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+                     "input": {"query": "rust"}},
+                ]},
+            ],
+        }));
+
+        let first = out["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            first.starts_with("what does this say?\n\n[relay: a \"document\" content block"),
+            "the placeholder must sit where the block was: {first}"
+        );
+        assert!(
+            out["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("server_tool_use"),
+            "the note names the block type that was dropped"
+        );
+    }
+
+    #[test]
+    fn an_unmappable_block_inside_a_tool_result_becomes_a_placeholder_too() {
+        let out = translate(json!({
             "messages": [{"role": "user", "content": [
-                {"type": "document", "source": {"type": "base64", "data": "JVBER"}},
+                {"type": "tool_result", "tool_use_id": "toolu_01", "content": [
+                    {"type": "search_result", "title": "t"},
+                ]},
             ]}],
         }));
         assert!(
-            message.contains("document") && message.contains("messages[0]"),
+            out["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("search_result")
+        );
+    }
+
+    #[test]
+    fn a_block_type_the_table_covers_still_fails_when_it_is_misplaced() {
+        let message = error(json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_01", "content": "x"},
+            ]}],
+        }));
+        assert!(
+            message.contains("misplaced \"tool_result\"") && message.contains("messages[0]"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn stop_sequences_are_truncated_to_the_four_openai_accepts() {
+        let out = translate(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop_sequences": ["a", "b", "c", "d", "e"],
+        }));
+        assert_eq!(out["stop"], json!(["a", "b", "c", "d"]));
+    }
+
+    /// `serde_json`'s own message embeds the offending value on a type
+    /// mismatch, and the caller is free to log whatever error it gets back.
+    #[test]
+    fn a_parse_failure_reports_its_location_but_never_the_offending_value() {
+        let message = error(json!({
+            "max_tokens": "not-a-number-but-a-secret-looking-value",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert!(
+            !message.contains("secret-looking-value"),
+            "the client's own value must not reach the error: {message}"
+        );
+        assert!(message.contains("line"), "unexpected error: {message}");
     }
 
     #[test]

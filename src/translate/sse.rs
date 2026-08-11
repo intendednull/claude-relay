@@ -5,7 +5,7 @@
 //! thin adapter that drives it from an upstream byte stream, and is the only
 //! part that knows what a `Stream` is.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -15,7 +15,7 @@ use futures_core::Stream;
 use serde_json::{Value, json};
 
 use super::BUFFER_CAP;
-use super::openai::{ChatCompletionChunk, ToolCallDelta, Usage};
+use super::openai::{ChatCompletionChunk, TextContent, ToolCallDelta, Usage};
 use super::response::stop_reason;
 
 /// What the client is told when the upstream connection itself fails. The
@@ -24,6 +24,11 @@ use super::response::stop_reason;
 /// credential could hide (Global Constraint 2).
 const UPSTREAM_FAILED: &str = "upstream stream ended unexpectedly";
 
+/// A turn may legitimately call several tools at once, but "several" is single
+/// digits. Every slot is retained for the life of the stream, so an upstream
+/// inventing them without bound — broken or hostile — must hit a ceiling.
+const MAX_TOOL_SLOTS: usize = 256;
+
 #[derive(Debug, Default)]
 pub struct SseTranslator {
     buf: Vec<u8>,
@@ -31,7 +36,12 @@ pub struct SseTranslator {
     done: bool,
     next_index: u32,
     open: Option<Open>,
-    tools: HashMap<u32, ToolCallState>,
+    tools: BTreeMap<u32, ToolCallState>,
+    /// Every byte the tool slots are holding onto — ids, names and buffered
+    /// arguments, summed across slots. `BUFFER_CAP` bounds a single frame;
+    /// this bounds what survives between frames, which is the part an upstream
+    /// can grow without ever sending a large frame.
+    tool_bytes: usize,
     scanned: usize,
     last_slot: Option<u32>,
     finish_reason: Option<String>,
@@ -51,11 +61,18 @@ enum Open {
 struct ToolCallState {
     id: String,
     name: Option<String>,
-    /// Argument fragments that arrived before the function name did. Anthropic
-    /// cannot open a `tool_use` block without the name, so they wait here and
-    /// are replayed in order the moment it turns up.
+    /// Argument fragments with nowhere to go yet — either the function name
+    /// has not arrived (Anthropic cannot open a `tool_use` block without it),
+    /// or another call's block is still open and Anthropic allows only one at
+    /// a time. Replayed in order the moment this call gets its block.
     pending: String,
     block: Option<u32>,
+}
+
+impl ToolCallState {
+    fn is_named(&self) -> bool {
+        self.name.is_some()
+    }
 }
 
 impl SseTranslator {
@@ -103,6 +120,14 @@ impl SseTranslator {
         out
     }
 
+    /// Whether a terminal event — `message_stop` or `error` — has been emitted
+    /// and nothing further will be synthesized. The driver ends the response
+    /// body on this rather than waiting for the upstream connection to close,
+    /// which an upstream has no obligation to do promptly.
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
     fn take_frame(&mut self) -> Option<Vec<u8>> {
         let Some((end, skip)) = frame_end(&self.buf, self.scanned) else {
             // Everything but the last two bytes is known to hold no
@@ -118,6 +143,13 @@ impl SseTranslator {
     }
 
     fn handle_frame(&mut self, frame: &[u8], out: &mut Vec<u8>) {
+        let Ok(frame) = std::str::from_utf8(frame) else {
+            // Dropping it would be indistinguishable from a heartbeat, and a
+            // frame this module cannot read is a frame whose content never
+            // reaches the client — the one thing it must not do quietly.
+            self.fail("upstream sent a non-UTF-8 SSE frame", out);
+            return;
+        };
         let Some(data) = frame_data(frame) else {
             return;
         };
@@ -161,8 +193,15 @@ impl SseTranslator {
         let Some(choice) = chunk.choices.into_iter().next() else {
             return;
         };
-        if let Some(text) = choice.delta.content.filter(|text| !text.is_empty()) {
-            let index = self.open_text(out);
+        let text = choice
+            .delta
+            .content
+            .map(TextContent::into_text)
+            .filter(|text| !text.is_empty());
+        if let Some(text) = text {
+            let Some(index) = self.open_text(out) else {
+                return;
+            };
             emit(
                 out,
                 "content_block_delta",
@@ -185,64 +224,119 @@ impl SseTranslator {
     }
 
     fn apply_tool_delta(&mut self, delta: ToolCallDelta, out: &mut Vec<u8>) {
-        let slot = self.slot_for(&delta);
+        let Some(slot) = self.slot_for(&delta) else {
+            self.fail("upstream tool call index is out of range", out);
+            return;
+        };
         self.last_slot = Some(slot);
         let (name, fragment) = match delta.function {
             Some(function) => (function.name, function.arguments.unwrap_or_default()),
             None => (None, String::new()),
         };
 
-        let state = self.tools.entry(slot).or_default();
-        if let Some(id) = delta.id.filter(|id| !id.is_empty())
-            && state.id.is_empty()
+        let mut retained = 0;
         {
-            state.id = id;
-        }
-        // Set-once: OpenAI sends the whole function name in the first fragment
-        // for a call, but several compatible providers repeat it in every
-        // fragment, and appending would corrupt the name.
-        if let Some(name) = name.filter(|name| !name.is_empty())
-            && state.name.is_none()
-        {
-            state.name = Some(name);
-        }
-
-        if let Some(block) = state.block {
-            if self.open != Some(Open::Tool { block, slot }) {
-                self.fail(
-                    "upstream resumed a tool call whose content block had already closed",
-                    out,
-                );
-                return;
+            let state = self.tools.entry(slot).or_default();
+            if let Some(id) = delta.id.filter(|id| !id.is_empty())
+                && state.id.is_empty()
+            {
+                retained += id.len();
+                state.id = id;
             }
-            self.emit_input_json(block, &fragment, out);
-            return;
-        }
-
-        let Some(name) = state.name.clone() else {
-            state.pending.push_str(&fragment);
-            if state.pending.len() > BUFFER_CAP {
-                self.fail(
-                    "upstream tool call arguments exceeded the relay's buffer cap \
-                     before a function name arrived",
-                    out,
-                );
+            // Set-once: OpenAI sends the whole function name in the first
+            // fragment for a call, but several compatible providers repeat it
+            // in every fragment, and appending would corrupt the name.
+            if let Some(name) = name.filter(|name| !name.is_empty())
+                && state.name.is_none()
+            {
+                retained += name.len();
+                state.name = Some(name);
             }
-            return;
-        };
-        if state.id.is_empty() {
+        }
+        self.tool_bytes += retained;
+        if self.tools.len() > MAX_TOOL_SLOTS {
             self.fail(
-                "upstream tool call has no id to match its result against",
+                "upstream opened more parallel tool calls than the relay will track",
                 out,
             );
             return;
         }
-        let id = state.id.clone();
-        let pending = std::mem::take(&mut state.pending);
 
+        // The call whose block is open streams straight through.
+        if let Some(Open::Tool { block, slot: open }) = self.open
+            && open == slot
+        {
+            self.emit_input_json(block, &fragment, out);
+            return;
+        }
+        // A call whose block was opened and then closed can take no more
+        // fragments: its JSON would end up split across two `tool_use` blocks,
+        // both of them incomplete.
+        if self.tools[&slot].block.is_some() {
+            self.fail(
+                "upstream resumed a tool call whose content block had already closed",
+                out,
+            );
+            return;
+        }
+        // Anthropic allows one open content block at a time, so a call that
+        // turns up while another is streaming waits its turn rather than
+        // displacing it. This is what makes any interleaving order safe:
+        // providers are free to batch several calls into one delta, or to
+        // alternate between them fragment by fragment.
+        let blocked = matches!(self.open, Some(Open::Tool { .. }));
+        if blocked || !self.tools[&slot].is_named() {
+            self.buffer(slot, &fragment, out);
+            return;
+        }
         self.close_open(out);
+        let Some(block) = self.open_tool_block(slot, out) else {
+            return;
+        };
+        self.emit_input_json(block, &fragment, out);
+    }
+
+    /// Holds a fragment until its call can have a block of its own.
+    fn buffer(&mut self, slot: u32, fragment: &str, out: &mut Vec<u8>) {
+        if fragment.is_empty() {
+            return;
+        }
+        self.tools
+            .get_mut(&slot)
+            .expect("slot was just populated")
+            .pending
+            .push_str(fragment);
+        self.tool_bytes += fragment.len();
+        if self.tool_bytes > BUFFER_CAP {
+            self.fail(
+                "upstream tool call arguments exceeded the relay's buffer cap",
+                out,
+            );
+        }
+    }
+
+    /// Opens `slot`'s `tool_use` block and replays whatever it buffered. The
+    /// caller closes any block that was open first.
+    fn open_tool_block(&mut self, slot: u32, out: &mut Vec<u8>) -> Option<u32> {
+        let state = self.tools.get_mut(&slot).expect("slot was just populated");
+        let name = state.name.clone()?;
+        let id = state.id.clone();
+        let pending = if id.is_empty() {
+            String::new()
+        } else {
+            std::mem::take(&mut state.pending)
+        };
+        if id.is_empty() {
+            self.fail(
+                "upstream tool call has no id to match its result against",
+                out,
+            );
+            return None;
+        }
+        self.tool_bytes = self.tool_bytes.saturating_sub(pending.len());
+
         let block = self.next_index;
-        self.next_index += 1;
+        self.next_index = self.next_index.saturating_add(1);
         self.tools
             .get_mut(&slot)
             .expect("slot was just populated")
@@ -259,7 +353,29 @@ impl SseTranslator {
             }),
         );
         self.emit_input_json(block, &pending, out);
-        self.emit_input_json(block, &fragment, out);
+        Some(block)
+    }
+
+    /// Gives every named call still waiting a block of its own, in slot order.
+    /// A call whose name has not arrived yet is left alone — a later fragment
+    /// may still complete it, and only the end of the stream makes that a
+    /// failure.
+    fn drain_waiting_tools(&mut self, out: &mut Vec<u8>) {
+        let waiting: Vec<u32> = self
+            .tools
+            .iter()
+            .filter(|(_, state)| state.block.is_none() && state.is_named())
+            .map(|(slot, _)| *slot)
+            .collect();
+        for slot in waiting {
+            if self.done {
+                return;
+            }
+            self.close_open(out);
+            if self.open_tool_block(slot, out).is_some() {
+                self.close_open(out);
+            }
+        }
     }
 
     /// Argument fragments are re-emitted exactly as they arrived: Anthropic's
@@ -285,24 +401,40 @@ impl SseTranslator {
     /// to. Providers that only ever stream one call sometimes omit it, so an
     /// absent index means "the call already in flight" — unless the fragment
     /// carries a different id, which is a new call.
-    fn slot_for(&self, delta: &ToolCallDelta) -> u32 {
+    ///
+    /// `None` when no slot can be derived. `index` is upstream-controlled, so
+    /// the successor of `u32::MAX` has to be *something*: saturating would
+    /// hand the new call the previous call's slot and silently splice two
+    /// tool calls' arguments into one block, which is the corruption this
+    /// whole layer exists to prevent.
+    fn slot_for(&self, delta: &ToolCallDelta) -> Option<u32> {
         if let Some(index) = delta.index {
-            return index;
+            return Some(index);
         }
-        let Some(last) = self.last_slot else { return 0 };
+        let Some(last) = self.last_slot else {
+            return Some(0);
+        };
         match (self.tools.get(&last), delta.id.as_deref()) {
-            (Some(state), Some(id)) if !state.id.is_empty() && state.id != id => last + 1,
-            _ => last,
+            (Some(state), Some(id)) if !state.id.is_empty() && state.id != id => {
+                last.checked_add(1)
+            }
+            _ => Some(last),
         }
     }
 
-    fn open_text(&mut self, out: &mut Vec<u8>) -> u32 {
+    fn open_text(&mut self, out: &mut Vec<u8>) -> Option<u32> {
         if let Some(Open::Text(index)) = self.open {
-            return index;
+            return Some(index);
         }
         self.close_open(out);
+        // Calls still waiting get their blocks before the text block does, so
+        // `tool_use` blocks stay in the order the provider streamed them.
+        self.drain_waiting_tools(out);
+        if self.done {
+            return None;
+        }
         let index = self.next_index;
-        self.next_index += 1;
+        self.next_index = self.next_index.saturating_add(1);
         emit(
             out,
             "content_block_start",
@@ -313,7 +445,7 @@ impl SseTranslator {
             }),
         );
         self.open = Some(Open::Text(index));
-        index
+        Some(index)
     }
 
     fn close_open(&mut self, out: &mut Vec<u8>) {
@@ -360,6 +492,12 @@ impl SseTranslator {
         if !self.started {
             self.start_message(out);
         }
+        self.close_open(out);
+        self.drain_waiting_tools(out);
+        if self.done {
+            return;
+        }
+        self.close_open(out);
         if self
             .tools
             .values()
@@ -371,7 +509,6 @@ impl SseTranslator {
             );
             return;
         }
-        self.close_open(out);
         let stop_reason = match self.finish_reason.as_deref() {
             Some(reason) => stop_reason(reason),
             // No `finish_reason` at all: infer from what the turn actually
@@ -440,11 +577,10 @@ fn frame_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
 /// The frame's `data:` payload, with multiple `data:` lines joined by newline
 /// as SSE specifies. `None` for frames carrying no data at all — comments and
 /// heartbeats, which several providers send to keep the connection alive.
-fn frame_data(frame: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(frame).ok()?;
+fn frame_data(frame: &str) -> Option<String> {
     let mut data = String::new();
     let mut seen = false;
-    for line in text.split('\n') {
+    for line in frame.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let Some(rest) = line.strip_prefix("data:") else {
             continue;
@@ -508,8 +644,16 @@ where
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     let out = this.translator.push(&chunk);
+                    // A terminal event ends the *body*, not just the synthesis:
+                    // waiting for the upstream to hang up would leave a client
+                    // reading to end-of-body blocked on a connection the
+                    // upstream is under no obligation to close.
+                    this.drained = this.translator.is_done();
                     if !out.is_empty() {
                         return Poll::Ready(Some(Ok(Bytes::from(out))));
+                    }
+                    if this.drained {
+                        return Poll::Ready(None);
                     }
                 }
                 Poll::Ready(Some(Err(_))) => {
@@ -570,6 +714,19 @@ mod tests {
         }
         out.extend(translator.finish());
         events(&out)
+    }
+
+    /// The `input_json_delta` fragments for content block `index`, reassembled.
+    fn arguments_for(events: &[(String, Value)], index: u32) -> String {
+        events
+            .iter()
+            .filter(|(name, data)| {
+                name == "content_block_delta"
+                    && data["delta"]["type"] == "input_json_delta"
+                    && data["index"] == index
+            })
+            .map(|(_, data)| data["delta"]["partial_json"].as_str().unwrap())
+            .collect()
     }
 
     fn names(events: &[(String, Value)]) -> Vec<&str> {
@@ -874,15 +1031,125 @@ mod tests {
         assert_eq!(blocks, vec![json!("call_1"), json!("call_2")]);
     }
 
+    /// Anthropic allows one open content block at a time, so a second call
+    /// waits rather than displacing the first. That is what makes a provider
+    /// free to alternate between parallel calls fragment by fragment.
     #[test]
-    fn a_reopened_tool_call_fails_loudly_rather_than_splitting_its_json() {
+    fn interleaved_parallel_tool_calls_keep_each_calls_json_together() {
         let events = synthesize(&[
             &tool_chunk(json!({
-                "index": 0, "id": "call_1", "function": {"name": "Bash", "arguments": "{\"a\":1}"},
+                "index": 0, "id": "call_1", "function": {"name": "Bash", "arguments": "{\"a\":"},
+            })),
+            &tool_chunk(json!({
+                "index": 1, "id": "call_2", "function": {"name": "Read", "arguments": "{\"b\":"},
+            })),
+            &tool_chunk(json!({"index": 0, "function": {"arguments": "1}"}})),
+            &tool_chunk(json!({"index": 1, "function": {"arguments": "2}"}})),
+            &finish_chunk("tool_calls"),
+        ]);
+
+        assert_eq!(
+            names(&events),
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(arguments_for(&events, 0), r#"{"a":1}"#);
+        assert_eq!(arguments_for(&events, 1), r#"{"b":2}"#);
+        assert_eq!(events[1].1["content_block"]["id"], "call_1");
+        assert_eq!(events[5].1["content_block"]["id"], "call_2");
+    }
+
+    /// A whole turn's worth of parallel calls can arrive in one delta — the
+    /// wire format's `tool_calls` is an array precisely so it can.
+    #[test]
+    fn several_tool_calls_batched_into_one_delta_all_survive() {
+        let events = synthesize(&[
+            &frame(json!({
+                "id": "chatcmpl-1", "model": "target/Model",
+                "choices": [{"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "id": "call_1", "type": "function",
+                     "function": {"name": "Bash", "arguments": "{\"a\":1}"}},
+                    {"index": 1, "id": "call_2", "type": "function",
+                     "function": {"name": "Read", "arguments": "{\"b\":2}"}},
+                    {"index": 2, "id": "call_3", "type": "function",
+                     "function": {"name": "Grep", "arguments": "{\"c\":3}"}},
+                ]}, "finish_reason": Value::Null}],
+            })),
+            &finish_chunk("tool_calls"),
+        ]);
+
+        let blocks: Vec<_> = events
+            .iter()
+            .filter(|(name, _)| name == "content_block_start")
+            .map(|(_, data)| (data["index"].clone(), data["content_block"]["id"].clone()))
+            .collect();
+        assert_eq!(
+            blocks,
+            vec![
+                (json!(0), json!("call_1")),
+                (json!(1), json!("call_2")),
+                (json!(2), json!("call_3")),
+            ]
+        );
+        assert_eq!(arguments_for(&events, 0), r#"{"a":1}"#);
+        assert_eq!(arguments_for(&events, 1), r#"{"b":2}"#);
+        assert_eq!(arguments_for(&events, 2), r#"{"c":3}"#);
+    }
+
+    #[test]
+    fn a_tool_call_still_waiting_gets_its_block_before_a_later_text_block() {
+        let events = synthesize(&[
+            &tool_chunk(json!({
+                "index": 0, "id": "call_1", "function": {"name": "Bash", "arguments": "{}"},
             })),
             &tool_chunk(json!({
                 "index": 1, "id": "call_2", "function": {"name": "Read", "arguments": "{}"},
             })),
+            &text_chunk("and here is why"),
+            &finish_chunk("stop"),
+        ]);
+
+        assert_eq!(
+            names(&events),
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(events[7].1["content_block"]["type"], "text");
+        assert_eq!(events[8].1["delta"]["text"], "and here is why");
+    }
+
+    /// The genuine corruption case the interleaving support must still catch:
+    /// a call resuming after its block closed would split one JSON document
+    /// across two `tool_use` blocks, leaving both unparseable.
+    #[test]
+    fn a_call_resumed_after_its_block_closed_fails_loudly() {
+        let events = synthesize(&[
+            &tool_chunk(json!({
+                "index": 0, "id": "call_1", "function": {"name": "Bash", "arguments": "{\"a\":1}"},
+            })),
+            &text_chunk("done"),
             &tool_chunk(json!({"index": 0, "function": {"arguments": " oops"}})),
         ]);
 
@@ -893,6 +1160,108 @@ mod tests {
                 .unwrap()
                 .contains("already closed")
         );
+    }
+
+    #[test]
+    fn more_parallel_calls_than_the_relay_tracks_terminates_the_stream() {
+        let chunks: Vec<String> = (0..=MAX_TOOL_SLOTS as u32)
+            .map(|index| {
+                tool_chunk(json!({
+                    "index": index, "id": format!("call_{index}"),
+                    "function": {"name": "Bash", "arguments": "{}"},
+                }))
+            })
+            .collect();
+        let refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+        let events = synthesize(&refs);
+
+        assert_eq!(events.last().unwrap().0, "error");
+        assert!(
+            events.last().unwrap().1["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("more parallel tool calls")
+        );
+    }
+
+    /// The per-frame cap bounds one frame; this is the part an upstream can
+    /// grow without ever sending a large frame — arguments buffered across
+    /// many slots while one call's block is open.
+    #[test]
+    fn arguments_buffered_across_slots_are_bounded_in_aggregate() {
+        let mut translator = SseTranslator::new();
+        let mut out = Vec::new();
+        out.extend(
+            translator.push(
+                tool_chunk(json!({
+                    "index": 0, "id": "call_0", "function": {"name": "Bash", "arguments": "{"},
+                }))
+                .as_bytes(),
+            ),
+        );
+        let filler = "x".repeat(64 * 1024);
+        for index in 1..MAX_TOOL_SLOTS as u32 {
+            out.extend(
+                translator.push(
+                    tool_chunk(json!({
+                        "index": index, "id": format!("call_{index}"),
+                        "function": {"name": "Bash", "arguments": filler},
+                    }))
+                    .as_bytes(),
+                ),
+            );
+            if translator.is_done() {
+                break;
+            }
+        }
+
+        let events = events(&out);
+        assert_eq!(events.last().unwrap().0, "error");
+        assert!(
+            events.last().unwrap().1["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("buffer cap"),
+            "unexpected: {:?}",
+            events.last().unwrap().1
+        );
+    }
+
+    /// `index` is upstream-controlled: a `u32::MAX` slot followed by an
+    /// index-less fragment for a *different* call used to overflow — panicking
+    /// in debug, wrapping in release. Saturating instead would be worse than
+    /// either, since it hands the new call the old one's slot and splices two
+    /// tool calls' JSON into one block.
+    #[test]
+    fn a_tool_call_index_at_the_top_of_the_range_fails_rather_than_colliding() {
+        let events = synthesize(&[
+            &tool_chunk(json!({
+                "index": u32::MAX, "id": "call_1", "function": {"name": "Bash", "arguments": "{}"},
+            })),
+            &tool_chunk(json!({"id": "call_2", "function": {"name": "Read", "arguments": "{}"}})),
+        ]);
+
+        assert_eq!(events.last().unwrap().0, "error");
+        assert!(
+            events.last().unwrap().1["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("out of range")
+        );
+    }
+
+    #[test]
+    fn a_tool_call_index_at_the_top_of_the_range_is_otherwise_ordinary() {
+        let events = synthesize(&[
+            &tool_chunk(json!({
+                "index": u32::MAX, "id": "call_1",
+                "function": {"name": "Bash", "arguments": "{\"a\":1}"},
+            })),
+            &finish_chunk("tool_calls"),
+        ]);
+
+        assert!(events.iter().all(|(name, _)| name != "error"));
+        assert_eq!(arguments_for(&events, 0), r#"{"a":1}"#);
     }
 
     #[test]
@@ -1006,6 +1375,68 @@ mod tests {
                          "finish_reason": Value::Null}],
         }))]);
         assert_eq!(events[2].1["delta"]["text"], "hi");
+    }
+
+    #[test]
+    fn a_null_delta_on_a_final_chunk_is_tolerated() {
+        let events = synthesize(&[
+            &text_chunk("hi"),
+            &frame(json!({
+                "id": "chatcmpl-1", "model": "m",
+                "choices": [{"index": 0, "delta": Value::Null, "finish_reason": "stop"}],
+            })),
+        ]);
+        assert_eq!(events.last().unwrap().0, "message_stop");
+        assert_eq!(
+            events[events.len() - 2].1["delta"]["stop_reason"],
+            "end_turn"
+        );
+    }
+
+    /// Some OpenAI-compatible providers stream assistant text as a parts array
+    /// — the same shape this module writes in the request direction.
+    #[test]
+    fn delta_content_as_a_parts_array_is_read_as_text() {
+        let events = synthesize(&[&frame(json!({
+            "id": "chatcmpl-1", "model": "m",
+            "choices": [{"index": 0, "delta": {"content": [{"type": "text", "text": "hi"}]}}],
+        }))]);
+        assert_eq!(events[2].1["delta"]["text"], "hi");
+    }
+
+    #[test]
+    fn a_non_utf8_frame_fails_loudly_rather_than_passing_for_a_heartbeat() {
+        let mut translator = SseTranslator::new();
+        let mut out = Vec::new();
+        out.extend(translator.push(b"data: \xff\xfe not text\n\n"));
+        let events = events(&out);
+        assert_eq!(names(&events), vec!["error"]);
+        assert!(
+            events[0].1["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("non-UTF-8")
+        );
+    }
+
+    #[test]
+    fn done_marks_the_translator_finished_so_the_body_can_end() {
+        let mut translator = SseTranslator::new();
+        assert!(!translator.is_done());
+        translator.push(text_chunk("hi").as_bytes());
+        assert!(
+            !translator.is_done(),
+            "an ordinary chunk leaves the message open"
+        );
+        translator.push(b"data: [DONE]\n\n");
+        assert!(translator.is_done());
+    }
+
+    #[test]
+    fn an_error_event_also_marks_the_translator_finished() {
+        let mut translator = SseTranslator::new();
+        translator.push(b"data: not json at all\n\n");
+        assert!(translator.is_done());
     }
 
     #[test]

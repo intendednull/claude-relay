@@ -127,7 +127,7 @@ pub struct ChatCompletion {
 
 #[derive(Debug, Deserialize)]
 pub struct Choice {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub message: ResponseMessage,
     #[serde(default)]
     pub finish_reason: Option<String>,
@@ -136,9 +136,36 @@ pub struct Choice {
 #[derive(Debug, Default, Deserialize)]
 pub struct ResponseMessage {
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<TextContent>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub tool_calls: Vec<ResponseToolCall>,
+}
+
+/// Assistant text as either the plain string OpenAI documents or the parts
+/// array several compatible providers emit instead — the same shape this
+/// module writes in the request direction, so it is hardly exotic coming back.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TextContent {
+    Text(String),
+    Parts(Vec<TextPart>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TextPart {
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+impl TextContent {
+    /// Parts concatenate with no separator: in a stream they are fragments of
+    /// one run of text, not distinct blocks.
+    pub fn into_text(self) -> String {
+        match self {
+            TextContent::Text(text) => text,
+            TextContent::Parts(parts) => parts.into_iter().filter_map(|part| part.text).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,7 +206,7 @@ pub struct ChatCompletionChunk {
 
 #[derive(Debug, Deserialize)]
 pub struct ChunkChoice {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub delta: Delta,
     #[serde(default)]
     pub finish_reason: Option<String>,
@@ -188,7 +215,7 @@ pub struct ChunkChoice {
 #[derive(Debug, Default, Deserialize)]
 pub struct Delta {
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<TextContent>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub tool_calls: Vec<ToolCallDelta>,
 }

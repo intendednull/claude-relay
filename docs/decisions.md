@@ -253,13 +253,54 @@ this.
   for that reason. It only affects history sent *upstream*: a tool call coming
   *back* streams through as raw fragments and is never re-encoded.
 
-**Refusals, i.e. where a wrong guess would be silent corruption.** A content
-block type the table has no row for (`document`, a server-tool block), a tool
-with no `input_schema` (Anthropic's server-side tools), a tool call whose
-arguments are not a JSON object, and a streamed tool call that never carries a
-function name or an id — all fail loudly rather than translating into something
-plausible. The asymmetry is deliberate: a dropped `document` block is invisible,
-while a failed request says why.
+**Refusals, i.e. where a wrong guess would be silent corruption.** A tool with
+no `input_schema` (Anthropic's server-side tools), a tool call whose arguments
+are not a JSON object, a streamed tool call that never carries a function name
+or an id, a call resuming after its content block closed, an upstream tool-call
+`index` with no successor left in `u32`, and a block of a type the table *does*
+cover arriving malformed or somewhere it cannot appear — all fail loudly rather
+than translating into something plausible. Each is a tool contract this
+translator cannot honour halfway.
+
+**Amended after review: a content block type the table has no row for does
+*not* fail.** It was in the list above, on the reasoning that a failed request
+says why while a dropped block is invisible. That missed where such a block
+lives: a `document` (a read PDF) or a `server_tool_use`/`web_search_tool_result`
+(Claude Code's WebSearch) sits in the conversation *history*, so failing on it
+breaks not just the request carrying it but every later request in that session
+— permanently, and starting the moment Anthropic rate-limits the user, which is
+the session the fallback exists to rescue. It also was not the two-way choice it
+looked like. Such a block now becomes a placeholder text block (`[relay: a
+"document" content block was dropped here; …]`) plus a `tracing::warn!` naming
+the type: visible to the model and to the operator, without making a session
+un-fallback-able. Dropped `thinking` blocks log at `debug` rather than `warn` —
+they are spec §7c's own instruction, and a thinking-enabled session carries them
+in every turn.
+
+**One tool call streams at a time; the rest wait, buffered.** Anthropic allows a
+single open content block, and OpenAI's `delta.tool_calls` is an array precisely
+so a provider may batch or interleave parallel calls. Requiring the incoming
+fragment to match the open block — the first implementation — aborted the stream
+on any provider that did either. A call arriving while another's block is open
+now buffers into its own slot (bounded, below) and gets its block when the open
+one closes. The cost is a bounded delay on the second and later calls'
+`input_json_delta` events; the alternative was a translator that only works
+against providers that behave exactly like OpenAI's own service, which is
+unverifiable here (Global Constraint 10) and is the make-or-break of the whole
+milestone (Global Constraint 9).
+
+**Memory is bounded per frame *and* in aggregate.** `BUFFER_CAP` (4 MiB) caps an
+unterminated SSE frame, but the tool slots are what survive *between* frames, so
+an upstream could have grown them without ever sending a large frame: slot count
+is capped at `MAX_TOOL_SLOTS` (256) and the total retained across slots — ids,
+names, buffered arguments — is capped at `BUFFER_CAP` too. A `base_url` is
+operator config pointing at a third party, not a trusted peer.
+
+**The response body ends at the terminal event, not when the upstream hangs
+up.** Emitting `message_stop` or `error` and then continuing to drain the
+upstream leaves a client that reads to end-of-body waiting on a connection the
+provider is under no obligation to close. `sse_stream` ends the body as soon as
+the translator reports itself done.
 
 **`stream_options: {"include_usage": true}` is deliberately not sent.** It is
 how OpenAI asks for token counts on a streamed response, and without it the
