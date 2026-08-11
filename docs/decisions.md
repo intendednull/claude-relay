@@ -94,3 +94,12 @@ environment, never as shell text. The cost is that killing a timed-out hook
 reaches the `sh`, so a hook that forks its own children can outlive its
 timeout; the relay is unaffected either way, and killing the process group
 would mean a libc dependency for one signal.
+
+**Follow-up for Milestone 3, not a bug now:** the hook inherits the relay's
+whole environment, which today holds no credential — but spec §8's
+`[profiles.*]` puts a fallback provider's API key in one (`api_key_env =
+"RELAY_TOGETHER_KEY"`), and that environment would then be handed to an
+`sh -c` command on every state change. Milestone 3 should decide whether the
+notifier filters `RELAY_*_KEY`-shaped variables out of the child's
+environment, weighed against the inheritance a desktop notifier needs
+(`DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`).

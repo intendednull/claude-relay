@@ -76,7 +76,8 @@ format = "unix-seconds"
 #
 # It is fire-and-forget: nothing about a request waits on it, its output is
 # whatever it writes to the relay's own stdout/stderr, and a command that has
-# not exited within `timeout_secs` is killed and logged as a warning.
+# not exited within `timeout_secs` (1-60, default 5) is killed and logged as a
+# warning.
 # [notify]
 # command = "notify-send 'claude-relay' \"$RELAY_DETAIL\""
 # timeout_secs = 5

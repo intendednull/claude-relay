@@ -49,6 +49,12 @@ fn default_timeout_secs() -> u64 {
     5
 }
 
+/// A notification is fire-and-forget; anything still running a minute later has
+/// stopped being one. The ceiling also keeps the deadline arithmetic in
+/// `notify` inside `Instant`'s representable range, and bounds how long one
+/// wedged hook can hold up the next notification.
+const MAX_TIMEOUT_SECS: u64 = 60;
+
 impl Default for NotifyConfig {
     fn default() -> Self {
         Self {
@@ -59,9 +65,11 @@ impl Default for NotifyConfig {
 }
 
 impl NotifyConfig {
-    /// Both ways a configured hook can be silently unable to ever run: a blank
-    /// command is a shell that does nothing, and a zero timeout kills the hook
-    /// before it can do anything.
+    /// The ways a configured hook can be silently unable to work: a blank
+    /// command is a shell that does nothing, a zero timeout kills the hook
+    /// before it can do anything, and a timeout large enough to overflow the
+    /// deadline arithmetic panics the notifier *after* it has spawned the hook
+    /// — losing the notification and leaving the child unreaped.
     pub fn validate(&self) -> Result<()> {
         let Some(command) = &self.command else {
             return Ok(());
@@ -71,6 +79,12 @@ impl NotifyConfig {
         }
         if self.timeout_secs == 0 {
             bail!("`notify.timeout_secs` must be at least 1");
+        }
+        if self.timeout_secs > MAX_TIMEOUT_SECS {
+            bail!(
+                "`notify.timeout_secs` must be at most {MAX_TIMEOUT_SECS}, got {}",
+                self.timeout_secs
+            );
         }
         Ok(())
     }
@@ -188,6 +202,35 @@ mod tests {
         assert_eq!(config.state_file().expect("should validate"), None);
         assert!(config.notify.command.is_none());
         assert!(config.notify.validate().is_ok());
+    }
+
+    /// These values are ordinary TOML integers, and every one of them makes
+    /// the notifier's `Instant::now() + timeout` overflow and panic — which
+    /// happens *after* the hook has been spawned, so the notification is lost
+    /// and the child is never reaped. Rejecting them at load keeps that
+    /// arithmetic unreachable.
+    #[test]
+    fn a_notify_timeout_that_would_overflow_the_deadline_is_rejected() {
+        for timeout_secs in [MAX_TIMEOUT_SECS + 1, i64::MAX as u64, u64::MAX] {
+            let config = NotifyConfig {
+                command: Some("notify-send hi".to_string()),
+                timeout_secs,
+            };
+            let err = config
+                .validate()
+                .expect_err("{timeout_secs} must not reach the deadline calculation")
+                .to_string();
+            assert!(err.contains("timeout_secs"), "{timeout_secs}: {err}");
+        }
+        assert!(
+            NotifyConfig {
+                command: Some("notify-send hi".to_string()),
+                timeout_secs: MAX_TIMEOUT_SECS,
+            }
+            .validate()
+            .is_ok(),
+            "the ceiling itself is a valid timeout"
+        );
     }
 
     #[test]
