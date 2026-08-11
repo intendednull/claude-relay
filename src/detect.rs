@@ -1,8 +1,11 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use axum::http::{HeaderMap, StatusCode};
+use flate2::read::GzDecoder;
 use serde::Deserialize;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -134,6 +137,17 @@ impl Default for DetectConfig {
     }
 }
 
+/// The ceiling on the ceiling. `max_reset_horizon_secs` is what stops a
+/// wrong-unit reset from producing a window that never elapses — but written in
+/// the wrong unit *itself* (milliseconds for seconds) it stops being a bound:
+/// large enough and `bounded`'s `checked_add` returns `None`, silently killing
+/// every marked classification; merely huge and it yields a `Limited` state
+/// whose `until` is past what `rfc3339` can render, so `/status` shows a stuck
+/// route with a null window and nothing says why. 10 years is orders of
+/// magnitude past any subscription window and orders of magnitude short of
+/// either failure.
+const MAX_RESET_HORIZON_CEILING_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+
 impl DetectConfig {
     /// A status the proxy never classifies (2xx, or not a status at all) would
     /// leave detection silently dead, which is the one failure this milestone
@@ -143,6 +157,12 @@ impl DetectConfig {
             bail!(
                 "`detect.status` must be a 4xx or 5xx status code, got {}",
                 self.status
+            );
+        }
+        if self.max_reset_horizon_secs > MAX_RESET_HORIZON_CEILING_SECS {
+            bail!(
+                "`detect.max_reset_horizon_secs` must be at most {MAX_RESET_HORIZON_CEILING_SECS} (10 years), got {}",
+                self.max_reset_horizon_secs
             );
         }
         if self.min_reset_horizon_secs > self.max_reset_horizon_secs {
@@ -174,15 +194,9 @@ impl DetectConfig {
         if truncated {
             return None;
         }
-        // The proxy carries no decompression (see Cargo.toml), so a compressed
-        // error body is opaque bytes here. Saying so is the difference between
-        // a known gap and detection that silently never fires.
-        if is_compressed(headers) {
-            tracing::warn!("limit detection skipped: the upstream error body is compressed");
-            return None;
-        }
+        let body = classification_body(headers, body)?;
 
-        let json: Value = serde_json::from_slice(body).ok()?;
+        let json: Value = serde_json::from_slice(&body).ok()?;
         for (path, expected) in &self.match_body {
             if lookup(&json, path)?.as_str()? != expected {
                 return None;
@@ -264,15 +278,84 @@ impl ResetSource {
     }
 }
 
-/// The value is deliberately not returned, and not logged: this proxy does not
-/// log header values, and knowing *that* a body is compressed is the whole
-/// diagnostic.
-fn is_compressed(headers: &HeaderMap) -> bool {
-    headers
-        .get("content-encoding")
-        .and_then(|value| value.to_str().ok())
+/// A ceiling on what one classification is allowed to expand to. The 1 MiB the
+/// accumulator already enforces bounds the *compressed* bytes and says nothing
+/// about the output: gzip reaches ratios in the thousands, so without this a
+/// misbehaving upstream could turn a small error response into gigabytes of
+/// allocation. 4x the input cap is far past any error body — the real ones are
+/// a few hundred bytes — while keeping the worst case a fixed few megabytes.
+const MAX_DECOMPRESSED_BODY: u64 = 4 * 1024 * 1024;
+
+enum BodyEncoding {
+    Identity,
+    Gzip,
+    Unsupported,
+}
+
+/// Header values are deliberately not logged (this proxy logs none), so an
+/// unsupported encoding is diagnosed by the fact alone, not by naming it.
+fn body_encoding(headers: &HeaderMap) -> BodyEncoding {
+    let mut encodings = headers
+        .get_all("content-encoding")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
         .map(str::trim)
-        .is_some_and(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
+        .filter(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"));
+
+    // A second encoding means the body was compressed twice; unwinding that is
+    // guesswork detection has no reason to take on.
+    match (encodings.next(), encodings.next()) {
+        (None, _) => BodyEncoding::Identity,
+        (Some(encoding), None)
+            if encoding.eq_ignore_ascii_case("gzip") || encoding.eq_ignore_ascii_case("x-gzip") =>
+        {
+            BodyEncoding::Gzip
+        }
+        _ => BodyEncoding::Unsupported,
+    }
+}
+
+/// Detection's own view of the body, decompressed where it can be. Nothing here
+/// touches what the client receives or what `--capture-errors` writes: both keep
+/// the exact bytes the upstream sent (Milestone 1's fidelity guarantee).
+///
+/// Anthropic gzips error bodies whenever the client asks it to, and Claude
+/// Code's client does by default — so this is the ordinary path in production,
+/// not an edge case.
+fn classification_body<'a>(headers: &HeaderMap, body: &'a [u8]) -> Option<Cow<'a, [u8]>> {
+    match body_encoding(headers) {
+        BodyEncoding::Identity => Some(Cow::Borrowed(body)),
+        BodyEncoding::Gzip => match decompress_gzip(body) {
+            Some(decoded) => Some(Cow::Owned(decoded)),
+            None => {
+                tracing::warn!(
+                    "limit detection skipped: the upstream error body did not decompress"
+                );
+                None
+            }
+        },
+        BodyEncoding::Unsupported => {
+            tracing::warn!(
+                "limit detection skipped: the upstream error body uses an unsupported content-encoding"
+            );
+            None
+        }
+    }
+}
+
+/// `None` for a body that is not gzip after all, is truncated mid-stream, or
+/// expands past `MAX_DECOMPRESSED_BODY` — all of which mean the same thing to
+/// the caller: nothing to classify, so pass the response through.
+fn decompress_gzip(body: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::new();
+    // Reading one byte past the cap is what tells a body exactly at the cap from
+    // one that ran over it.
+    GzDecoder::new(body)
+        .take(MAX_DECOMPRESSED_BODY + 1)
+        .read_to_end(&mut decoded)
+        .ok()?;
+    (decoded.len() as u64 <= MAX_DECOMPRESSED_BODY).then_some(decoded)
 }
 
 fn lookup<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
@@ -511,8 +594,83 @@ mod tests {
         assert!(result.is_none());
     }
 
+    // --- compressed bodies (the production path: Anthropic gzips when asked,
+    // and Claude Code's client always asks) ---
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).expect("gzip write failed");
+        encoder.finish().expect("gzip finish failed")
+    }
+
+    fn classify_gzipped(body: &str, pairs: &[(&str, &str)]) -> Option<SystemTime> {
+        DetectConfig::default().classify(&headers(pairs), &gzip(body.as_bytes()), false, now())
+    }
+
     #[test]
-    fn a_compressed_body_never_classifies() {
+    fn a_gzipped_limit_body_classifies() {
+        for encoding in ["gzip", "GZIP", "x-gzip", " gzip "] {
+            let reset_at = classify_gzipped(
+                LIMIT_BODY,
+                &[("retry-after", "3600"), ("content-encoding", encoding)],
+            )
+            .unwrap_or_else(|| panic!("a gzipped limit response must classify ({encoding:?})"));
+            assert!((3500..=3600).contains(&horizon_secs(reset_at)));
+        }
+    }
+
+    /// Decompression must not make detection any less conservative: the burst
+    /// 429 is still a burst 429 once it is readable.
+    #[test]
+    fn a_gzipped_burst_body_still_does_not_classify() {
+        assert!(
+            classify_gzipped(
+                BURST_BODY,
+                &[("retry-after", "12"), ("content-encoding", "gzip")]
+            )
+            .is_none()
+        );
+    }
+
+    /// The compressed body is capped at 1 MiB by the accumulator, which bounds
+    /// nothing about what it expands to: a few hundred bytes of gzip can carry
+    /// gigabytes of output.
+    #[test]
+    fn a_decompression_bomb_is_not_classified() {
+        let bomb = gzip(&vec![b'a'; (MAX_DECOMPRESSED_BODY + 1) as usize]);
+        assert!(
+            bomb.len() < 64 * 1024,
+            "the bomb must be small compressed, or it is not testing the cap"
+        );
+        let result = DetectConfig::default().classify(
+            &headers(&[("retry-after", "3600"), ("content-encoding", "gzip")]),
+            &bomb,
+            false,
+            now(),
+        );
+        assert!(result.is_none());
+    }
+
+    /// The other side of the cap: it must be generous enough that a real body
+    /// with an unusually long message still gets read in full.
+    #[test]
+    fn a_large_body_under_the_cap_still_classifies() {
+        let filler = "x".repeat(1024 * 1024);
+        let body = format!(
+            r#"{{"error":{{"type":"rate_limit_error","message":"You have reached your usage limit.","detail":"{filler}"}}}}"#
+        );
+        assert!(
+            classify_gzipped(
+                &body,
+                &[("retry-after", "3600"), ("content-encoding", "gzip")]
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn a_body_labelled_gzip_that_is_not_gzip_does_not_classify() {
         let result = DetectConfig::default().classify(
             &headers(&[("retry-after", "3600"), ("content-encoding", "gzip")]),
             LIMIT_BODY.as_bytes(),
@@ -521,8 +679,49 @@ mod tests {
         );
         assert!(
             result.is_none(),
-            "compressed bytes are not JSON; classifying them would be a guess"
+            "a body that fails to decompress is not JSON either; classifying it would be a guess"
         );
+    }
+
+    #[test]
+    fn a_gzip_stream_that_stops_early_does_not_classify() {
+        let complete = gzip(LIMIT_BODY.as_bytes());
+        let cut = &complete[..complete.len() - 8];
+        let result = DetectConfig::default().classify(
+            &headers(&[("retry-after", "3600"), ("content-encoding", "gzip")]),
+            cut,
+            false,
+            now(),
+        );
+        assert!(result.is_none(), "a partial document must never classify");
+    }
+
+    /// Everything detection cannot read is still passed through untouched —
+    /// including a doubly-compressed body, which is not worth unwinding.
+    #[test]
+    fn an_unsupported_content_encoding_does_not_classify() {
+        for encoding in ["br", "zstd", "deflate", "gzip, gzip"] {
+            let result = DetectConfig::default().classify(
+                &headers(&[("retry-after", "3600"), ("content-encoding", encoding)]),
+                LIMIT_BODY.as_bytes(),
+                false,
+                now(),
+            );
+            assert!(result.is_none(), "{encoding} must not be guessed at");
+        }
+    }
+
+    /// The cap is on the classifier's own copy; a truncated accumulation is
+    /// rejected before any of it is read.
+    #[test]
+    fn a_truncated_gzipped_body_never_reaches_decompression() {
+        let result = DetectConfig::default().classify(
+            &headers(&[("retry-after", "3600"), ("content-encoding", "gzip")]),
+            &gzip(LIMIT_BODY.as_bytes()),
+            true,
+            now(),
+        );
+        assert!(result.is_none());
     }
 
     #[test]
@@ -757,6 +956,63 @@ mod tests {
         };
         let err = config.validate().expect_err("should reject");
         assert!(err.to_string().contains("max_reset_horizon_secs"));
+    }
+
+    /// The ceiling is what keeps a wrong-unit *reset* survivable, so a
+    /// wrong-unit ceiling is the same bug one level up — and it is reachable by
+    /// an ordinary TOML integer. Past `bounded`'s `checked_add` every marked
+    /// classification silently stops happening; short of it, `Limited` renders
+    /// a null window `/status` cannot explain.
+    #[test]
+    fn validate_rejects_a_max_reset_horizon_that_is_not_a_bound_at_all() {
+        for max_reset_horizon_secs in [
+            7 * 24 * 60 * 60 * 1000, // 7 days written in milliseconds
+            i64::MAX as u64,
+            u64::MAX,
+        ] {
+            let config = DetectConfig {
+                max_reset_horizon_secs,
+                ..DetectConfig::default()
+            };
+            let err = config
+                .validate()
+                .expect_err("an unbounded ceiling bounds nothing")
+                .to_string();
+            assert!(
+                err.contains("max_reset_horizon_secs"),
+                "{max_reset_horizon_secs}: {err}"
+            );
+        }
+
+        assert!(
+            DetectConfig {
+                max_reset_horizon_secs: MAX_RESET_HORIZON_CEILING_SECS,
+                ..DetectConfig::default()
+            }
+            .validate()
+            .is_ok(),
+            "the ceiling itself is a valid configuration"
+        );
+    }
+
+    /// The two failures the ceiling exists to keep unreachable, checked against
+    /// the machinery itself rather than assumed from the number.
+    #[test]
+    fn a_horizon_at_the_ceiling_still_produces_a_renderable_window() {
+        let config = DetectConfig {
+            max_reset_horizon_secs: MAX_RESET_HORIZON_CEILING_SECS,
+            ..DetectConfig::default()
+        };
+        let at_ceiling = config
+            .bounded(
+                SystemTime::now() + Duration::from_secs(u32::MAX as u64),
+                now(),
+            )
+            .expect("`checked_add` must not overflow inside the ceiling");
+        assert!(
+            crate::route_state::rfc3339(at_ceiling).is_some(),
+            "a window `/status` cannot render is a stuck route with no diagnosis"
+        );
     }
 
     #[test]

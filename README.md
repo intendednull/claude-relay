@@ -66,21 +66,26 @@ to be left on across restarts — fixtures accumulate rather than overwrite.
   `anthropic-ratelimit-*` included, since those are the point.
 - `"truncated": true` means the body is partial — it hit the 1 MiB cap, the
   upstream died mid-body, or the client hung up. Absent means complete.
-- A non-UTF-8 body lands in `body_base64` instead of `body`. A gzip-encoded
-  error response is opaque bytes to the proxy, so it shows up that way rather
-  than as readable JSON; decode and decompress it by hand (`base64 -d | zcat`).
+- A non-UTF-8 body lands in `body_base64` instead of `body`. Fixtures hold the
+  exact bytes the upstream sent and are never decompressed — limit detection
+  decompresses a copy of its own, not this one — so a gzip-encoded error
+  response shows up that way rather than as readable JSON; decode it by hand
+  (`base64 -d | zcat`).
 - Fixtures are written 0600, into a directory the relay creates 0700 (a
   directory that already exists keeps its own permissions). They are still
   unredacted response bodies on disk — treat them as sensitive.
 
 ## Limit detection
 
-Every non-2xx Anthropic response is classified against the `[detect]` rule in
-the config file (see `relay.example.toml`, which spells out the built-in
-defaults). A match moves the route to `LIMITED` until the reported reset plus
-15–60s of jitter; the window elapsing moves it to `PROBING`; the next
-successful response moves it back to `ACTIVE`. `GET /status` reports the
-current state and `limited_until`.
+Anthropic responses carrying the status named by the `[detect]` rule in the
+config file — 429 by default; see `relay.example.toml`, which spells out every
+built-in default — are classified against the rest of that rule. They are also
+the only responses whose bodies the relay buffers at all, so a limit returned
+under a different status code goes unnoticed until `detect.status` names it. A
+match moves the route to `LIMITED` until the reported reset plus 15–60s of
+jitter; the window elapsing moves it to `PROBING`; the next successful response
+moves it back to `ACTIVE`. `GET /status` reports the current state and
+`limited_until`.
 
 - **Nothing else changes yet.** The client always receives the upstream's own
   response, byte for byte, whether or not it classified as a limit.
@@ -97,9 +102,14 @@ current state and `limited_until`.
   not code.
 - Set `state_file` to keep the state across a restart, so a restart mid-limit
   doesn't go straight back to Anthropic.
-- A compressed error body cannot be classified — the proxy carries no
-  decompression, by design (see `Cargo.toml`). It logs a warning and passes
-  the response through rather than guessing.
+- **A gzipped error body is classified normally.** Anthropic compresses error
+  bodies whenever the client asks it to, and Claude Code's client always asks,
+  so this is the ordinary case rather than an edge one. Only detection's own
+  copy is decompressed (capped at 4 MiB of output, so a malicious upstream
+  cannot expand a small body into unbounded memory); the client still receives
+  the upstream's exact bytes, `content-encoding` included. Any other encoding —
+  `br`, `zstd`, or a doubly-compressed body — logs a warning and passes through
+  unclassified rather than being guessed at.
 
 ## Notifications
 

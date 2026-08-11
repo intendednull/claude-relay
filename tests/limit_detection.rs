@@ -40,6 +40,20 @@ fn epoch_millis_reset() -> String {
     format!("{secs}000")
 }
 
+/// What Anthropic actually returns when the client asks for compression — which
+/// Claude Code's HTTP client does by default. Compressed here rather than
+/// embedded as fixed bytes so the fidelity assertion below compares the client's
+/// bytes against the exact bytes this upstream served.
+fn gzipped_limit_body() -> Vec<u8> {
+    use std::io::Write;
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(LIMIT_BODY.as_bytes())
+        .expect("gzip write failed");
+    encoder.finish().expect("gzip finish failed")
+}
+
 fn error_response(status: StatusCode, retry_after: u64, body: &'static str) -> Response {
     Response::builder()
         .status(status)
@@ -73,6 +87,18 @@ fn upstream() -> Router {
                     .header("content-type", "application/json")
                     .header("anthropic-ratelimit-unified-reset", epoch_millis_reset())
                     .body(Body::from(LIMIT_BODY))
+                    .expect("failed to build mock response")
+            }),
+        )
+        .route(
+            "/v1/limit-gzip",
+            any(|| async {
+                Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("content-type", "application/json")
+                    .header("content-encoding", "gzip")
+                    .header("retry-after", LIMIT_RETRY_AFTER.to_string())
+                    .body(Body::from(gzipped_limit_body()))
                     .expect("failed to build mock response")
             }),
         )
@@ -196,6 +222,47 @@ async fn a_limit_shaped_429_flips_the_route_to_limited() {
         "limited_until should be the reported reset plus 15-60s of jitter, got {horizon}s"
     );
     assert_eq!(status_body["fallback_requests_served"], 0);
+}
+
+/// The production shape of the same event, and the one this milestone shipped
+/// blind to at first: Anthropic gzips its error bodies whenever the client asks
+/// it to, and Claude Code's client always asks. Both halves are asserted at once
+/// — detection reads through the compression, and the client still receives the
+/// upstream's exact compressed bytes, because only the classifier's own copy is
+/// ever decompressed.
+#[tokio::test]
+async fn a_gzipped_limit_body_classifies_and_still_reaches_the_client_byte_for_byte() {
+    let relay = relay_over(serve(upstream()).await).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{relay}/v1/limit-gzip"))
+        .body(r#"{"model":"claude-opus-5","messages":[]}"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-encoding")
+            .map(|value| value.as_bytes()),
+        Some(b"gzip".as_slice()),
+        "the client's response must still describe itself as the upstream did"
+    );
+    let body = response.bytes().await.expect("failed to read body");
+    assert_eq!(
+        body.as_ref(),
+        gzipped_limit_body(),
+        "detection must decompress its own copy only, never the client's response"
+    );
+
+    let status_body = wait_for_state(relay, "LIMITED").await;
+    let horizon = horizon_secs(&status_body["limited_until"]);
+    assert!(
+        (LIMIT_RETRY_AFTER as i64 + 10..=LIMIT_RETRY_AFTER as i64 + 60).contains(&horizon),
+        "a gzipped limit response must produce the same window as a plain one, got {horizon}s"
+    );
 }
 
 /// The wrong-unit case end to end: epoch *milliseconds* read by a rule

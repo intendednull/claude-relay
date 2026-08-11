@@ -40,6 +40,8 @@ min_reset_horizon_secs = 300
 # through a rule expecting seconds) lands ~55,000 years out; unbounded, such a
 # window is persisted, survives every restart and never elapses. A marked limit
 # past this ceiling is capped to it; an unmarked one is not believed at all.
+# Itself capped at 10 years, so a ceiling written in the wrong unit is rejected
+# at startup rather than quietly becoming no ceiling at all.
 max_reset_horizon_secs = 604800   # 7 days: Claude limits include weekly windows
 
 # Reset-time sources in preference order: the first that yields a time wins.

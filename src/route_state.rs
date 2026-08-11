@@ -119,7 +119,7 @@ impl RouteStateMachine {
     /// transition (spec §4: no background timer, checked lazily on query)
     /// when `until` has passed, persisting the change before returning it.
     pub fn current_state(&self) -> RouteState {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.lock();
         if let RouteState::Limited { until } = *guard
             && SystemTime::now() >= until
         {
@@ -144,8 +144,20 @@ impl RouteStateMachine {
         self.apply(RouteEvent::Succeeded)
     }
 
+    /// A panic while this guard is held would poison the mutex, and every later
+    /// `lock().unwrap()` would panic on it in turn: the applier thread's
+    /// `catch_unwind` would keep it alive only to re-panic on every request, and
+    /// `/status` would 500 for good. `RouteState` is a `Copy` enum with no
+    /// invariant a half-finished mutation could tear, so taking the value back
+    /// out of a poisoned lock loses nothing.
+    fn lock(&self) -> std::sync::MutexGuard<'_, RouteState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn apply(&self, event: RouteEvent) -> Option<RouteTransition> {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.lock();
         let from = *guard;
         let to = transition(from, event);
         if to == from {

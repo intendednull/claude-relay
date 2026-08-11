@@ -134,6 +134,18 @@ async fn wait_for_hook_lines(log: &Path, count: usize) -> Vec<String> {
     }
 }
 
+/// `wait_for_hook_lines` returns the instant it sees enough lines, so a count
+/// asserted on its result cannot catch a spurious extra one arriving just after.
+/// Reading again past a settle window can.
+async fn hook_lines_after_settling(log: &Path) -> Vec<String> {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
 fn fields(line: &str) -> Vec<&str> {
     line.split('|').collect()
 }
@@ -148,7 +160,8 @@ async fn a_detected_limit_fires_failover_engaged_with_the_reset_time() {
         StatusCode::TOO_MANY_REQUESTS
     );
 
-    let lines = wait_for_hook_lines(&log, 1).await;
+    wait_for_hook_lines(&log, 1).await;
+    let lines = hook_lines_after_settling(&log).await;
     assert_eq!(
         lines.len(),
         1,
