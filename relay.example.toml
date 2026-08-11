@@ -1,8 +1,55 @@
-# Milestone 1 config shape. Later milestones add `state_file`,
-# `[profiles.*]`, `[policy]`, `[detect]`, and `[notify]` sections (see
-# docs/spec.md §8) — not implemented yet, so don't add them here.
+# Milestone 1 + 2 config shape. Later milestones add `[profiles.*]`,
+# `[policy]`, and `[notify]` sections (see docs/spec.md §8) — not implemented
+# yet, so don't add them here.
 
 listen = "127.0.0.1:8484"
 
+# Optional. Where route state (ACTIVE / LIMITED / PROBING and its reset time)
+# survives a restart, so a restart mid-limit doesn't go straight back to
+# Anthropic. Absent means in-memory only. Must be an absolute path — `~` is
+# not expanded.
+# state_file = "/home/you/.local/state/relay/state.json"
+
 [anthropic]
 base_url = "https://api.anthropic.com"
+
+# Limit detection (spec §5). The whole section is optional and every key has a
+# default: what is written out below IS the built-in default, so omitting a key
+# keeps it. Anything that doesn't match passes through to the client untouched
+# and never changes route state.
+#
+# These values are derived from spec §5's *expected* shape, not from a captured
+# real limit response (docs/decisions.md). Once `--capture-errors` has caught a
+# genuine subscription-limit 429, re-derive them from that fixture — a config
+# edit, not a rebuild, which is the point.
+[detect]
+status = 429
+# Dotted paths into the JSON body that must all equal the given string.
+match_body = { "error.type" = "rate_limit_error" }
+# Case-insensitive substrings searched in `marker_field`. A hit is an explicit
+# subscription marker, which classifies on its own regardless of the horizon.
+marker_field = "error.message"
+markers = ["usage limit", "subscription"]
+# Without a marker, the reset must be further out than this to count as the
+# subscription limit rather than an ordinary per-minute burst 429.
+min_reset_horizon_secs = 300
+
+# Reset-time sources in preference order: the first that yields a time wins.
+# `from` is header | body (body names are dotted paths), and `format` is
+# delta-seconds | unix-seconds | rfc3339.
+[[detect.reset]]
+from = "header"
+name = "retry-after"
+format = "delta-seconds"
+
+[[detect.reset]]
+from = "header"
+name = "anthropic-ratelimit-unified-reset"
+format = "unix-seconds"
+
+# Anthropic's per-endpoint reset headers are RFC3339 rather than epoch seconds;
+# add them the same way if a captured fixture shows them carrying the window:
+# [[detect.reset]]
+# from = "header"
+# name = "anthropic-ratelimit-requests-reset"
+# format = "rfc3339"

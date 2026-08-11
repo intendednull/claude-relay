@@ -57,7 +57,12 @@ fn transition(state: RouteState, event: RouteEvent) -> RouteState {
 
 fn add_jitter(reset_at: SystemTime) -> SystemTime {
     let jitter_secs: u64 = rand::random_range(JITTER_MIN_SECS..=JITTER_MAX_SECS);
-    reset_at + Duration::from_secs(jitter_secs)
+    // `reset_at` is derived from an upstream-supplied reset time, and plain
+    // `SystemTime` addition panics on overflow — here that would kill the
+    // thread applying transitions and stop state tracking for good.
+    reset_at
+        .checked_add(Duration::from_secs(jitter_secs))
+        .unwrap_or(reset_at)
 }
 
 /// Thread-safe wrapper around `RouteState`, optionally backed by a JSON

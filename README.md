@@ -12,8 +12,10 @@ or extend it: [`docs/decisions.md`](docs/decisions.md).
 
 Pre-alpha. Milestone 1 (transparent passthrough proxy, `/status`,
 `--capture-errors`) is complete — see [`docs/plans/`](docs/plans/). Milestone
-2 (limit detection) is next; there is no fallback routing yet, so every
-request goes to Anthropic.
+2 is in progress: limit detection and the route state machine are in, the
+notifier is not. There is still no fallback routing (Milestone 3), so every
+request goes to Anthropic and a detected limit only changes what `/status`
+reports.
 
 ## Running it
 
@@ -70,6 +72,30 @@ to be left on across restarts — fixtures accumulate rather than overwrite.
 - Fixtures are written 0600, into a directory the relay creates 0700 (a
   directory that already exists keeps its own permissions). They are still
   unredacted response bodies on disk — treat them as sensitive.
+
+## Limit detection
+
+Every non-2xx Anthropic response is classified against the `[detect]` rule in
+the config file (see `relay.example.toml`, which spells out the built-in
+defaults). A match moves the route to `LIMITED` until the reported reset plus
+15–60s of jitter; the window elapsing moves it to `PROBING`; the next
+successful response moves it back to `ACTIVE`. `GET /status` reports the
+current state and `limited_until`.
+
+- **Nothing else changes yet.** The client always receives the upstream's own
+  response, byte for byte, whether or not it classified as a limit.
+- **Non-matches never move state.** A per-minute burst 429 needs either an
+  explicit subscription marker in the message or a reset further out than
+  `min_reset_horizon_secs` (default 5 minutes) before it counts.
+- **The default rule is a guess** from spec §5's expected shape, not from a
+  real limit response (`docs/decisions.md`). Catch one with
+  `--capture-errors` and re-derive the rule from the fixture; it is config,
+  not code.
+- Set `state_file` to keep the state across a restart, so a restart mid-limit
+  doesn't go straight back to Anthropic.
+- A compressed error body cannot be classified — the proxy carries no
+  decompression, by design (see `Cargo.toml`). It logs a warning and passes
+  the response through rather than guessing.
 
 ## Logging
 

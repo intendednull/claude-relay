@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 
 use crate::capture::Capture;
 use crate::config::Config;
+use crate::route_state::RouteStateMachine;
+use crate::route_updates::RouteUpdates;
 
 /// Bounds connection establishment only. There is deliberately no overall
 /// timeout: a streamed response stays open for as long as the model generates,
@@ -38,6 +40,10 @@ pub struct AppState {
     /// request, and only `/status` ever reads the digest.
     pub config_digest: Arc<str>,
     pub http: reqwest::Client,
+    /// Read by `/status`; written only through `route_updates`, so the request
+    /// path never blocks on the state file.
+    pub route: Arc<RouteStateMachine>,
+    pub route_updates: RouteUpdates,
 }
 
 impl AppState {
@@ -57,11 +63,16 @@ impl AppState {
 
         let capture = capture_errors.map(Capture::new).transpose()?;
 
+        let route = Arc::new(RouteStateMachine::new(config.state_file()?)?);
+        let route_updates = RouteUpdates::spawn(route.clone());
+
         Ok(Self {
             config,
             capture,
             config_digest: config_digest.into(),
             http,
+            route,
+            route_updates,
         })
     }
 }

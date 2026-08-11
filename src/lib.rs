@@ -1,8 +1,10 @@
 pub mod capture;
 pub mod cli;
 pub mod config;
+pub mod detect;
 pub mod proxy;
 pub mod route_state;
+pub mod route_updates;
 pub mod state;
 pub mod status;
 

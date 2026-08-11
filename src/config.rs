@@ -1,16 +1,24 @@
 use std::fs;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::detect::DetectConfig;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: String,
+    /// Where route state survives a restart; absent means in-memory only,
+    /// which is spec §4's default ("optional small JSON file").
+    #[serde(default)]
+    pub state_file: Option<PathBuf>,
     pub anthropic: AnthropicConfig,
+    #[serde(default)]
+    pub detect: DetectConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +84,19 @@ impl Config {
         }
         Ok(url)
     }
+
+    /// Spec §8's own example writes `state_file = "~/.local/state/..."`, and
+    /// nothing here expands `~` — left alone it would silently create a
+    /// directory literally named `~` next to wherever the relay was started.
+    pub fn state_file(&self) -> Result<Option<PathBuf>> {
+        let Some(path) = &self.state_file else {
+            return Ok(None);
+        };
+        if path.starts_with("~") {
+            bail!("`state_file` must be an absolute path: `~` is not expanded");
+        }
+        Ok(Some(path.clone()))
+    }
 }
 
 #[cfg(test)]
@@ -94,6 +115,83 @@ mod tests {
         let config = Config::from_toml_str(raw).expect("should parse");
         assert_eq!(config.listen, "127.0.0.1:8484");
         assert_eq!(config.anthropic.base_url, "https://api.anthropic.com");
+    }
+
+    /// Milestone 1 configs keep working, and get the documented detection
+    /// defaults without naming them.
+    #[test]
+    fn state_file_and_detect_are_optional() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+        "#;
+
+        let config = Config::from_toml_str(raw).expect("should parse");
+        assert!(config.state_file.is_none());
+        assert_eq!(config.detect.status, DetectConfig::default().status);
+        assert_eq!(config.state_file().expect("should validate"), None);
+    }
+
+    #[test]
+    fn parses_state_file_and_a_detect_section() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+            state_file = "/var/lib/relay/state.json"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [detect]
+            status = 429
+            min_reset_horizon_secs = 900
+            match_body = { "error.type" = "rate_limit_error" }
+
+            [[detect.reset]]
+            from = "header"
+            name = "retry-after"
+            format = "delta-seconds"
+        "#;
+
+        let config = Config::from_toml_str(raw).expect("should parse");
+        assert_eq!(
+            config.state_file().expect("should validate"),
+            Some(PathBuf::from("/var/lib/relay/state.json"))
+        );
+        assert_eq!(config.detect.min_reset_horizon_secs, 900);
+        assert_eq!(config.detect.reset.len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_detect_field_is_a_parse_error() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [detect]
+            jsonpath = "$.error.type"
+        "#;
+        let err = Config::from_toml_str(raw).expect_err("should fail to parse");
+        assert!(err.to_string().contains("jsonpath"));
+    }
+
+    /// Copying spec §8's example verbatim otherwise creates a directory named
+    /// `~` wherever the relay happens to be started.
+    #[test]
+    fn a_tilde_state_file_is_rejected_rather_than_taken_literally() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+            state_file = "~/.local/state/relay/state.json"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+        "#;
+        let config = Config::from_toml_str(raw).expect("should parse");
+        let err = config.state_file().expect_err("should reject");
+        assert!(err.to_string().contains("state_file"));
     }
 
     #[test]
@@ -131,37 +229,40 @@ mod tests {
         assert!(err.to_string().contains("some_unplanned_section"));
     }
 
-    #[test]
-    fn listen_addr_parses_valid_socket_addr() {
-        let config = Config {
-            listen: "127.0.0.1:8484".to_string(),
+    fn config_with_listen(listen: &str) -> Config {
+        Config {
+            listen: listen.to_string(),
+            state_file: None,
             anthropic: AnthropicConfig {
                 base_url: "https://api.anthropic.com".to_string(),
             },
-        };
+            detect: DetectConfig::default(),
+        }
+    }
+
+    #[test]
+    fn listen_addr_parses_valid_socket_addr() {
         assert_eq!(
-            config.listen_addr().expect("should parse"),
+            config_with_listen("127.0.0.1:8484")
+                .listen_addr()
+                .expect("should parse"),
             "127.0.0.1:8484".parse::<SocketAddr>().unwrap()
         );
     }
 
     #[test]
     fn listen_addr_rejects_invalid_address() {
-        let config = Config {
-            listen: "not-an-address".to_string(),
-            anthropic: AnthropicConfig {
-                base_url: "https://api.anthropic.com".to_string(),
-            },
-        };
-        assert!(config.listen_addr().is_err());
+        assert!(config_with_listen("not-an-address").listen_addr().is_err());
     }
 
     fn config_with_base_url(base_url: &str) -> Config {
         Config {
             listen: "127.0.0.1:8484".to_string(),
+            state_file: None,
             anthropic: AnthropicConfig {
                 base_url: base_url.to_string(),
             },
+            detect: DetectConfig::default(),
         }
     }
 

@@ -24,3 +24,8 @@ base64 = "0.23.1"
 # For the Limited-state jitter window (spec §4): no existing crate in the
 # tree provides random number generation.
 rand = "0.10.2"
+# Spec §5 names `anthropic-ratelimit-*` as a reset-time source and Anthropic's
+# reset headers are RFC3339; `/status` renders `limited_until` the same way.
+# The alternative is hand-rolled civil-date arithmetic. Parsing/formatting
+# only — no macros, no local-timezone support.
+time = { version = "0.3", default-features = false, features = ["std", "parsing", "formatting"] }
