@@ -443,9 +443,15 @@ answer differs by format:
   count there would bill a real inference call and answer with a `message`
   object where the client wanted `{"input_tokens": N}` — strictly worse than
   the error §6 prefers. So the Anthropic pin stays.
+- A name *no* profile claims, with no `active_profile` to fall through to,
+  resolves nowhere: the router errors. On `/v1/messages` that becomes the
+  relay's own `400 no_route_for_model`; on a count it must not, because the pin
+  has no exception for names the relay cannot place. The count goes to
+  Anthropic, whose tokenizer owns the verdict on the name — §6's "on failure,
+  pass the error through" means Anthropic's error, not the relay's.
 
-Failover never applies to `count_tokens` in either case: route state and policy
-mode are not consulted for it at all.
+Failover never applies to `count_tokens` in any of these cases: route state and
+policy mode are not consulted for it at all.
 
 **`x-relay-route` marks fallback responses only, and only the relay may set
 it.** Spec §9 offers either that or an explicit `x-relay-route: anthropic`; the

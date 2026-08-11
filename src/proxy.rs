@@ -104,6 +104,12 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
         // remapped (§7a).
         Ok(RouteDecision::Anthropic) if count_tokens => None,
         Ok(RouteDecision::Anthropic) => failover(&state, &view).await.map(|name| (name, true)),
+        // Global Constraint 7 from the other side: a name nothing claims has
+        // no route but Anthropic's, and a count is pinned there regardless.
+        // Answering the relay's own 400 would put the relay's opinion of the
+        // name where the tokenizer's belongs (spec §6: "on failure, pass the
+        // error through").
+        Err(_) if count_tokens => None,
         Err(err) => {
             tracing::warn!(model = %model, error = %err, "no route for the requested model");
             return (
@@ -378,9 +384,15 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 
 /// Everything the peer sent, minus the hop-by-hop headers the next connection
 /// recomputes for itself and minus the relay's own audit marker, which only
-/// the relay may set: an upstream that emits `x-relay-route` — misconfigured,
-/// or hostile in the case of a `base_url` pointed somewhere it shouldn't be —
-/// must not be able to forge a claim about which route served a response.
+/// the relay may set.
+///
+/// Both of the Anthropic route's call sites share this, so `x-relay-route` is
+/// stripped in both directions. On the response it is the anti-forgery rule: an
+/// upstream that emits it — misconfigured, or hostile in the case of a
+/// `base_url` pointed somewhere it shouldn't be — must not be able to forge a
+/// claim about which route served a response. On the request it keeps a client
+/// from putting a marker of its own on the wire to Anthropic, which is the same
+/// rule read forwards: the header means what the relay says it means.
 ///
 /// This is the *Anthropic* route's rule, and a denylist on purpose: that route
 /// exists to forward what the client sent. The fallback route must never reuse
@@ -668,5 +680,119 @@ mod tests {
         // An empty conversation is vacuously a session start; with no model
         // there is no failover decision to reach it.
         assert!(broken.is_session_start());
+    }
+
+    const CAP: usize = 64;
+
+    /// Bytes distinct enough that a dropped or duplicated chunk cannot
+    /// coincidentally still compare equal.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| b'a' + (i % 26) as u8).collect()
+    }
+
+    /// A body whose frames land on exactly the boundaries a test names. The
+    /// end-to-end reassembly test in `tests/fallback.rs` takes whatever
+    /// framing hyper chooses, which cannot pin the cap arithmetic — one frame
+    /// either side of the boundary is the whole question here.
+    fn body_of(chunks: &[&[u8]]) -> Body {
+        let chunks: Vec<Bytes> = chunks.iter().map(|c| Bytes::copy_from_slice(c)).collect();
+        Body::from_stream(ChunkStream {
+            chunks: chunks.into_iter().collect(),
+        })
+    }
+
+    struct ChunkStream {
+        chunks: std::collections::VecDeque<Bytes>,
+    }
+
+    impl Stream for ChunkStream {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.get_mut().chunks.pop_front().map(Ok))
+        }
+    }
+
+    /// Every frame `Prefixed` yields, in order — so a test can assert both what
+    /// the prefix held and that the whole stream is the client's bytes back.
+    async fn frames(mut stream: Prefixed) -> Vec<Bytes> {
+        let mut frames = Vec::new();
+        while let Some(chunk) = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await
+        {
+            frames.push(chunk.expect("the test stream never fails"));
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn a_body_of_exactly_the_cap_is_still_buffered() {
+        let body = pattern(CAP);
+        let read = read_for_routing(body_of(&[&body]), CAP)
+            .await
+            .expect("read failed");
+        let RequestBody::Buffered(buffered) = read else {
+            panic!("`cap` bytes is at the cap, not over it");
+        };
+        assert_eq!(buffered, body);
+    }
+
+    /// The same boundary reached across two frames: the check is cumulative,
+    /// so what matters is the running total, not any one chunk's size.
+    #[tokio::test]
+    async fn two_frames_summing_to_exactly_the_cap_are_still_buffered() {
+        let body = pattern(CAP);
+        let (head, tail) = body.split_at(CAP - 1);
+        let read = read_for_routing(body_of(&[head, tail]), CAP)
+            .await
+            .expect("read failed");
+        let RequestBody::Buffered(buffered) = read else {
+            panic!("two frames summing to `cap` are at the cap, not over it");
+        };
+        assert_eq!(buffered, body);
+    }
+
+    /// One byte past the cap, on a frame of its own. The chunk that busts the
+    /// cap is kept in the prefix rather than deferred to `rest`, so the prefix
+    /// is everything read so far and the client's bytes come back exactly once.
+    #[tokio::test]
+    async fn one_byte_past_the_cap_is_too_large_and_loses_nothing() {
+        let body = pattern(CAP + 1);
+        let (head, tail) = body.split_at(CAP);
+        let read = read_for_routing(body_of(&[head, tail]), CAP)
+            .await
+            .expect("read failed");
+        let RequestBody::TooLarge(rest) = read else {
+            panic!("`cap + 1` bytes is over the cap");
+        };
+        let frames = frames(rest).await;
+        assert_eq!(
+            frames[0].len(),
+            CAP + 1,
+            "the prefix holds every byte read, including the one that busted the cap"
+        );
+        assert_eq!(frames.concat(), body, "the client's bytes, unaltered");
+    }
+
+    /// Chunks straddling the cap, with a frame after the split still to come:
+    /// the prefix and the untouched remainder of the stream reassemble to the
+    /// input, in order, with nothing lost or repeated.
+    #[tokio::test]
+    async fn a_straddling_split_reassembles_byte_identically() {
+        let body = pattern(CAP * 2);
+        let (head, remainder) = body.split_at(CAP - 10);
+        let (straddle, tail) = remainder.split_at(30);
+        let read = read_for_routing(body_of(&[head, straddle, tail]), CAP)
+            .await
+            .expect("read failed");
+        let RequestBody::TooLarge(rest) = read else {
+            panic!("the second frame crosses the cap");
+        };
+        let frames = frames(rest).await;
+        assert_eq!(
+            frames[0].len(),
+            CAP - 10 + 30,
+            "the prefix ends where the cap was crossed, not where the cap is"
+        );
+        assert_eq!(frames.concat(), body, "the client's bytes, unaltered");
     }
 }

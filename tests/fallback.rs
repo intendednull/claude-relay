@@ -870,12 +870,10 @@ async fn a_profile_with_no_key_in_the_environment_fails_without_sending_anything
     assert_eq!(relay.fallback.count(), 0);
 }
 
-/// §7d's dead end: a non-`claude-*` name no profile claims, with no active
-/// profile to fall through to. The router has nothing to resolve it against, so
-/// the relay says so rather than sending an open-model name to Anthropic to be
-/// rejected there.
-#[tokio::test]
-async fn a_name_no_profile_claims_with_no_active_profile_is_a_clean_error() {
+/// A profile configured but no `active_profile` — a valid config, and the only
+/// shape in which `router::route` returns `Err`, so both of the tests below
+/// need it and nothing else does.
+async fn start_without_an_active_profile() -> Relay {
     set_profile_keys();
     let anthropic = Recorder::default();
     let fallback = Recorder::default();
@@ -887,10 +885,24 @@ async fn a_name_no_profile_claims_with_no_active_profile_is_a_clean_error() {
         profile(fallback_addr, "openai", OPENAI_KEY_ENV),
     );
     config.policy.active_profile = None;
-    let relay = serve_relay_with(config, None).await;
+    let addr = serve_relay_with(config, None).await;
+    Relay {
+        addr,
+        anthropic,
+        fallback,
+    }
+}
+
+/// §7d's dead end: a non-`claude-*` name no profile claims, with no active
+/// profile to fall through to. The router has nothing to resolve it against, so
+/// the relay says so rather than sending an open-model name to Anthropic to be
+/// rejected there.
+#[tokio::test]
+async fn a_name_no_profile_claims_with_no_active_profile_is_a_clean_error() {
+    let relay = start_without_an_active_profile().await;
 
     let response = client()
-        .post(format!("http://{relay}/v1/messages"))
+        .post(format!("http://{}/v1/messages", relay.addr))
         .body(session_start("some-other-provider/model"))
         .send()
         .await
@@ -900,8 +912,41 @@ async fn a_name_no_profile_claims_with_no_active_profile_is_a_clean_error() {
     let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
         .expect("error body must be JSON");
     assert_eq!(body["error"], "no_route_for_model");
-    assert_eq!(anthropic.count(), 0);
-    assert_eq!(fallback.count(), 0);
+    assert_eq!(relay.anthropic.count(), 0);
+    assert_eq!(relay.fallback.count(), 0);
+}
+
+/// The same dead end reached by a count, which does not share that answer.
+/// Global Constraint 7 pins `count_tokens` to Anthropic whatever the state, so
+/// an unroutable name there is Anthropic's to reject — the relay's own 400 in
+/// its place would contradict spec §6's "on failure, pass the error through",
+/// and would change where this request went before `count_tokens` was routed
+/// at all.
+#[tokio::test]
+async fn count_tokens_for_an_unroutable_name_still_reaches_anthropic() {
+    let relay = start_without_an_active_profile().await;
+
+    let response = client()
+        .post(format!("http://{}/v1/messages/count_tokens", relay.addr))
+        .body(session_start("some-other-provider/model"))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("x-relay-route").is_none());
+    assert_eq!(
+        response.bytes().await.expect("failed to read body"),
+        br#"{"input_tokens":7}"#.as_slice()
+    );
+    assert_eq!(relay.fallback.count(), 0);
+    let seen = relay.anthropic.only();
+    assert_eq!(seen.path, "/v1/messages/count_tokens");
+    assert_eq!(
+        seen.json()["model"],
+        "some-other-provider/model",
+        "the name reaches the tokenizer that owns the verdict on it, unremapped"
+    );
 }
 
 #[tokio::test]
@@ -1083,6 +1128,12 @@ async fn a_relay_with_a_profile_does_buffer_the_request_body() {
 /// the rest of the client's stream. Nothing may be dropped or duplicated
 /// across that split, and the request must still reach Anthropic — the cap
 /// costs a routing decision, never a byte.
+///
+/// End to end over real HTTP, so hyper picks the framing and this cannot say
+/// where the split lands; what it proves is that reassembly survives whatever
+/// framing production actually produces. The boundary arithmetic itself is
+/// pinned by the unit tests in `src/proxy.rs`, which drive `read_for_routing`
+/// over frames they choose.
 #[tokio::test]
 async fn a_body_past_the_routing_cap_reaches_anthropic_byte_for_byte() {
     set_profile_keys();
@@ -1090,8 +1141,8 @@ async fn a_body_past_the_routing_cap_reaches_anthropic_byte_for_byte() {
     let fallback = Recorder::default();
     let anthropic_addr = serve(anthropic_upstream(anthropic.clone(), false)).await;
     let fallback_addr = serve(openai_upstream(fallback.clone(), false)).await;
-    // Small enough that the split lands inside the body, and far below any
-    // single frame hyper will deliver, so the prefix really is a partial read.
+    // Far below the body, so the very first frame busts the cap and everything
+    // after it has to come back through `Prefixed::rest`.
     let relay = serve_relay_with_routing_cap(
         config(
             anthropic_addr,
