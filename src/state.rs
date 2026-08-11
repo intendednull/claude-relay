@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -45,6 +46,11 @@ pub struct AppState {
     /// path never blocks on the state file.
     pub route: Arc<RouteStateMachine>,
     pub route_updates: RouteUpdates,
+    /// Spec §9's `/status` counter: requests a fallback profile answered,
+    /// whatever it answered with. A request that never reached one — an
+    /// untranslatable body, a missing key, an unreachable endpoint — is not
+    /// one the fallback served.
+    pub fallback_requests_served: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -89,6 +95,7 @@ impl AppState {
             http,
             route,
             route_updates,
+            fallback_requests_served: Arc::new(AtomicU64::new(0)),
         })
     }
 }

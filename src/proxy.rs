@@ -4,22 +4,137 @@ use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime};
 
 use axum::Json;
-use axum::body::{Body, Bytes};
+use axum::body::{Body, BodyDataStream, Bytes};
 use axum::extract::{Request, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_core::Stream;
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::capture::Capture;
 use crate::config::Config;
+use crate::fallback::{self, FallbackRequest};
+use crate::route_state::RouteState;
 use crate::route_updates::{RequestOutcome, RouteUpdates};
+use crate::router::{self, RouteDecision};
 use crate::state::AppState;
+
+/// The only path whose body is inspected. `count_tokens` goes to Anthropic
+/// whatever the route state or policy says (spec §6 — a token count against
+/// the wrong tokenizer is worse than an error), and the catch-all carries no
+/// `model` to route on, so both keep Milestone 1's streamed verbatim forward
+/// and never pay to buffer a body.
+const MESSAGES_PATH: &str = "/v1/messages";
+
+/// A `/v1/messages` body has to be in hand before its route is known — the
+/// `model` that decides it is inside. This is what keeps that bounded (Global
+/// Constraint 3): a body past the cap is not inspected at all, and the bytes
+/// already read are handed back in front of the rest of the stream, so the
+/// Anthropic route still forwards exactly what the client sent. Set well past
+/// Anthropic's own request-size limit so no request it would have served ever
+/// loses its routing decision to it.
+const ROUTING_BODY_CAP: usize = 32 * 1024 * 1024;
 
 pub async fn forward(State(state): State<AppState>, request: Request) -> Response {
     let start = Instant::now();
     let (parts, body) = request.into_parts();
 
+    if parts.uri.path() != MESSAGES_PATH {
+        let body = reqwest::Body::wrap_stream(body.into_data_stream());
+        return to_anthropic(&state, start, &parts, body, None).await;
+    }
+
+    let buffered = match read_for_routing(body).await {
+        Ok(buffered) => buffered,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not read the request body");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "request_body_read_failed" })),
+            )
+                .into_response();
+        }
+    };
+
+    let body = match buffered {
+        RequestBody::TooLarge(rest) => {
+            tracing::warn!(
+                cap_bytes = ROUTING_BODY_CAP,
+                "request body too large to route on; forwarding to Anthropic"
+            );
+            let body = reqwest::Body::wrap_stream(rest);
+            return to_anthropic(&state, start, &parts, body, None).await;
+        }
+        RequestBody::Buffered(body) => body,
+    };
+
+    let view = RoutingView::parse(&body);
+    let Some(model) = view.model.clone() else {
+        // No `model` to route on, so §7d has nothing to say: Anthropic, and
+        // its own error if the request was malformed.
+        return to_anthropic(&state, start, &parts, body.into(), None).await;
+    };
+
+    let named = router::route(
+        &model,
+        &state.config.profiles,
+        state.config.policy.active_profile.as_deref(),
+    );
+    let target = match named {
+        // §7d: routed by name, so the name is passed through unremapped.
+        Ok(RouteDecision::Profile(name)) => Some((name, false)),
+        // §6: a `claude-*` request may still fail over while Anthropic is
+        // `Limited`, and that one *is* remapped (§7a).
+        Ok(RouteDecision::Anthropic) => failover(&state, &view).await.map(|name| (name, true)),
+        Err(err) => {
+            tracing::warn!(model = %model, error = %err, "no route for the requested model");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "no_route_for_model" })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some((name, remap)) = target else {
+        return to_anthropic(&state, start, &parts, body.into(), Some(model)).await;
+    };
+
+    let Some(profile) = state.config.profiles.get(&name) else {
+        // Startup validation rules this out. If it happens anyway, the
+        // always-available route is a better answer than a 500.
+        tracing::error!(profile = %name, "routed to an unconfigured profile; staying on Anthropic");
+        return to_anthropic(&state, start, &parts, body.into(), Some(model)).await;
+    };
+
+    fallback::forward(
+        &state,
+        start,
+        parts.method.clone(),
+        parts.uri.path().to_owned(),
+        body,
+        FallbackRequest {
+            profile_name: &name,
+            profile,
+            model: &model,
+            remap,
+        },
+    )
+    .await
+}
+
+/// Milestone 1's route, unchanged: everything the client sent, forwarded
+/// verbatim to Anthropic, and everything Anthropic sent, streamed back
+/// verbatim. The only additions are the `route`/`model` log fields.
+async fn to_anthropic(
+    state: &AppState,
+    start: Instant,
+    parts: &Parts,
+    body: reqwest::Body,
+    model: Option<String>,
+) -> Response {
     let target = format!(
         "{}{}",
         state.config.anthropic.base_url.trim_end_matches('/'),
@@ -37,7 +152,7 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
         .http
         .request(method.clone(), target)
         .headers(forwardable(&parts.headers))
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        .body(body)
         .send()
         .await;
 
@@ -65,6 +180,10 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
     // Latency is taken at response headers, not at end of body: a streamed
     // response stays open for as long as the model keeps generating.
     let log = RequestLog {
+        route: "anthropic",
+        profile: None,
+        model_in: model.clone(),
+        model_out: model,
         method,
         path,
         status,
@@ -82,7 +201,7 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
     // limit detection always (it cannot depend on a debug flag being set), and
     // a `--capture-errors` fixture when the flag is on.
     let observation = (!status.is_success())
-        .then(|| ErrorObservation::new(&state, status, &headers))
+        .then(|| ErrorObservation::new(state, status, &headers))
         .flatten();
 
     let body = Body::from_stream(CountingStream {
@@ -98,7 +217,121 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
     response
 }
 
-fn elapsed_ms(start: Instant) -> u64 {
+/// Spec §6's failover decision, reached only by a `claude-*` request the
+/// router already pointed at Anthropic. `Some(profile)` fails it over;
+/// `None` leaves it on Anthropic, where a limit error passes through to the
+/// client as the visible failure the mode asked for.
+async fn failover(state: &AppState, view: &RoutingView) -> Option<String> {
+    let policy = &state.config.policy;
+    let active = policy.active_profile.as_deref()?;
+    let eligible = match policy.mode.as_str() {
+        "all" => true,
+        // The session-start heuristic: a conversation with no assistant turn
+        // yet has no thought to switch models in the middle of. Known
+        // imperfection, per spec §6 — Claude Code's own title-generation and
+        // summarization requests look like session starts too, and land on the
+        // fallback harmlessly. Not worth engineering around.
+        "new-sessions" => view.is_session_start(),
+        // "notify-only"; startup validation admits no other value.
+        _ => false,
+    };
+    // The state query comes last because it is the expensive half: it can
+    // write the state file on the lazy `Limited -> Probing` transition, so a
+    // request that could not fail over anyway never pays for it.
+    if !eligible || !is_limited(state).await {
+        return None;
+    }
+    Some(active.to_string())
+}
+
+async fn is_limited(state: &AppState) -> bool {
+    let route = state.route.clone();
+    // Same reason `/status` does this: the query can persist a transition, and
+    // a synchronous file write does not belong on an async worker.
+    match tokio::task::spawn_blocking(move || route.current_state()).await {
+        Ok(state) => matches!(state, RouteState::Limited { .. }),
+        Err(err) => {
+            tracing::warn!(error = %err, "route state query failed; staying on the Anthropic route");
+            false
+        }
+    }
+}
+
+/// The only two things a routing decision reads out of a `/v1/messages` body:
+/// which model it asks for (§7d) and whether the conversation has an assistant
+/// turn yet (§6). Every other field is skipped rather than materialized, so a
+/// megabyte of conversation is walked but not copied.
+#[derive(Debug, Default, Deserialize)]
+struct RoutingView {
+    model: Option<String>,
+    #[serde(default)]
+    messages: Vec<RoutingMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutingMessage {
+    role: Option<String>,
+}
+
+impl RoutingView {
+    /// A body this cannot read is a body with no route to decide — the request
+    /// goes to Anthropic and gets Anthropic's own opinion of it. This proxy
+    /// does not validate requests.
+    fn parse(body: &[u8]) -> Self {
+        serde_json::from_slice(body).unwrap_or_default()
+    }
+
+    fn is_session_start(&self) -> bool {
+        !self
+            .messages
+            .iter()
+            .any(|message| message.role.as_deref() == Some("assistant"))
+    }
+}
+
+enum RequestBody {
+    Buffered(Bytes),
+    /// The prefix already read, in front of the rest of the client's stream.
+    TooLarge(Prefixed),
+}
+
+async fn read_for_routing(body: Body) -> Result<RequestBody, axum::Error> {
+    let mut stream = Box::pin(body.into_data_stream());
+    let mut buffered: Vec<u8> = Vec::new();
+    loop {
+        let Some(chunk) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await else {
+            return Ok(RequestBody::Buffered(Bytes::from(buffered)));
+        };
+        let chunk = chunk?;
+        let over_cap = buffered.len() + chunk.len() > ROUTING_BODY_CAP;
+        buffered.extend_from_slice(&chunk);
+        if over_cap {
+            return Ok(RequestBody::TooLarge(Prefixed {
+                prefix: Some(Bytes::from(buffered)),
+                rest: stream,
+            }));
+        }
+    }
+}
+
+struct Prefixed {
+    prefix: Option<Bytes>,
+    rest: Pin<Box<BodyDataStream>>,
+}
+
+impl Stream for Prefixed {
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Some(prefix) = this.prefix.take() {
+            return Poll::Ready(Some(Ok(prefix)));
+        }
+        this.rest.as_mut().poll_next(cx)
+    }
+}
+
+pub(crate) fn elapsed_ms(start: Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
 
@@ -111,7 +344,12 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 
 /// Everything the peer sent, minus the hop-by-hop headers the next connection
 /// recomputes for itself.
-fn forwardable(headers: &HeaderMap) -> HeaderMap {
+///
+/// This is the *Anthropic* route's rule, and a denylist on purpose: that route
+/// exists to forward what the client sent. The fallback route must never reuse
+/// it — see `fallback::outgoing_headers`, which builds its request headers from
+/// nothing instead (spec §7b).
+pub(crate) fn forwardable(headers: &HeaderMap) -> HeaderMap {
     let mut forwarded = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers {
         if is_hop_by_hop(name) {
@@ -123,11 +361,34 @@ fn forwardable(headers: &HeaderMap) -> HeaderMap {
     forwarded
 }
 
-struct RequestLog {
-    method: Method,
-    path: String,
-    status: StatusCode,
-    latency_ms: u64,
+pub(crate) struct RequestLog {
+    pub(crate) route: &'static str,
+    pub(crate) profile: Option<String>,
+    pub(crate) model_in: Option<String>,
+    pub(crate) model_out: Option<String>,
+    pub(crate) method: Method,
+    pub(crate) path: String,
+    pub(crate) status: StatusCode,
+    pub(crate) latency_ms: u64,
+}
+
+impl RequestLog {
+    /// Spec §9's one line per request. Names only — a model name, a profile
+    /// name, a path — never a body and never a header value.
+    pub(crate) fn emit(self, response_bytes: u64) {
+        tracing::info!(
+            route = self.route,
+            profile = self.profile.as_deref().unwrap_or("-"),
+            model_in = self.model_in.as_deref().unwrap_or("-"),
+            model_out = self.model_out.as_deref().unwrap_or("-"),
+            method = %self.method,
+            path = %self.path,
+            status = self.status.as_u16(),
+            latency_ms = self.latency_ms,
+            response_bytes,
+            "proxied request"
+        );
+    }
 }
 
 /// An accumulated body is the one thing this proxy holds in memory, so it is
@@ -210,7 +471,12 @@ impl ErrorObservation {
 /// chunk is also copied into it so limit detection can classify the response,
 /// and a `--capture-errors` fixture can be written, on the same terminal events
 /// as the log line — without delaying forwarding.
-struct CountingStream {
+///
+/// The fallback route shares this for the counting and the log line, and never
+/// for the observation: a fallback provider's 429 says nothing about
+/// Anthropic's limit window, and its error bodies are not fixtures Anthropic
+/// detection rules can be derived from.
+pub(crate) struct CountingStream {
     inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
     response_bytes: u64,
     log: Option<RequestLog>,
@@ -218,18 +484,23 @@ struct CountingStream {
 }
 
 impl CountingStream {
+    pub(crate) fn new(
+        inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
+        log: RequestLog,
+    ) -> Self {
+        Self {
+            inner,
+            response_bytes: 0,
+            log: Some(log),
+            observation: None,
+        }
+    }
+
     fn emit(&mut self) {
         let Some(log) = self.log.take() else {
             return;
         };
-        tracing::info!(
-            method = %log.method,
-            path = %log.path,
-            status = log.status.as_u16(),
-            latency_ms = log.latency_ms,
-            response_bytes = self.response_bytes,
-            "proxied request"
-        );
+        log.emit(self.response_bytes);
     }
 
     /// `ended_early` covers every way the body stopped short of its own end —
@@ -317,5 +588,48 @@ mod tests {
 
         let cookies: Vec<_> = forwarded.get_all("set-cookie").iter().collect();
         assert_eq!(cookies, vec!["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn a_conversation_with_an_assistant_turn_is_not_a_session_start() {
+        let mid = RoutingView::parse(
+            br#"{"model":"claude-opus-4-6","messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"hello"},
+                {"role":"user","content":"more"}]}"#,
+        );
+        assert_eq!(mid.model.as_deref(), Some("claude-opus-4-6"));
+        assert!(!mid.is_session_start());
+    }
+
+    #[test]
+    fn a_first_user_turn_is_a_session_start() {
+        let start = RoutingView::parse(
+            br#"{"model":"claude-opus-4-6","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert!(start.is_session_start());
+    }
+
+    /// A tool result comes back as a `user` message, so a request that is
+    /// really mid-conversation still carries an assistant turn ahead of it —
+    /// which is what the heuristic keys on, rather than the last role.
+    #[test]
+    fn a_tool_result_turn_is_not_mistaken_for_a_session_start() {
+        let after_tool = RoutingView::parse(
+            br#"{"model":"claude-opus-4-6","messages":[
+                {"role":"user","content":"run ls"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}"#,
+        );
+        assert!(!after_tool.is_session_start());
+    }
+
+    #[test]
+    fn an_unreadable_body_yields_no_model_and_no_route_of_its_own() {
+        let broken = RoutingView::parse(b"not json at all");
+        assert!(broken.model.is_none());
+        // An empty conversation is vacuously a session start; with no model
+        // there is no failover decision to reach it.
+        assert!(broken.is_session_start());
     }
 }

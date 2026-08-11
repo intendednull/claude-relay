@@ -54,6 +54,17 @@ format = "unix-seconds"
 # optional: with none configured, a `claude-*` request always goes to
 # Anthropic and a non-`claude-*` request has nothing to route to (spec §7d).
 #
+# `base_url` is the provider's API *root*, not a full endpoint URL: the relay
+# appends the path the format implies — `/v1/chat/completions` for an "openai"
+# profile, whatever Anthropic path the client called, and the client's own path
+# for an "anthropic" one.
+#
+# `api_key_env` names an environment variable the relay reads at request time.
+# The key is sent as `Authorization: Bearer <key>`, and to an "anthropic"
+# profile as `x-api-key` as well, which is the scheme that API documents.
+# Nothing the client sent reaches a profile — not its auth headers, not its
+# `anthropic-*` headers, not `accept-encoding` (spec §7b).
+#
 # [profiles.deepseek]
 # base_url = "https://<provider-anthropic-compat-endpoint>"
 # api_key_env = "RELAY_TOGETHER_KEY"      # read from env, never stored here

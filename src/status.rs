@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -14,9 +16,8 @@ pub struct StatusResponse {
     config_digest: String,
 }
 
-/// `fallback_requests_served` stays 0 until there is fallback routing to count
-/// (Milestone 3). `limited_until` is null outside `LIMITED`, `PROBING`
-/// included: the window it named has already elapsed by then.
+/// `limited_until` is null outside `LIMITED`, `PROBING` included: the window it
+/// named has already elapsed by then.
 pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, StatusCode> {
     let route = state.route.clone();
     // A state query performs the lazy `Limited -> Probing` transition, which
@@ -37,7 +38,7 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
     Ok(Json(StatusResponse {
         state: state_label,
         limited_until,
-        fallback_requests_served: 0,
+        fallback_requests_served: state.fallback_requests_served.load(Ordering::Relaxed),
         config_digest: state.config_digest.to_string(),
     }))
 }

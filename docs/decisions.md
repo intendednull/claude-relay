@@ -391,3 +391,84 @@ does not come back out of the translator, and its text is never interpolated
 into the event either, since a `reqwest` error can carry the upstream URL and a
 profile's `base_url` is a place a credential could hide. A caller wanting the
 error's details in its logs should inspect the upstream stream on the way in.
+
+## 2026-08-11 — Failover wiring: what Task 3 had to decide
+
+Milestone 3 Task 3 (`src/proxy.rs` routing, `src/fallback.rs`). Spec §6, §7a,
+§7b, §7d say what must happen; these are the places they did not say how, or
+where two sections pulled in different directions.
+
+**Only `/v1/messages` has its request body read.** The routing decision needs
+the `model` inside the body, so that body cannot stay a stream. It is bounded
+(32 MiB, well past Anthropic's own request-size limit) and a body past the cap
+is not inspected at all — the bytes already read go back in front of the rest of
+the stream and the request takes the Anthropic route unchanged, so the cap
+degrades routing rather than rejecting a request the proxy used to serve.
+`count_tokens` and the `/v1/*` catch-all never buffer: neither has a routing
+decision to make. One visible consequence for `/v1/messages`: the upstream
+request is now framed with `content-length` instead of `transfer-encoding:
+chunked`. The bytes are identical; the framing is not.
+
+**`count_tokens` is pinned to Anthropic unconditionally — including for a
+non-`claude-*` model name.** §6 says "always go to Anthropic regardless of
+state"; §7d says any non-`claude-*` name routes to the profile that claims it,
+"regardless of Anthropic's state". They collide on `POST
+/v1/messages/count_tokens {"model": "deepseek-ai/…"}`. §6 wins, because its
+stated reason — a count against the wrong tokenizer is worse than an error —
+is about the *tokenizer*, which is exactly what changes when the name is an
+open model, and because an `openai`-format profile has no token-counting
+endpoint to route to at all. The cost: a client that selects an open model by
+name gets Anthropic's "unknown model" error for its count_tokens calls rather
+than a count. Revisit if that turns out to break Claude Code's context
+management rather than degrade it.
+
+**`x-relay-route` marks fallback responses only.** Spec §9 offers either that or
+an explicit `x-relay-route: anthropic`; the Anthropic route's response is a
+verbatim copy of Anthropic's own (Milestone 1's whole purpose) and adding a
+header would end that. Absence therefore means Anthropic. Every response the
+fallback route produces carries the marker, relay-generated errors included:
+the question it answers afterwards is "did this come from Anthropic", and a
+failed fallback attempt did not.
+
+**The fallback's header allowlist is empty.** §7b says allowlist, not denylist;
+taken to its end that means *nothing* from the client is copied and the outgoing
+headers are built from constants: `content-type`, the profile's own
+`Authorization: Bearer`, and (for `format = "anthropic"`) `x-api-key` with the
+same key plus a constant `anthropic-version: 2023-06-01`, which that API
+requires and which is ours rather than the client's. Two headers matter for
+reasons beyond auth: `accept-encoding` is dropped because Claude Code asks for
+gzip and a compressed body is one the translator cannot read, and
+`content-length` because the body it described is not the body being sent.
+Sending both `Authorization` and `x-api-key` to an Anthropic-format profile is
+belt-and-braces for a code path no real provider has ever exercised (Global
+Constraint 10) — if a provider rejects a request carrying both, that is the
+first thing to cut.
+
+**`base_url` is an API root, not an endpoint.** An `openai` profile is served at
+`{base_url}/v1/chat/completions` whatever Anthropic path the client called; an
+`anthropic` profile mirrors the incoming path. The relay owns the path because
+the format determines it.
+
+**A fallback's non-2xx passes through verbatim, untranslated.** Spec §7d already
+says a provider's error surfaces as that provider's error. Translating an error
+envelope would mean inventing an OpenAI→Anthropic error mapping from shapes this
+project has never captured. Claude Code will render an OpenAI-shaped error less
+gracefully than an Anthropic one; that is a known, cheap-to-fix gap, and fixing
+it on a guess is not.
+
+**Nothing a fallback returns touches Anthropic's route state or the capture
+fixtures.** A 429 from the fallback provider must not put the Anthropic route
+into `LIMITED`, a 200 from it must not recover the route out of it, and its
+error bodies are not fixtures Anthropic detection rules can be derived from.
+
+**A model nothing can route is a 400, not a silent forward.** `router::route`'s
+clean error (no profile claims the name, no active profile) becomes
+`400 {"error": "no_route_for_model"}` rather than being forwarded to Anthropic
+to be rejected there. With zero profiles configured — a Milestone 1/2 config —
+this is the only behavior change for a non-`claude-*` name: an error from the
+relay instead of an error from Anthropic.
+
+**`fallback_requests_served` counts requests a profile answered**, whatever it
+answered with, and not requests that never reached one (untranslatable body,
+missing key, unreachable endpoint). `/status` reads it now rather than keeping
+its hardcoded `0`, since the field was already in the documented response shape.

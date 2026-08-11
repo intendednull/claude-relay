@@ -124,3 +124,64 @@ impl Stream for ChannelStream {
         self.0.poll_recv(cx)
     }
 }
+
+/// A `tracing` writer that keeps everything in memory, so a test can assert on
+/// what did — and did not — reach the logs. The subscriber is process-global,
+/// which is why a test binary using this holds exactly one test.
+#[derive(Clone)]
+pub struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Buffer {
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+    }
+
+    pub fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log buffer poisoned")).into_owned()
+    }
+
+    /// Waits for `needle` to appear and returns everything captured so far.
+    /// Logs are emitted from the stream's terminal event, which can land after
+    /// the client has its whole response.
+    pub async fn logs_containing(&self, needle: &str) -> String {
+        for _ in 0..100 {
+            let logs = self.contents();
+            if logs.contains(needle) {
+                return logs;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "timed out waiting for {needle:?} in captured logs:\n{}",
+            self.contents()
+        );
+    }
+}
+
+impl Default for Buffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl io::Write for Buffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log buffer poisoned")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+    type Writer = Buffer;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
