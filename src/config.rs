@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -52,16 +51,39 @@ pub struct ProfileConfig {
     /// Prefix-matched against the incoming `model` field when remapping a
     /// failed-over `claude-*` request (spec §7a); `"*"` is the catch-all. A
     /// name-routed request's model name passes through unchanged instead.
+    /// An `IndexMap`, not a `HashMap`, for the same reason as
+    /// `Config::profiles`: overlapping prefix keys need a deterministic
+    /// winner, and only file order can give Task 3's longest/first-match
+    /// logic something stable to work from.
     #[serde(default)]
-    pub model_map: HashMap<String, String>,
+    pub model_map: IndexMap<String, String>,
 }
 
 impl ProfileConfig {
+    /// A parsed, host-bearing, http(s) `base_url` — same shape as
+    /// `Config::anthropic_base_url`, and shared with it, since a profile's
+    /// endpoint is exactly as capable of silently 502ing every request as
+    /// Anthropic's is if this isn't checked at startup.
+    pub fn base_url(&self) -> Result<reqwest::Url> {
+        validated_base_url("profiles.*.base_url", &self.base_url)
+    }
+
+    /// An unrecognized `format`, a `base_url` that can't route a request
+    /// (see `base_url`), and a `serves` entry that is an empty string (which
+    /// would `starts_with`-match every non-`claude-*` model, silently
+    /// shadowing every profile declared after it) are all startup-time
+    /// errors rather than silent misrouting.
     pub fn validate(&self) -> Result<()> {
         if !matches!(self.format.as_str(), "anthropic" | "openai") {
             bail!(
                 "`profiles.*.format` must be \"anthropic\" or \"openai\", got {:?}",
                 self.format
+            );
+        }
+        self.base_url()?;
+        if self.serves.iter().any(String::is_empty) {
+            bail!(
+                "`profiles.*.serves` entries must not be empty — an empty prefix matches every model name"
             );
         }
         Ok(())
@@ -144,11 +166,28 @@ impl Default for PolicyConfig {
 /// and far short of either failure.
 pub(crate) const MAX_RESET_HORIZON_CEILING_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 
+/// The ceiling on `reset_jitter_secs[1]`. Jitter is added *on top of* the
+/// already-bounded window `detect::bounded` produces (`route_state::
+/// add_jitter`), so it is not covered by `MAX_RESET_HORIZON_CEILING_SECS` at
+/// all — a units mistake here (milliseconds for seconds, or an operator
+/// meaning "a day" and writing `86400`) pushes `Limited.until` unboundedly far
+/// past a validated, sane window. Jitter exists only to avoid racing the
+/// upstream reset boundary, so it needs seconds to minutes, never hours: one
+/// hour is already generous for that purpose and small next to
+/// `min_reset_horizon_secs`'s 5-minute default.
+const MAX_JITTER_SECS: u64 = 60 * 60;
+
 impl PolicyConfig {
     /// An unrecognized `mode`, an `active_profile` naming a profile that
-    /// isn't configured, crossed or absurd horizon bounds, and inverted
-    /// jitter bounds (which would panic `rand::random_range`) are all
-    /// startup-time errors rather than silent misbehavior.
+    /// isn't configured, crossed or absurd horizon bounds, and jitter bounds
+    /// that are inverted or exceed `MAX_JITTER_SECS` are all startup-time
+    /// errors rather than silent misbehavior. Inverted jitter bounds would
+    /// panic `rand::random_range` inside `RouteStateMachine::on_limit_detected`
+    /// — caught by the applier thread's `catch_unwind`
+    /// (`route_updates.rs`), so the process survives, but that outcome is
+    /// lost: the route never transitions to `Limited` for *any* detected
+    /// limit, silently, for the life of the process, and `/status` keeps
+    /// reporting `ACTIVE`.
     pub fn validate(&self, profiles: &IndexMap<String, ProfileConfig>) -> Result<()> {
         if !matches!(self.mode.as_str(), "new-sessions" | "all" | "notify-only") {
             bail!(
@@ -178,6 +217,11 @@ impl PolicyConfig {
         if jitter_min > jitter_max {
             bail!(
                 "`policy.reset_jitter_secs` min ({jitter_min}) must not exceed max ({jitter_max})"
+            );
+        }
+        if jitter_max > MAX_JITTER_SECS {
+            bail!(
+                "`policy.reset_jitter_secs` max must be at most {MAX_JITTER_SECS} (1 hour), got {jitter_max}"
             );
         }
         Ok(())
@@ -251,6 +295,24 @@ impl NotifyConfig {
     }
 }
 
+/// Shared shape for `anthropic.base_url` and `profiles.*.base_url`: parses
+/// the URL, requires a host, requires `http`/`https` — and never echoes the
+/// raw value in errors, since a URL can carry credentials in its userinfo
+/// (the same leak `without_url()` guards against on the request path).
+/// `field` names the config key in the error, never the value.
+fn validated_base_url(field: &str, raw: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).with_context(|| format!("invalid `{field}`"))?;
+    if url.host_str().is_none() {
+        bail!("`{field}` has no host");
+    }
+    // Any other scheme parses cleanly here and then fails per-request as the
+    // opaque "builder error" this check exists to keep out of the hot path.
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("`{field}` must be http or https, got {:?}", url.scheme());
+    }
+    Ok(url)
+}
+
 /// A parsed config plus the SHA-256 digest of the exact bytes it was parsed
 /// from, for `/status`'s `config_digest` field.
 pub struct LoadedConfig {
@@ -293,20 +355,7 @@ impl Config {
     /// credentials in its userinfo, the same leak `without_url()` guards against
     /// on the request path.
     pub fn anthropic_base_url(&self) -> Result<reqwest::Url> {
-        let url = reqwest::Url::parse(&self.anthropic.base_url)
-            .context("invalid `anthropic.base_url`")?;
-        if url.host_str().is_none() {
-            bail!("`anthropic.base_url` has no host");
-        }
-        // Any other scheme parses cleanly here and then fails per-request as the
-        // opaque "builder error" this check exists to keep out of the hot path.
-        if !matches!(url.scheme(), "http" | "https") {
-            bail!(
-                "`anthropic.base_url` must be http or https, got {:?}",
-                url.scheme()
-            );
-        }
-        Ok(url)
+        validated_base_url("anthropic.base_url", &self.anthropic.base_url)
     }
 
     /// Both ways a state file silently ends up somewhere the operator didn't
@@ -678,7 +727,7 @@ mod tests {
             api_key_env: "RELAY_TOGETHER_KEY".to_string(),
             format: format.to_string(),
             serves: vec!["deepseek-ai/".to_string()],
-            model_map: HashMap::new(),
+            model_map: IndexMap::new(),
         }
     }
 
@@ -692,6 +741,85 @@ mod tests {
     fn profile_format_rejects_anything_else() {
         let err = profile("claude").validate().unwrap_err().to_string();
         assert!(err.contains("format"), "{err}");
+    }
+
+    fn profile_with_base_url(base_url: &str) -> ProfileConfig {
+        ProfileConfig {
+            base_url: base_url.to_string(),
+            ..profile("openai")
+        }
+    }
+
+    #[test]
+    fn profile_base_url_parses_a_valid_url() {
+        let url = profile_with_base_url("https://api.together.ai")
+            .base_url()
+            .expect("should parse");
+        assert_eq!(url.host_str(), Some("api.together.ai"));
+    }
+
+    #[test]
+    fn profile_base_url_rejects_a_url_without_a_scheme() {
+        let err = profile_with_base_url("api.together.ai")
+            .base_url()
+            .expect_err("a scheme-less URL must not reach the request path");
+        assert!(err.to_string().contains("profiles.*.base_url"));
+    }
+
+    #[test]
+    fn profile_base_url_rejects_a_url_without_a_host() {
+        let err = profile_with_base_url("file:///etc/passwd")
+            .base_url()
+            .expect_err("a hostless URL must not reach the request path");
+        assert!(err.to_string().contains("no host"));
+    }
+
+    #[test]
+    fn profile_base_url_rejects_a_non_http_scheme() {
+        let err = profile_with_base_url("ftp://example.com")
+            .base_url()
+            .expect_err("a non-http scheme must not reach the request path");
+        assert!(err.to_string().contains("http or https"));
+    }
+
+    #[test]
+    fn profile_base_url_errors_never_echo_the_value() {
+        let secret = "sk-together-DO-NOT-ECHO-THIS";
+        for base_url in [
+            format!("https://user:{secret}@"),
+            format!("ftp://user:{secret}@example.com"),
+        ] {
+            let err = profile_with_base_url(&base_url)
+                .base_url()
+                .expect_err("should reject");
+            let rendered = format!("{err:?}");
+            assert!(
+                !rendered.contains(secret),
+                "error leaked a credential from base_url: {rendered}"
+            );
+            assert!(rendered.contains("profiles.*.base_url"));
+        }
+    }
+
+    #[test]
+    fn profile_validate_surfaces_a_bad_base_url() {
+        let err = profile_with_base_url("api.together.ai")
+            .validate()
+            .expect_err("a bad base_url must not pass startup validation");
+        assert!(err.to_string().contains("profiles.*.base_url"));
+    }
+
+    /// An empty `serves` entry `starts_with`-matches every model name, so it
+    /// would silently claim every non-`claude-*` request and shadow every
+    /// profile declared after it.
+    #[test]
+    fn an_empty_serves_entry_is_rejected() {
+        let bad = ProfileConfig {
+            serves: vec!["deepseek-ai/".to_string(), String::new()],
+            ..profile("openai")
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("serves"), "{err}");
     }
 
     #[test]
@@ -871,8 +999,10 @@ mod tests {
         );
     }
 
-    /// Inverted jitter bounds would panic `rand::random_range` in the request
-    /// path (`route_state::add_jitter`), not fail cleanly.
+    /// Inverted jitter bounds would panic `rand::random_range` inside the
+    /// route-state applier thread — caught by its `catch_unwind`, so the
+    /// process survives, but silently: the route never transitions to
+    /// `Limited` again for the life of the process.
     #[test]
     fn validate_rejects_inverted_jitter_bounds() {
         let policy = PolicyConfig {
@@ -881,6 +1011,30 @@ mod tests {
         };
         let err = policy.validate(&IndexMap::new()).unwrap_err().to_string();
         assert!(err.contains("reset_jitter_secs"), "{err}");
+    }
+
+    /// Jitter is added *on top of* the already-bounded window `bounded`
+    /// produces, so it is not covered by `MAX_RESET_HORIZON_CEILING_SECS` —
+    /// a units mistake here can push `Limited.until` unboundedly far out
+    /// unless it has its own ceiling.
+    #[test]
+    fn validate_rejects_a_jitter_max_past_its_own_ceiling() {
+        let policy = PolicyConfig {
+            reset_jitter_secs: [15, 24 * 60 * 60], // a day, written as seconds
+            ..PolicyConfig::default()
+        };
+        let err = policy.validate(&IndexMap::new()).unwrap_err().to_string();
+        assert!(err.contains("reset_jitter_secs"), "{err}");
+
+        assert!(
+            PolicyConfig {
+                reset_jitter_secs: [15, MAX_JITTER_SECS],
+                ..PolicyConfig::default()
+            }
+            .validate(&IndexMap::new())
+            .is_ok(),
+            "the ceiling itself is a valid configuration"
+        );
     }
 
     #[test]
@@ -944,5 +1098,34 @@ mod tests {
         "#;
         let err = Config::from_toml_str(raw).expect_err("should fail to parse");
         assert!(err.to_string().contains("min_reset_horizon_secs"));
+    }
+
+    /// The shipped example doubled in size this milestone (`[profiles.*]`,
+    /// `[policy]`); nothing else pins it against silently going stale or
+    /// unparseable the next time a field moves or gets renamed.
+    #[test]
+    fn relay_example_toml_parses_and_validates() {
+        let raw = include_str!("../relay.example.toml");
+        let config = Config::from_toml_str(raw).expect("relay.example.toml should parse");
+        config
+            .detect
+            .validate()
+            .expect("relay.example.toml's [detect] should validate");
+        config
+            .notify
+            .validate()
+            .expect("relay.example.toml's [notify] should validate");
+        for profile in config.profiles.values() {
+            profile
+                .validate()
+                .expect("relay.example.toml's profiles should validate");
+        }
+        config
+            .policy
+            .validate(&config.profiles)
+            .expect("relay.example.toml's [policy] should validate");
+        config
+            .anthropic_base_url()
+            .expect("relay.example.toml's anthropic.base_url should validate");
     }
 }

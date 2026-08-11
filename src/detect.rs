@@ -206,7 +206,7 @@ impl DetectConfig {
 /// `max`/`min` rather than `clamp`, which panics when the bounds cross —
 /// `PolicyConfig::validate` (`src/config.rs`) rejects that config, but a panic
 /// here would be in the request path.
-pub(crate) fn bounded(
+fn bounded(
     reset_at: SystemTime,
     now: SystemTime,
     min_reset_horizon_secs: u64,

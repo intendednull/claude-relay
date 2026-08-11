@@ -18,8 +18,9 @@ async fn main() -> Result<()> {
     let loaded = Config::load(&config_path)?;
     // Checked here, before the listener binds: none of it should first fail on a
     // request an operator has to diagnose. `AppState::new` — also before the
-    // bind — validates the `[detect]` and `[notify]` rules, both of which fail
-    // silently by nature when they are wrong.
+    // bind — validates the `[detect]`, `[notify]`, `[profiles.*]` and
+    // `[policy]` rules, all of which fail silently by nature when they are
+    // wrong.
     let listen_addr: SocketAddr = loaded.config.listen_addr()?;
     loaded.config.anthropic_base_url()?;
     loaded.config.state_file()?;

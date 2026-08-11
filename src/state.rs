@@ -98,7 +98,9 @@ mod tests {
     use super::*;
     use crate::config::{AnthropicConfig, NotifyConfig, PolicyConfig};
     use crate::detect::DetectConfig;
+    use crate::route_state::RouteState;
     use indexmap::IndexMap;
+    use std::time::SystemTime;
 
     fn config(detect: DetectConfig, notify: NotifyConfig) -> Config {
         Config {
@@ -156,6 +158,34 @@ mod tests {
             .err()
             .expect("an unconfigured active_profile must not silently build a relay");
         assert!(err.to_string().contains("active_profile"), "{err}");
+    }
+
+    /// Both `RouteStateMachine::new` and `add_jitter` are unit-tested with
+    /// explicit bounds passed directly, which proves the arithmetic but not
+    /// that `AppState::new` actually threads `config.policy.reset_jitter_secs`
+    /// through to the machine it constructs — a hardcoded `[15, 60]` left in
+    /// place of that wiring would leave every one of those tests green.
+    #[test]
+    fn appstate_new_wires_reset_jitter_secs_into_the_route_state_machine() {
+        let mut wired = config(DetectConfig::default(), NotifyConfig::default());
+        wired.policy.reset_jitter_secs = [1000, 1000];
+        let state =
+            AppState::new(Arc::new(wired), None, "digest".to_string()).expect("should build");
+
+        let reset_at = SystemTime::now();
+        let transitioned = state
+            .route
+            .on_limit_detected(reset_at)
+            .expect("Active -> Limited must report a transition");
+        let RouteState::Limited { until } = transitioned.to else {
+            panic!("expected Limited, got {:?}", transitioned.to);
+        };
+        let delta = until.duration_since(reset_at).unwrap().as_secs();
+        assert_eq!(
+            delta, 1000,
+            "policy.reset_jitter_secs must reach the constructed RouteStateMachine, not just \
+             the [15, 60] default"
+        );
     }
 
     #[test]

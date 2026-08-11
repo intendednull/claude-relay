@@ -82,20 +82,24 @@ config file — 429 by default; see `relay.example.toml`, which spells out every
 built-in default — are classified against the rest of that rule, and they are
 the only responses the relay buffers for classification, so a limit returned
 under a different status code goes unnoticed until `detect.status` names it. A
-match moves the route to `LIMITED` until the reported reset plus 15–60s of
-jitter; the window elapsing moves it to `PROBING`; the next successful response
-moves it back to `ACTIVE`. `GET /status` reports the current state and
-`limited_until`.
+match moves the route to `LIMITED` until the reported reset plus
+`policy.reset_jitter_secs` of jitter (default 15–60s); the window elapsing
+moves it to `PROBING`; the next successful response moves it back to
+`ACTIVE`. `GET /status` reports the current state and `limited_until`.
+
+`min_reset_horizon_secs`, `max_reset_horizon_secs` and `reset_jitter_secs`
+live under `[policy]`, not `[detect]` — see `relay.example.toml`.
 
 - **Nothing else changes yet.** The client always receives the upstream's own
   response, byte for byte, whether or not it classified as a limit.
 - **Non-matches never move state.** A per-minute burst 429 needs either an
   explicit subscription marker in the message or a reset further out than
-  `min_reset_horizon_secs` (default 5 minutes) before it counts.
+  `policy.min_reset_horizon_secs` (default 5 minutes) before it counts.
 - **The window is bounded at both ends.** It is never shorter than
-  `min_reset_horizon_secs` nor longer than `max_reset_horizon_secs` (default 7
-  days), so neither a stale reset time nor one reported in the wrong unit can
-  produce a window that expires instantly or never elapses at all.
+  `policy.min_reset_horizon_secs` nor longer than `policy.max_reset_horizon_secs`
+  (default 7 days), so neither a stale reset time nor one reported in the
+  wrong unit can produce a window that expires instantly or never elapses at
+  all.
 - **The default rule is a guess** from spec §5's expected shape, not from a
   real limit response (`docs/decisions.md`). Catch one with
   `--capture-errors` and re-derive the rule from the fixture; it is config,
