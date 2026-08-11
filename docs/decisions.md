@@ -45,19 +45,10 @@ anticipates it: detection rules are config data, not code, specifically so
 captured fixture should replace the guessed `[detect]` defaults — a config
 edit, per the design's own intent, not a code change.
 
-**Check `content-encoding` on that fixture first.** The proxy forwards the
-client's `accept-encoding` upstream (it is not a hop-by-hop header) and
-reqwest is built with no decompression feature, deliberately — so *asking*
-Anthropic to compress is the default behavior, and a compressed error body is
-opaque bytes to the detector. Milestone 2 handles this honestly rather than
-silently: it logs `limit detection skipped: the upstream error body is
-compressed` and passes the response through. But if real error bodies do come
-back compressed, detection is inert in production with only that log line as
-the symptom, and it becomes a design question for whoever does this
-follow-up — add a decompression dependency for the classification path, or
-stop forwarding the client's `accept-encoding` on the Anthropic route. A
-fixture with `"body_base64"` instead of `"body"` (see the README) is the
-tell.
+**The fixture will very likely be gzipped, and that is handled.** This was an
+open question when the paragraph above was written; see *Anthropic gzips its
+error bodies, so detection decompresses its own copy* below for how it was
+settled.
 
 ## 2026-08-10 — The notifier runs on its own thread, not on the tokio runtime
 
@@ -103,3 +94,89 @@ whole environment, which today holds no credential — but spec §8's
 notifier filters `RELAY_*_KEY`-shaped variables out of the child's
 environment, weighed against the inheritance a desktop notifier needs
 (`DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`).
+
+## 2026-08-10 — Anthropic gzips its error bodies, so detection decompresses its own copy
+
+**Confirmed, not hypothesised:** an unauthenticated request to
+`https://api.anthropic.com/v1/messages` sent with `accept-encoding: gzip,
+deflate` comes back `content-encoding: gzip` with a body starting `1f 8b 08
+00`. Claude Code's HTTP client (Node/undici) sends `accept-encoding` with
+compression by default, and the proxy forwards it verbatim (it is not
+hop-by-hop). So the compressed case is the *ordinary* case in production, not
+an edge one — and the version of Milestone 2 that skipped classification on
+any `content-encoding` would have hit that skip on essentially every real
+error response and never classified anything. Spec §11's acceptance criterion
+("real limit event flips state and fires notification") was unmeetable as
+first shipped.
+
+**The fix decompresses only the classifier's own buffer** (`flate2`, default
+features — the pure-Rust `miniz_oxide` backend, no C toolchain, no libz), inside
+`DetectConfig::classify`. Nothing else in the pipeline changes: the client's
+response and every `--capture-errors` fixture still carry the exact bytes
+Anthropic sent, `content-encoding` included, which is Milestone 1's whole
+guarantee. `tests/limit_detection.rs` asserts both halves of that in one test,
+and `tests/proxy.rs`'s gzip fidelity test is untouched.
+
+**Bounded on both sides.** The accumulator already caps the compressed body at
+1 MiB, which bounds nothing about the output — gzip reaches ratios in the
+thousands — so decompression stops at 4 MiB of output and treats an overrun
+exactly like a body it cannot read: warn, pass through, never classify. Only a
+single `gzip`/`x-gzip` encoding is decompressed; `br`, `zstd` and
+doubly-compressed bodies keep the old skip-and-warn behavior rather than being
+guessed at.
+
+**Rejected: enabling reqwest's own `gzip` feature.** It would decompress every
+response before the proxy saw it, so the client would receive bytes the upstream
+never sent — precisely the fidelity Milestone 1 exists for. (Note for anyone
+reading the old `Cargo.toml` comment: its stated reason, that responses would be
+"mislabelled", was wrong — reqwest strips `content-encoding`/`content-length`
+when it decodes, so nothing is mislabelled. The comment has been corrected; the
+conclusion it reached was right for a different reason.)
+
+**Rejected: stripping the client's `accept-encoding` on the Anthropic route.**
+It would make bodies readable without any new dependency, but it silently
+degrades every response the proxy carries — including the large streaming ones —
+by turning compression off for a client that asked for it, to serve a detector
+that only ever looks at error responses.
+
+## 2026-08-10 — Where Milestone 2's config diverges from spec §8, and why
+
+Recorded so none of it reads as an oversight, and so Milestone 3 makes the
+compatibility call deliberately.
+
+**`min_reset_horizon_secs` and `max_reset_horizon_secs` live in `[detect]`, not
+`[policy]`.** Spec §8 puts `min_reset_horizon_secs` (and `reset_jitter_secs`)
+under `[policy]`; Milestone 2's plan banned a `[policy]` section outright
+(Global Constraint 5), so they went where the code that reads them lives.
+**Forward-compat question for Milestone 3:** every config struct is
+`deny_unknown_fields`, so if M3 introduces `[policy]` and moves these keys to
+match spec §8 literally, every Milestone-2-era config carrying them under
+`[detect]` fails to parse. M3 has to pick one — move them (matching the spec,
+breaking existing configs) or leave them in `[detect]` (deviating from the
+spec's section names, staying compatible). Not decided here.
+
+**`reset_jitter_secs` is not a config field at all.** Spec §8 lists it; Task 1
+implemented the jitter as a hardcoded 15–60s window in `src/route_state.rs`,
+again a plan-scope decision rather than an oversight. Same forward-compat
+question as above if it ever becomes configurable.
+
+**`RELAY_RESET_AT` carries the jittered `until`, not the raw upstream
+`reset_at`.** Spec §4's text names the upstream reset time, but the value an
+operator needs is when the relay will actually retry — and it is the same value
+`/status` reports as `limited_until`, which is what makes the two agree. This is
+a deliberate, tested interpretation; do not "correct" it back from a literal
+reading of §4 without also changing `/status`.
+
+**Why `max_reset_horizon_secs` defaults to 7 days.** It is a midpoint between
+two failure directions: tighter, and a legitimate weekly subscription window
+gets rejected; looser, and a units mistake produces a lockout measured in years.
+It does not need to be generous, because once a limit is genuinely hit the
+*remaining* time to any real reset can never exceed that limit's own period — 7
+days covers the known windows with room to spare. If the captured fixture (still
+pending, above) shows different periods, this default moves with it. The
+ceiling now has a ceiling of its own — 10 years, enforced in
+`DetectConfig::validate` — because a `max_reset_horizon_secs` written in
+milliseconds is not a bound at all: large enough and `bounded`'s `checked_add`
+returns `None`, silently disabling every marked classification; merely huge and
+`/status` reports `LIMITED` with a `limited_until` too far out for RFC3339 to
+render, which is a stuck route with nothing to read.
