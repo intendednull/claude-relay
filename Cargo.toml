@@ -21,3 +21,6 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 sha2 = "0.11.0"
 base64 = "0.23.1"
+# For the Limited-state jitter window (spec §4): no existing crate in the
+# tree provides random number generation.
+rand = "0.10.2"
