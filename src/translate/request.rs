@@ -50,6 +50,9 @@ fn convert(request: MessagesRequest, target_model: &str, stream: bool) -> Result
         messages.extend(converted.with_context(|| format!("in messages[{position}]"))?);
     }
 
+    let tools = tools(&request.tools);
+    let dropped_every_tool = !request.tools.is_empty() && tools.is_empty();
+    let tool_choice = request.tool_choice.as_ref().and_then(tool_choice);
     Ok(ChatRequest {
         model: target_model.to_string(),
         messages,
@@ -57,8 +60,12 @@ fn convert(request: MessagesRequest, target_model: &str, stream: bool) -> Result
         temperature: request.temperature,
         top_p: request.top_p,
         stop: stop_sequences(&request.stop_sequences),
-        tools: tools(&request.tools)?,
-        tool_choice: request.tool_choice.as_ref().and_then(tool_choice),
+        tools,
+        // A `tool_choice` with nothing left to choose from is a request some
+        // providers reject outright. Only compensated for when *this* dropped
+        // the last tool: a client that sent a `tool_choice` and no tools in the
+        // first place gets it forwarded, as it would have been before.
+        tool_choice: tool_choice.filter(|_| !dropped_every_tool),
         stream,
     })
 }
@@ -216,7 +223,7 @@ fn tool_result_content(content: Option<&ToolResultContent>) -> Result<(String, V
 /// session the fallback route exists to rescue. A block type the table does
 /// cover still fails, because that is a malformed request rather than a gap.
 fn dropped_block_note(block: &Block) -> String {
-    let block_type = safe_type_name(block.type_name());
+    let block_type = safe_identifier(block.type_name());
     tracing::warn!(
         block_type,
         "dropping a content block with no OpenAI equivalent"
@@ -227,10 +234,11 @@ fn dropped_block_note(block: &Block) -> String {
     )
 }
 
-/// A block's `type` is client-controlled and unbounded, and this one reaches
-/// both a log line and text the model reads, so it is clipped to something a
-/// type name could plausibly be before either sees it.
-fn safe_type_name(name: &str) -> String {
+/// Block types and tool names are client-controlled and unbounded, and these
+/// reach a log line and — for a block type — text the model reads, so they are
+/// clipped to something an identifier could plausibly be before either sees
+/// them.
+fn safe_identifier(name: &str) -> String {
     const MAX_TYPE_NAME: usize = 64;
     let clipped: String = name
         .chars()
@@ -249,7 +257,7 @@ fn safe_type_name(name: &str) -> String {
 /// where the other drop is `warn`.
 fn note_dropped_thinking(block: &Block) {
     tracing::debug!(
-        block_type = safe_type_name(block.type_name()),
+        block_type = safe_identifier(block.type_name()),
         "dropping a thinking block, which OpenAI has no equivalent for"
     );
 }
@@ -294,18 +302,32 @@ fn collapse(parts: Vec<Part>) -> Content {
     }
 }
 
-fn tools(tools: &[super::anthropic::Tool]) -> Result<Vec<openai::Tool>> {
+/// A tool *definition* this translator cannot map — one of Anthropic's
+/// server-side tools, which carries no `input_schema` because the provider
+/// runs it rather than the client — is dropped rather than failing the
+/// request.
+///
+/// This is the opposite call from a malformed `tool_use`/`tool_result`, and
+/// the difference is what the history refers to. Nothing in a conversation
+/// refers to a tool *definition*: an OpenAI-format `tools` list constrains only
+/// the calls the model may make on this turn, so a past `web_search` call
+/// already in the history still translates either way. Dropping one strands
+/// nothing; failing strands everything, because `tools` is re-sent on every
+/// request — a session with WebSearch enabled could never reach the fallback at
+/// all, which is the session the fallback exists for.
+fn tools(tools: &[super::anthropic::Tool]) -> Vec<openai::Tool> {
     tools
         .iter()
-        .map(|tool| {
+        .filter_map(|tool| {
             let Some(parameters) = tool.input_schema.clone() else {
-                bail!(
-                    "tool {:?} has no input_schema, so it is one of Anthropic's server-side \
-                     tools and has no OpenAI equivalent",
-                    tool.name
+                tracing::warn!(
+                    tool = safe_identifier(&tool.name),
+                    "dropping a tool with no input_schema: one of Anthropic's server-side \
+                     tools, which the fallback provider could not have served anyway"
                 );
+                return None;
             };
-            Ok(openai::Tool {
+            Some(openai::Tool {
                 kind: "function",
                 function: FunctionDef {
                     name: tool.name.clone(),
@@ -653,15 +675,84 @@ mod tests {
         );
     }
 
+    /// Failing here would strand the session rather than the request: `tools`
+    /// is re-sent on every turn, so a WebSearch-enabled session could never
+    /// reach the fallback at all. Nothing refers to a tool *definition*, so
+    /// dropping one leaves no dangling reference behind.
     #[test]
-    fn a_tool_without_an_input_schema_is_a_loud_error() {
-        let message = error(json!({
+    fn a_tool_with_no_input_schema_is_dropped_and_the_rest_still_translates() {
+        let out = translate(json!({
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "tools": [
+                {"name": "Bash", "description": "Run a command",
+                 "input_schema": {"type": "object", "properties": {}}},
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 5},
+                {"name": "Read", "input_schema": {"type": "object", "properties": {}}},
+            ],
         }));
+
+        let names: Vec<&str> = out["tools"]
+            .as_array()
+            .expect("the translatable tools survive")
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Bash", "Read"]);
+        assert_eq!(
+            out["messages"],
+            json!([{"role": "user", "content": "hi"}]),
+            "the rest of the request translates normally"
+        );
+    }
+
+    #[test]
+    fn a_request_of_only_untranslatable_tools_sends_no_tools_at_all() {
+        let out = translate(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "auto"},
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"type": "computer_20241022", "name": "computer"},
+            ],
+        }));
+
+        assert!(out.get("tools").is_none());
         assert!(
-            message.contains("web_search") && message.contains("input_schema"),
-            "unexpected error: {message}"
+            out.get("tool_choice").is_none(),
+            "a tool_choice with nothing left to choose from is rejected by some providers"
+        );
+    }
+
+    /// The history side of the same session: a `server_tool_use` block and its
+    /// result degrade to placeholders, so nothing refers to the tool that was
+    /// dropped from the definitions.
+    #[test]
+    fn a_websearch_session_translates_end_to_end_with_nothing_dangling() {
+        let out = translate(json!({
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [
+                {"role": "user", "content": "what is new in rust?"},
+                {"role": "assistant", "content": [
+                    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+                     "input": {"query": "rust release notes"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+                     "content": [{"type": "web_search_result", "url": "https://example.com"}]},
+                    {"type": "text", "text": "Rust 1.99 shipped."},
+                ]},
+                {"role": "user", "content": "and after that?"},
+            ],
+        }));
+
+        assert!(out.get("tools").is_none());
+        let assistant = out["messages"][1]["content"].as_str().unwrap();
+        assert!(assistant.contains("server_tool_use") && assistant.contains("Rust 1.99 shipped."));
+        assert!(
+            out["messages"][1].get("tool_calls").is_none(),
+            "nothing may reference the tool whose definition was dropped"
+        );
+        assert_eq!(
+            out["messages"][2],
+            json!({"role": "user", "content": "and after that?"})
         );
     }
 

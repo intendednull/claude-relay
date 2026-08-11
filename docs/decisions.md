@@ -292,20 +292,41 @@ with is left referring to a call that no longer exists, and the provider rejects
 *that* with an error far less legible than this one. Every other block type is
 ordinary content, and content degrades.
 
-**Still open — the same defect through a third door, deliberately not changed
-here.** An Anthropic *server tool* in the request's `tools` array —
+**Resolved: an untranslatable tool *definition* is dropped, not failed.** An
+Anthropic server tool in the request's `tools` array —
 `{"type": "web_search_20250305", "name": "web_search"}`, which Claude Code sends
-on every request when WebSearch is enabled — has no `input_schema`, and that
-still fails the translation outright. It is the reviewed and twice-confirmed
-decision for tool-contract violations, but it has exactly the property this
-amendment exists to remove: `tools` is re-sent on *every* request, so a session
-with WebSearch enabled can never reach the fallback route at all. Dropping such a
-tool instead would now be coherent — the matching `server_tool_use` history
-blocks degrade to placeholders, so nothing is left dangling, and the provider
-could not have served the tool regardless. Left alone rather than widened
-unilaterally, because this is the one case where "fail loudly" and "never strand
-a session" genuinely conflict and the call is not the implementer's to make
-quietly.
+on every request when WebSearch is enabled — has no `input_schema` and is
+dropped from the outgoing list with a `tracing::warn!` naming it, leaving the
+rest of the request to translate normally.
+
+This was raised as the one place where "fail loudly on a tool contract" and
+"never strand a session" genuinely conflicted, and was decided rather than
+settled by the implementer. Failing had exactly the property the content-block
+amendment above exists to remove: `tools` is re-sent on *every* request, so a
+WebSearch-enabled session could never reach the fallback at all — the session
+the fallback exists for.
+
+**Why this is the opposite call from a malformed `tool_use`/`tool_result`, and
+not an inconsistency:** what matters is whether anything in the conversation
+*refers* to the thing being dropped. A `tool_use` is referred to by the
+`tool_result` that answers it, so replacing one leaves a dangling reference the
+provider rejects opaquely. Nothing refers to a tool *definition*: an
+OpenAI-format `tools` list constrains only the calls the model may make on this
+turn, so a `web_search` call already sitting in the history translates the same
+either way, and the only effect is that the model is not offered a capability
+the fallback provider could not have served regardless. The history side of that
+same session degrades to placeholders (above), so the two halves agree: nothing
+is left pointing at anything.
+
+**Assumption, unverifiable here, belonging with the others in this entry:** that
+an OpenAI-format provider does not validate historical `tool_calls` in the
+message history against the current `tools` list. That is how OpenAI's own API
+behaves; Together is assumed to match, like everything else in this module.
+
+If dropping every tool empties the list, `tool_choice` is dropped with it — some
+providers reject a `tool_choice` with nothing to choose from. Only when *this*
+removed the last tool: a client that sent a `tool_choice` and no tools to begin
+with still gets it forwarded, exactly as before.
 
 **One tool call streams at a time; the rest wait, buffered.** Anthropic allows a
 single open content block, and OpenAI's `delta.tool_calls` is an array precisely
