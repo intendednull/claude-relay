@@ -6,6 +6,10 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = "0.8"
+# No gzip/brotli/zstd feature, deliberately: with one, reqwest would silently
+# decompress upstream bodies while the proxy still forwards `content-encoding`,
+# mislabelling every compressed response. Held by the gzip fidelity test in
+# tests/proxy.rs.
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }

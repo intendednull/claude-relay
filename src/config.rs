@@ -2,7 +2,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -51,6 +51,19 @@ impl Config {
         self.listen
             .parse()
             .with_context(|| format!("invalid `listen` address: {:?}", self.listen))
+    }
+
+    /// Same fail-fast reason as `listen_addr`, and a worse failure without it:
+    /// reqwest defers a bad URL to `.send()`, where every request 502s with a
+    /// bare "builder error" naming neither the field nor the problem.
+    pub fn anthropic_base_url(&self) -> Result<reqwest::Url> {
+        let raw = &self.anthropic.base_url;
+        let url = reqwest::Url::parse(raw)
+            .with_context(|| format!("invalid `anthropic.base_url`: {raw:?}"))?;
+        if url.host_str().is_none() {
+            bail!("`anthropic.base_url` has no host: {raw:?}");
+        }
+        Ok(url)
     }
 }
 
@@ -130,5 +143,40 @@ mod tests {
             },
         };
         assert!(config.listen_addr().is_err());
+    }
+
+    fn config_with_base_url(base_url: &str) -> Config {
+        Config {
+            listen: "127.0.0.1:8484".to_string(),
+            anthropic: AnthropicConfig {
+                base_url: base_url.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn anthropic_base_url_parses_a_valid_url() {
+        let url = config_with_base_url("https://api.anthropic.com")
+            .anthropic_base_url()
+            .expect("should parse");
+        assert_eq!(url.host_str(), Some("api.anthropic.com"));
+    }
+
+    /// The motivating case: valid TOML, a clean startup, and then every single
+    /// request 502ing on an unexplained reqwest builder error.
+    #[test]
+    fn anthropic_base_url_rejects_a_url_without_a_scheme() {
+        let err = config_with_base_url("api.anthropic.com")
+            .anthropic_base_url()
+            .expect_err("a scheme-less URL must not reach the request path");
+        assert!(err.to_string().contains("anthropic.base_url"));
+    }
+
+    #[test]
+    fn anthropic_base_url_rejects_a_url_without_a_host() {
+        let err = config_with_base_url("file:///etc/passwd")
+            .anthropic_base_url()
+            .expect_err("a hostless URL must not reach the request path");
+        assert!(err.to_string().contains("no host"));
     }
 }

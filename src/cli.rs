@@ -12,8 +12,9 @@ pub struct Cli {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
-    /// Directory to write non-2xx upstream response fixtures to (consumed
-    /// starting in a later milestone task; only parsed and stored here).
+    /// Directory to write fixtures of non-2xx Anthropic responses to, for
+    /// debugging limit detection. Off unless passed; sensitive header values
+    /// are redacted; successful responses are never captured.
     #[arg(long)]
     pub capture_errors: Option<PathBuf>,
 }

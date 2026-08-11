@@ -88,6 +88,58 @@ async fn non_streaming_response_round_trips_byte_identically() {
     assert_eq!(body, MOCK_BODY.as_bytes());
 }
 
+/// `gzip -9` of a small JSON error body. Fixed bytes, not a compressor call, so
+/// the assertion is against exactly what the mock upstream put on the wire.
+const GZIPPED_BODY: &[u8] = &[
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0xab, 0x56, 0x4a, 0x2d, 0x2a, 0xca,
+    0x2f, 0x52, 0xb2, 0xaa, 0x56, 0x2a, 0xa9, 0x2c, 0x48, 0x55, 0xb2, 0x52, 0x2a, 0x4a, 0x2c, 0x49,
+    0x8d, 0xcf, 0xc9, 0xcc, 0xcd, 0x2c, 0x89, 0x87, 0x48, 0xe9, 0x28, 0xe5, 0xa6, 0x16, 0x17, 0x27,
+    0xa6, 0x83, 0x24, 0x93, 0xf3, 0x73, 0x0b, 0x8a, 0x80, 0xbc, 0xd4, 0x14, 0xa5, 0xda, 0x5a, 0x00,
+    0x8d, 0x29, 0x13, 0x4c, 0x3c, 0x00, 0x00, 0x00,
+];
+
+/// Byte-for-byte fidelity rests on reqwest carrying no compression feature (see
+/// Cargo.toml): with one, it would decompress the body while `content-encoding`
+/// still says gzip. Adding that feature must fail here, not in the field.
+#[tokio::test]
+async fn compressed_bodies_pass_through_without_being_decompressed() {
+    let upstream = serve(Router::new().route(
+        "/v1/messages",
+        any(|| async {
+            Response::builder()
+                .header("content-encoding", "gzip")
+                .header("content-type", "application/json")
+                .body(Body::from(GZIPPED_BODY))
+                .expect("failed to build mock response")
+        }),
+    ))
+    .await;
+    let relay = serve_relay(format!("http://{upstream}")).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{relay}/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(
+        response
+            .headers()
+            .get("content-encoding")
+            .map(|value| value.as_bytes()),
+        Some(b"gzip".as_slice()),
+        "content-encoding must survive the proxy; if it is missing entirely, \
+         reqwest decompressed the body — look for a compression feature in Cargo.toml"
+    );
+    let body = response.bytes().await.expect("failed to read body");
+    assert_eq!(
+        body.as_ref(),
+        GZIPPED_BODY,
+        "a compressed body must arrive as the exact bytes the upstream sent"
+    );
+}
+
 #[tokio::test]
 async fn headers_pass_through_in_both_directions() {
     let upstream = serve(echo_upstream()).await;

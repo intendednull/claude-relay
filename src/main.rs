@@ -16,7 +16,10 @@ async fn main() -> Result<()> {
 
     let config_path = cli.resolve_config_path()?;
     let loaded = Config::load(&config_path)?;
+    // Both address-shaped config values are checked here, before the listener
+    // binds: neither should first fail on a request an operator has to diagnose.
     let listen_addr: SocketAddr = loaded.config.listen_addr()?;
+    loaded.config.anthropic_base_url()?;
 
     init_tracing();
 

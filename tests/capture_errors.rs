@@ -10,7 +10,7 @@ use axum::response::Response;
 use axum::routing::any;
 use serde_json::Value;
 
-use common::{serve, serve_relay_with_capture, unique_temp_dir};
+use common::{dripped_body, serve, serve_relay_with_capture, truncated_body, unique_temp_dir};
 
 const RATE_LIMITED_BODY: &str = r#"{"error":{"type":"rate_limit_error","message":"limited"}}"#;
 const OK_BODY: &str = r#"{"ok":true}"#;
@@ -48,13 +48,19 @@ async fn rate_limited_with_duplicate_headers(_req: Request) -> Response {
 
 /// Fixture writing happens after the stream reports its end, which is itself
 /// ordered before the client sees end-of-body — but poll under a small retry
-/// budget anyway, consistent with this repo's other async-completion tests.
-async fn wait_for_fixture(dir: &Path) -> std::path::PathBuf {
+/// budget anyway, consistent with this repo's other async-completion tests. The
+/// file is created before it is filled, so a fixture that doesn't parse yet is
+/// one to keep waiting on rather than a failure.
+async fn wait_for_fixture(dir: &Path) -> (std::path::PathBuf, Value) {
     for _ in 0..100 {
         if let Ok(entries) = std::fs::read_dir(dir) {
-            let mut files: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-            if !files.is_empty() {
-                return files.remove(0).path();
+            let mut paths: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+            paths.sort();
+            if let Some(path) = paths.first()
+                && let Ok(contents) = std::fs::read_to_string(path)
+                && let Ok(fixture) = serde_json::from_str(&contents)
+            {
+                return (path.clone(), fixture);
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -93,7 +99,7 @@ async fn non_2xx_response_writes_a_redacted_fixture() {
         "the response body must still stream to the client unchanged"
     );
 
-    let fixture_path = wait_for_fixture(&capture_dir).await;
+    let (fixture_path, fixture) = wait_for_fixture(&capture_dir).await;
     let file_name = fixture_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -107,11 +113,12 @@ async fn non_2xx_response_writes_a_redacted_fixture() {
         "fixture file name should start with the counter, got {file_name}"
     );
 
-    let contents = std::fs::read_to_string(&fixture_path).expect("failed to read fixture");
-    let fixture: Value = serde_json::from_str(&contents).expect("fixture is not valid json");
-
     assert_eq!(fixture["status"], 429);
     assert_eq!(fixture["body"], RATE_LIMITED_BODY);
+    assert!(
+        fixture.get("truncated").is_none(),
+        "a body that ended cleanly must not be marked truncated"
+    );
     assert_eq!(
         fixture["headers"]["retry-after"], "42",
         "retry-after must survive verbatim"
@@ -148,9 +155,7 @@ async fn repeated_response_headers_all_survive_in_the_fixture() {
         .await
         .expect("failed to read response body");
 
-    let fixture_path = wait_for_fixture(&capture_dir).await;
-    let contents = std::fs::read_to_string(&fixture_path).expect("failed to read fixture");
-    let fixture: Value = serde_json::from_str(&contents).expect("fixture is not valid json");
+    let (_, fixture) = wait_for_fixture(&capture_dir).await;
 
     assert_eq!(
         fixture["headers"]["x-request-id"],
@@ -194,6 +199,143 @@ async fn success_response_does_not_write_a_fixture() {
     assert!(
         entries.is_empty(),
         "a 2xx response must never produce a capture-errors fixture"
+    );
+
+    let _ = std::fs::remove_dir_all(&capture_dir);
+}
+
+const CAPTURE_BODY_CAP: usize = 1024 * 1024;
+
+/// An upstream that is broken or hostile must not be able to make the proxy
+/// hold its whole error body: the fixture stops at the cap, the client does not.
+#[tokio::test]
+async fn an_oversized_error_body_is_capped_and_marked_truncated() {
+    let oversized = "x".repeat(CAPTURE_BODY_CAP + 4096);
+    let expected_len = oversized.len();
+    let upstream = serve(Router::new().route(
+        "/v1/messages",
+        any(move || {
+            let body = oversized.clone();
+            async move {
+                Response::builder()
+                    .status(429)
+                    .body(Body::from(body))
+                    .expect("failed to build mock response")
+            }
+        }),
+    ))
+    .await;
+    let capture_dir = unique_temp_dir("capture-oversized-test");
+    let relay =
+        serve_relay_with_capture(format!("http://{upstream}"), Some(capture_dir.clone())).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{relay}/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(response.status(), 429);
+    let body = response
+        .bytes()
+        .await
+        .expect("failed to read response body");
+    assert_eq!(
+        body.len(),
+        expected_len,
+        "capping the fixture must not cap what the client receives"
+    );
+
+    let (_, fixture) = wait_for_fixture(&capture_dir).await;
+    assert_eq!(
+        fixture["body"].as_str().expect("missing body field").len(),
+        CAPTURE_BODY_CAP,
+        "the fixture body must stop at the cap"
+    );
+    assert_eq!(
+        fixture["truncated"], true,
+        "a capped fixture must say it is partial"
+    );
+
+    let _ = std::fs::remove_dir_all(&capture_dir);
+}
+
+#[tokio::test]
+async fn an_upstream_dying_mid_body_marks_the_fixture_truncated() {
+    let upstream = serve(Router::new().route(
+        "/v1/messages",
+        any(|| async {
+            Response::builder()
+                .status(500)
+                .body(truncated_body(r#"{"error":{"type":"over"#))
+                .expect("failed to build mock response")
+        }),
+    ))
+    .await;
+    let capture_dir = unique_temp_dir("capture-midstream-error-test");
+    let relay =
+        serve_relay_with_capture(format!("http://{upstream}"), Some(capture_dir.clone())).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{relay}/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(response.status(), 500);
+    assert!(
+        response.bytes().await.is_err(),
+        "the client stream must fail rather than end cleanly"
+    );
+
+    let (_, fixture) = wait_for_fixture(&capture_dir).await;
+    assert_eq!(
+        fixture["truncated"], true,
+        "a body cut short by the upstream must not read as a complete one"
+    );
+    assert_eq!(fixture["body"], r#"{"error":{"type":"over"#);
+
+    let _ = std::fs::remove_dir_all(&capture_dir);
+}
+
+#[tokio::test]
+async fn a_client_hangup_marks_the_fixture_truncated() {
+    let upstream = serve(Router::new().route(
+        "/v1/messages",
+        any(|| async {
+            Response::builder()
+                .status(503)
+                .body(dripped_body(
+                    vec!["first-", "second-", "third"],
+                    Duration::from_millis(300),
+                ))
+                .expect("failed to build mock response")
+        }),
+    ))
+    .await;
+    let capture_dir = unique_temp_dir("capture-client-hangup-test");
+    let relay =
+        serve_relay_with_capture(format!("http://{upstream}"), Some(capture_dir.clone())).await;
+
+    let mut response = reqwest::Client::new()
+        .post(format!("http://{relay}/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(response.status(), 503);
+    let first = response
+        .chunk()
+        .await
+        .expect("failed to read the first chunk")
+        .expect("stream ended before the first chunk");
+    assert_eq!(first, "first-".as_bytes());
+    drop(response);
+
+    let (_, fixture) = wait_for_fixture(&capture_dir).await;
+    assert_eq!(
+        fixture["truncated"], true,
+        "a body the client stopped reading must not read as a complete one"
     );
 
     let _ = std::fs::remove_dir_all(&capture_dir);

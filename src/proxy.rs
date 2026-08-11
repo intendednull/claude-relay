@@ -77,6 +77,7 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
             status,
             headers: headers.clone(),
             body: Vec::new(),
+            truncated: false,
         })
     };
 
@@ -125,6 +126,11 @@ struct RequestLog {
     latency_ms: u64,
 }
 
+/// A fixture body is the one thing this proxy holds in memory, so it is bounded:
+/// a broken or hostile upstream must not be able to turn an error response into
+/// unbounded allocation (Global Constraint 3).
+const CAPTURE_BODY_CAP: usize = 1024 * 1024;
+
 /// A non-2xx response's status/headers plus the body bytes accumulated so far,
 /// so a fixture can be written once the stream ends without holding up any
 /// chunk on its way to the client.
@@ -133,6 +139,21 @@ struct PendingCapture {
     status: StatusCode,
     headers: HeaderMap,
     body: Vec<u8>,
+    truncated: bool,
+}
+
+impl PendingCapture {
+    /// Copies what still fits under the cap and drops the rest; the client's
+    /// stream is untouched either way and keeps receiving every byte.
+    fn accumulate(&mut self, chunk: &[u8]) {
+        let remaining = CAPTURE_BODY_CAP - self.body.len();
+        if chunk.len() > remaining {
+            self.body.extend_from_slice(&chunk[..remaining]);
+            self.truncated = true;
+        } else {
+            self.body.extend_from_slice(chunk);
+        }
+    }
 }
 
 /// Passes upstream bytes straight through, tallying them so the per-request log
@@ -162,13 +183,19 @@ impl CountingStream {
         );
     }
 
-    fn finish_capture(&mut self) {
+    /// `ended_early` covers every way the body stopped short of its own end —
+    /// the cap, an upstream failure, a client hangup — all of which produce a
+    /// fixture indistinguishable from a complete one unless it says so.
+    fn finish_capture(&mut self, ended_early: bool) {
         let Some(pending) = self.capture.take() else {
             return;
         };
-        pending
-            .capture
-            .write_fixture(pending.status, &pending.headers, &pending.body);
+        pending.capture.write_fixture(
+            pending.status,
+            &pending.headers,
+            &pending.body,
+            ended_early || pending.truncated,
+        );
     }
 }
 
@@ -181,20 +208,20 @@ impl Stream for CountingStream {
             Poll::Ready(Some(Ok(chunk))) => {
                 this.response_bytes += chunk.len() as u64;
                 if let Some(pending) = &mut this.capture {
-                    pending.body.extend_from_slice(&chunk);
+                    pending.accumulate(&chunk);
                 }
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(err))) => {
                 this.emit();
-                this.finish_capture();
+                this.finish_capture(true);
                 // Same reason as the handler's error path: whatever renders this
                 // error must not be handed a URL that may carry credentials.
                 Poll::Ready(Some(Err(err.without_url())))
             }
             Poll::Ready(None) => {
                 this.emit();
-                this.finish_capture();
+                this.finish_capture(false);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -205,7 +232,9 @@ impl Stream for CountingStream {
 impl Drop for CountingStream {
     fn drop(&mut self) {
         self.emit();
-        self.finish_capture();
+        // Reaching `Drop` with a capture still pending means the stream never
+        // reported its end — the client hung up (or the task was cancelled).
+        self.finish_capture(true);
     }
 }
 

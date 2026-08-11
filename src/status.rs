@@ -20,6 +20,6 @@ pub async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         state: "ACTIVE",
         limited_until: None,
         fallback_requests_served: 0,
-        config_digest: state.config_digest.clone(),
+        config_digest: state.config_digest.to_string(),
     })
 }
