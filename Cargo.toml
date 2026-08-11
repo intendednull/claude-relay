@@ -6,10 +6,13 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = "0.8"
-# No gzip/brotli/zstd feature, deliberately: with one, reqwest would silently
-# decompress upstream bodies while the proxy still forwards `content-encoding`,
-# mislabelling every compressed response. Held by the gzip fidelity test in
-# tests/proxy.rs.
+# No gzip/brotli/zstd feature, deliberately: with one, reqwest would decompress
+# every upstream body before the proxy saw it, so the client would receive bytes
+# the upstream never sent — the byte-for-byte fidelity Milestone 1 exists for.
+# (It rewrites `content-encoding`/`content-length` to match, so nothing is
+# *mislabelled*; the response is simply no longer the upstream's own.) Detection
+# decompresses a copy of its own instead, see `flate2`. Held by the gzip
+# fidelity test in tests/proxy.rs.
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -21,3 +24,18 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 sha2 = "0.11.0"
 base64 = "0.23.1"
+# For the Limited-state jitter window (spec §4): no existing crate in the
+# tree provides random number generation.
+rand = "0.10.2"
+# Spec §5 names `anthropic-ratelimit-*` as a reset-time source and Anthropic's
+# reset headers are RFC3339; `/status` renders `limited_until` the same way.
+# The alternative is hand-rolled civil-date arithmetic. Parsing/formatting
+# only — no macros, no local-timezone support.
+time = { version = "0.3", default-features = false, features = ["std", "parsing", "formatting"] }
+# Anthropic gzips its error bodies whenever the client asks it to, and Claude
+# Code's HTTP client always does — so without this, `classify` never sees JSON
+# and limit detection is inert in production. Used *only* on detection's own
+# copy of the body (`src/detect.rs`); the client's response and every
+# `--capture-errors` fixture keep the exact upstream bytes. Default features:
+# the pure-Rust `miniz_oxide` backend, no C toolchain and no libz linkage.
+flate2 = "1"

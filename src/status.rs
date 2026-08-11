@@ -1,7 +1,9 @@
 use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
 use serde::Serialize;
 
+use crate::route_state::{RouteState, rfc3339};
 use crate::state::AppState;
 
 #[derive(Serialize)]
@@ -12,14 +14,30 @@ pub struct StatusResponse {
     config_digest: String,
 }
 
-/// `limited_until` and `fallback_requests_served` have no state machine to
-/// populate them yet (Milestone 2) — the fields exist now so that milestone
-/// can extend this shape without a breaking change.
-pub async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
-    Json(StatusResponse {
-        state: "ACTIVE",
-        limited_until: None,
+/// `fallback_requests_served` stays 0 until there is fallback routing to count
+/// (Milestone 3). `limited_until` is null outside `LIMITED`, `PROBING`
+/// included: the window it named has already elapsed by then.
+pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, StatusCode> {
+    let route = state.route.clone();
+    // A state query performs the lazy `Limited -> Probing` transition, which
+    // writes the state file synchronously — off the request worker it goes.
+    let current = tokio::task::spawn_blocking(move || route.current_state())
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "route state query failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let (state_label, limited_until) = match current {
+        RouteState::Active => ("ACTIVE", None),
+        RouteState::Limited { until } => ("LIMITED", rfc3339(until)),
+        RouteState::Probing => ("PROBING", None),
+    };
+
+    Ok(Json(StatusResponse {
+        state: state_label,
+        limited_until,
         fallback_requests_served: 0,
         config_digest: state.config_digest.to_string(),
-    })
+    }))
 }

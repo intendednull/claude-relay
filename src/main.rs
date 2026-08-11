@@ -16,10 +16,13 @@ async fn main() -> Result<()> {
 
     let config_path = cli.resolve_config_path()?;
     let loaded = Config::load(&config_path)?;
-    // Both address-shaped config values are checked here, before the listener
-    // binds: neither should first fail on a request an operator has to diagnose.
+    // Checked here, before the listener binds: none of it should first fail on a
+    // request an operator has to diagnose. `AppState::new` — also before the
+    // bind — validates the `[detect]` and `[notify]` rules, both of which fail
+    // silently by nature when they are wrong.
     let listen_addr: SocketAddr = loaded.config.listen_addr()?;
     loaded.config.anthropic_base_url()?;
+    loaded.config.state_file()?;
 
     init_tracing();
 

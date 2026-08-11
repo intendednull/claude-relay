@@ -1,8 +1,85 @@
-# Milestone 1 config shape. Later milestones add `state_file`,
-# `[profiles.*]`, `[policy]`, `[detect]`, and `[notify]` sections (see
-# docs/spec.md §8) — not implemented yet, so don't add them here.
+# Milestone 1 + 2 config shape. Later milestones add `[profiles.*]` and
+# `[policy]` sections (see docs/spec.md §8) — not implemented yet, so don't add
+# them here.
 
 listen = "127.0.0.1:8484"
 
+# Optional. Where route state (ACTIVE / LIMITED / PROBING and its reset time)
+# survives a restart, so a restart mid-limit doesn't go straight back to
+# Anthropic. Absent means in-memory only. Must be an absolute path — `~` is
+# not expanded.
+# state_file = "/home/you/.local/state/relay/state.json"
+
 [anthropic]
 base_url = "https://api.anthropic.com"
+
+# Limit detection (spec §5). The whole section is optional and every key has a
+# default: what is written out below IS the built-in default, so omitting a key
+# keeps it. Anything that doesn't match passes through to the client untouched
+# and never changes route state.
+#
+# These values are derived from spec §5's *expected* shape, not from a captured
+# real limit response (docs/decisions.md). Once `--capture-errors` has caught a
+# genuine subscription-limit 429, re-derive them from that fixture — a config
+# edit, not a rebuild, which is the point.
+[detect]
+status = 429
+# Dotted paths into the JSON body that must all equal the given string.
+match_body = { "error.type" = "rate_limit_error" }
+# Case-insensitive substrings searched in `marker_field`. A hit is an explicit
+# subscription marker, which classifies on its own regardless of the horizon.
+marker_field = "error.message"
+markers = ["usage limit", "subscription"]
+# Without a marker, the reset must be further out than this to count as the
+# subscription limit rather than an ordinary per-minute burst 429. It is also
+# the floor under every window detection produces, so a stale reset time can't
+# yield one that has already expired.
+min_reset_horizon_secs = 300
+# The ceiling on that window — a units sanity check, not a claim about how long
+# Anthropic's windows are. A reset read in the wrong unit (epoch milliseconds
+# through a rule expecting seconds) lands ~55,000 years out; unbounded, such a
+# window is persisted, survives every restart and never elapses. A marked limit
+# past this ceiling is capped to it; an unmarked one is not believed at all.
+# Itself capped at 10 years, so a ceiling written in the wrong unit is rejected
+# at startup rather than quietly becoming no ceiling at all.
+max_reset_horizon_secs = 604800   # 7 days: Claude limits include weekly windows
+
+# Reset-time sources in preference order: the first that yields a time wins.
+# `from` is header | body (body names are dotted paths), and `format` is
+# delta-seconds | unix-seconds | rfc3339.
+[[detect.reset]]
+from = "header"
+name = "retry-after"
+format = "delta-seconds"
+
+[[detect.reset]]
+from = "header"
+name = "anthropic-ratelimit-unified-reset"
+format = "unix-seconds"
+
+# Anthropic's per-endpoint reset headers are RFC3339 rather than epoch seconds;
+# add them the same way if a captured fixture shows them carrying the window:
+# [[detect.reset]]
+# from = "header"
+# name = "anthropic-ratelimit-requests-reset"
+# format = "rfc3339"
+
+# Optional. A command run when the route state changes, so a limit doesn't have
+# to be noticed by polling /status. Omit the section, or leave `command` out, to
+# disable notifications entirely — that is the default.
+#
+# The command runs through `sh -c`, so it can be a whole shell line rather than
+# only a path to a script. It receives the event in its environment:
+#
+#   RELAY_EVENT     failover_engaged | recovered
+#   RELAY_RESET_AT  RFC3339 window end for failover_engaged, empty otherwise
+#                   (the same value /status reports as `limited_until`)
+#   RELAY_DETAIL    a one-line human-readable summary
+#
+# It is fire-and-forget: nothing about a request waits on it, its output is
+# whatever it writes to the relay's own stdout/stderr, and a command that has
+# not exited within `timeout_secs` (1-60, default 5) is killed and logged as a
+# warning.
+# [notify]
+# command = "notify-send 'claude-relay' \"$RELAY_DETAIL\""
+# timeout_secs = 5

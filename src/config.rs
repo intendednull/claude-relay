@@ -1,22 +1,93 @@
 use std::fs;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::detect::DetectConfig;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: String,
+    /// Where route state survives a restart; absent means in-memory only,
+    /// which is spec §4's default ("optional small JSON file").
+    #[serde(default)]
+    pub state_file: Option<PathBuf>,
     pub anthropic: AnthropicConfig,
+    #[serde(default)]
+    pub detect: DetectConfig,
+    #[serde(default)]
+    pub notify: NotifyConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnthropicConfig {
     pub base_url: String,
+}
+
+/// The command run on route state transitions (spec §4). No `command` is the
+/// default and means no notifications at all, not an error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifyConfig {
+    /// Run through `sh -c`, so spec §3's own integration examples
+    /// (`notify-send …`, `osascript -e …`, `ntfy publish …`) work as written
+    /// instead of each needing a wrapper script. Nothing outside this config
+    /// file is ever interpolated into that string: the event reaches the
+    /// command through the environment, never as shell text.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_timeout_secs() -> u64 {
+    5
+}
+
+/// A notification is fire-and-forget; anything still running a minute later has
+/// stopped being one. The ceiling also keeps the deadline arithmetic in
+/// `notify` inside `Instant`'s representable range, and bounds how long one
+/// wedged hook can hold up the next notification.
+const MAX_TIMEOUT_SECS: u64 = 60;
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            timeout_secs: default_timeout_secs(),
+        }
+    }
+}
+
+impl NotifyConfig {
+    /// The ways a configured hook can be silently unable to work: a blank
+    /// command is a shell that does nothing, a zero timeout kills the hook
+    /// before it can do anything, and a timeout large enough to overflow the
+    /// deadline arithmetic panics the notifier *after* it has spawned the hook
+    /// — losing the notification and leaving the child unreaped.
+    pub fn validate(&self) -> Result<()> {
+        let Some(command) = &self.command else {
+            return Ok(());
+        };
+        if command.trim().is_empty() {
+            bail!("`notify.command` is empty; remove the key to disable notifications");
+        }
+        if self.timeout_secs == 0 {
+            bail!("`notify.timeout_secs` must be at least 1");
+        }
+        if self.timeout_secs > MAX_TIMEOUT_SECS {
+            bail!(
+                "`notify.timeout_secs` must be at most {MAX_TIMEOUT_SECS}, got {}",
+                self.timeout_secs
+            );
+        }
+        Ok(())
+    }
 }
 
 /// A parsed config plus the SHA-256 digest of the exact bytes it was parsed
@@ -76,6 +147,24 @@ impl Config {
         }
         Ok(url)
     }
+
+    /// Both ways a state file silently ends up somewhere the operator didn't
+    /// mean: spec §8's own example writes `~/.local/state/...` and nothing here
+    /// expands `~`, so it would become a directory literally named `~`; and a
+    /// relative path resolves against whatever directory the relay happened to
+    /// be started from.
+    pub fn state_file(&self) -> Result<Option<PathBuf>> {
+        let Some(path) = &self.state_file else {
+            return Ok(None);
+        };
+        if !path.is_absolute() {
+            bail!(
+                "`state_file` must be an absolute path (`~` is not expanded): {}",
+                path.display()
+            );
+        }
+        Ok(Some(path.clone()))
+    }
 }
 
 #[cfg(test)]
@@ -94,6 +183,192 @@ mod tests {
         let config = Config::from_toml_str(raw).expect("should parse");
         assert_eq!(config.listen, "127.0.0.1:8484");
         assert_eq!(config.anthropic.base_url, "https://api.anthropic.com");
+    }
+
+    /// Milestone 1 configs keep working, and get the documented detection
+    /// defaults without naming them.
+    #[test]
+    fn state_file_and_detect_are_optional() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+        "#;
+
+        let config = Config::from_toml_str(raw).expect("should parse");
+        assert!(config.state_file.is_none());
+        assert_eq!(config.detect.status, DetectConfig::default().status);
+        assert_eq!(config.state_file().expect("should validate"), None);
+        assert!(config.notify.command.is_none());
+        assert!(config.notify.validate().is_ok());
+    }
+
+    /// These values are ordinary TOML integers, and every one of them makes
+    /// the notifier's `Instant::now() + timeout` overflow and panic — which
+    /// happens *after* the hook has been spawned, so the notification is lost
+    /// and the child is never reaped. Rejecting them at load keeps that
+    /// arithmetic unreachable.
+    #[test]
+    fn a_notify_timeout_that_would_overflow_the_deadline_is_rejected() {
+        for timeout_secs in [MAX_TIMEOUT_SECS + 1, i64::MAX as u64, u64::MAX] {
+            let config = NotifyConfig {
+                command: Some("notify-send hi".to_string()),
+                timeout_secs,
+            };
+            let err = config
+                .validate()
+                .expect_err("{timeout_secs} must not reach the deadline calculation")
+                .to_string();
+            assert!(err.contains("timeout_secs"), "{timeout_secs}: {err}");
+        }
+        assert!(
+            NotifyConfig {
+                command: Some("notify-send hi".to_string()),
+                timeout_secs: MAX_TIMEOUT_SECS,
+            }
+            .validate()
+            .is_ok(),
+            "the ceiling itself is a valid timeout"
+        );
+    }
+
+    #[test]
+    fn parses_a_notify_section_and_defaults_its_timeout() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [notify]
+            command = "/path/to/notify-hook"
+        "#;
+
+        let config = Config::from_toml_str(raw).expect("should parse");
+        assert_eq!(
+            config.notify.command.as_deref(),
+            Some("/path/to/notify-hook")
+        );
+        assert_eq!(config.notify.timeout_secs, 5);
+        assert!(config.notify.validate().is_ok());
+    }
+
+    #[test]
+    fn an_unknown_notify_field_is_a_parse_error() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [notify]
+            cmd = "/path/to/notify-hook"
+        "#;
+        let err = Config::from_toml_str(raw).expect_err("should fail to parse");
+        assert!(err.to_string().contains("cmd"));
+    }
+
+    /// Both configs describe a hook that can never run, and both would do so
+    /// silently — the notifier's failures are all warnings by design.
+    #[test]
+    fn a_notify_hook_that_could_never_run_is_rejected() {
+        let blank = NotifyConfig {
+            command: Some("   ".to_string()),
+            timeout_secs: 5,
+        };
+        assert!(blank.validate().unwrap_err().to_string().contains("empty"));
+
+        let no_time = NotifyConfig {
+            command: Some("notify-send hi".to_string()),
+            timeout_secs: 0,
+        };
+        assert!(
+            no_time
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("timeout_secs")
+        );
+
+        // A zero timeout with no command is still just "no notifications".
+        assert!(
+            NotifyConfig {
+                command: None,
+                timeout_secs: 0,
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn parses_state_file_and_a_detect_section() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+            state_file = "/var/lib/relay/state.json"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [detect]
+            status = 429
+            min_reset_horizon_secs = 900
+            match_body = { "error.type" = "rate_limit_error" }
+
+            [[detect.reset]]
+            from = "header"
+            name = "retry-after"
+            format = "delta-seconds"
+        "#;
+
+        let config = Config::from_toml_str(raw).expect("should parse");
+        assert_eq!(
+            config.state_file().expect("should validate"),
+            Some(PathBuf::from("/var/lib/relay/state.json"))
+        );
+        assert_eq!(config.detect.min_reset_horizon_secs, 900);
+        assert_eq!(config.detect.reset.len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_detect_field_is_a_parse_error() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [detect]
+            jsonpath = "$.error.type"
+        "#;
+        let err = Config::from_toml_str(raw).expect_err("should fail to parse");
+        assert!(err.to_string().contains("jsonpath"));
+    }
+
+    /// A tilde path (spec §8's own example) would become a directory named `~`,
+    /// and a relative one lands wherever the relay happened to be started —
+    /// both are silent, and both put route state somewhere unintended.
+    #[test]
+    fn a_state_file_that_is_not_absolute_is_rejected() {
+        for state_file in [
+            "~/.local/state/relay/state.json",
+            "state.json",
+            "./state.json",
+        ] {
+            let raw = format!(
+                r#"
+                listen = "127.0.0.1:8484"
+                state_file = "{state_file}"
+
+                [anthropic]
+                base_url = "https://api.anthropic.com"
+                "#
+            );
+            let config = Config::from_toml_str(&raw).expect("should parse");
+            let err = config.state_file().expect_err(state_file).to_string();
+            assert!(err.contains("state_file"), "{state_file}: {err}");
+        }
     }
 
     #[test]
@@ -131,37 +406,42 @@ mod tests {
         assert!(err.to_string().contains("some_unplanned_section"));
     }
 
-    #[test]
-    fn listen_addr_parses_valid_socket_addr() {
-        let config = Config {
-            listen: "127.0.0.1:8484".to_string(),
+    fn config_with_listen(listen: &str) -> Config {
+        Config {
+            listen: listen.to_string(),
+            state_file: None,
             anthropic: AnthropicConfig {
                 base_url: "https://api.anthropic.com".to_string(),
             },
-        };
+            detect: DetectConfig::default(),
+            notify: NotifyConfig::default(),
+        }
+    }
+
+    #[test]
+    fn listen_addr_parses_valid_socket_addr() {
         assert_eq!(
-            config.listen_addr().expect("should parse"),
+            config_with_listen("127.0.0.1:8484")
+                .listen_addr()
+                .expect("should parse"),
             "127.0.0.1:8484".parse::<SocketAddr>().unwrap()
         );
     }
 
     #[test]
     fn listen_addr_rejects_invalid_address() {
-        let config = Config {
-            listen: "not-an-address".to_string(),
-            anthropic: AnthropicConfig {
-                base_url: "https://api.anthropic.com".to_string(),
-            },
-        };
-        assert!(config.listen_addr().is_err());
+        assert!(config_with_listen("not-an-address").listen_addr().is_err());
     }
 
     fn config_with_base_url(base_url: &str) -> Config {
         Config {
             listen: "127.0.0.1:8484".to_string(),
+            state_file: None,
             anthropic: AnthropicConfig {
                 base_url: base_url.to_string(),
             },
+            detect: DetectConfig::default(),
+            notify: NotifyConfig::default(),
         }
     }
 

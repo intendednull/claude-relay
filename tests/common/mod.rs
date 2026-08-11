@@ -14,7 +14,8 @@ use futures_core::Stream;
 use tokio::sync::mpsc;
 
 use relay::build_router;
-use relay::config::{AnthropicConfig, Config};
+use relay::config::{AnthropicConfig, Config, NotifyConfig};
+use relay::detect::DetectConfig;
 use relay::state::AppState;
 
 /// Serves `app` on an ephemeral loopback port and returns its address.
@@ -37,10 +38,20 @@ pub async fn serve_relay_with_capture(
     base_url: String,
     capture_errors: Option<PathBuf>,
 ) -> SocketAddr {
-    let config = Config {
+    serve_relay_with(relay_config(base_url), capture_errors).await
+}
+
+pub fn relay_config(base_url: String) -> Config {
+    Config {
         listen: "127.0.0.1:0".to_string(),
+        state_file: None,
         anthropic: AnthropicConfig { base_url },
-    };
+        detect: DetectConfig::default(),
+        notify: NotifyConfig::default(),
+    }
+}
+
+pub async fn serve_relay_with(config: Config, capture_errors: Option<PathBuf>) -> SocketAddr {
     let state = AppState::new(Arc::new(config), capture_errors, "test-digest".to_string())
         .expect("failed to build app state");
     serve(build_router(state)).await

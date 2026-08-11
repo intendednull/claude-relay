@@ -6,6 +6,9 @@ use anyhow::{Context, Result};
 
 use crate::capture::Capture;
 use crate::config::Config;
+use crate::notify::Notifier;
+use crate::route_state::RouteStateMachine;
+use crate::route_updates::RouteUpdates;
 
 /// Bounds connection establishment only. There is deliberately no overall
 /// timeout: a streamed response stays open for as long as the model generates,
@@ -38,6 +41,10 @@ pub struct AppState {
     /// request, and only `/status` ever reads the digest.
     pub config_digest: Arc<str>,
     pub http: reqwest::Client,
+    /// Read by `/status`; written only through `route_updates`, so the request
+    /// path never blocks on the state file.
+    pub route: Arc<RouteStateMachine>,
+    pub route_updates: RouteUpdates,
 }
 
 impl AppState {
@@ -46,6 +53,12 @@ impl AppState {
         capture_errors: Option<PathBuf>,
         config_digest: String,
     ) -> Result<Self> {
+        // Here rather than in `main`, so validation is a property of building a
+        // relay: every embedding — the test harness included — gets the same
+        // rejections the binary does.
+        config.detect.validate()?;
+        config.notify.validate()?;
+
         let http = reqwest::Client::builder()
             // A proxy hands 3xx back to its client rather than chasing it: the
             // request body is streamed, so it cannot be replayed on a redirect.
@@ -57,11 +70,77 @@ impl AppState {
 
         let capture = capture_errors.map(Capture::new).transpose()?;
 
+        let route = Arc::new(RouteStateMachine::new(config.state_file()?)?);
+        let route_updates = RouteUpdates::spawn(route.clone(), Notifier::spawn(&config.notify));
+
         Ok(Self {
             config,
             capture,
             config_digest: config_digest.into(),
             http,
+            route,
+            route_updates,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AnthropicConfig, NotifyConfig};
+    use crate::detect::DetectConfig;
+
+    fn config(detect: DetectConfig, notify: NotifyConfig) -> Config {
+        Config {
+            listen: "127.0.0.1:0".to_string(),
+            state_file: None,
+            anthropic: AnthropicConfig {
+                base_url: "https://api.anthropic.com".to_string(),
+            },
+            detect,
+            notify,
+        }
+    }
+
+    /// Why validation belongs here and not only in `main`: both of these rules
+    /// fail silently when they are wrong, and anything that builds an `AppState`
+    /// directly — the integration harness included — used to skip them entirely.
+    #[test]
+    fn a_config_that_could_never_work_is_rejected_at_construction() {
+        let dead_detection = config(
+            DetectConfig {
+                status: 200,
+                ..DetectConfig::default()
+            },
+            NotifyConfig::default(),
+        );
+        let err = AppState::new(Arc::new(dead_detection), None, "digest".to_string())
+            .err()
+            .expect("a 2xx detect status leaves detection silently dead");
+        assert!(err.to_string().contains("detect.status"), "{err}");
+
+        let unrunnable_hook = config(
+            DetectConfig::default(),
+            NotifyConfig {
+                command: Some("notify-send hi".to_string()),
+                timeout_secs: 0,
+            },
+        );
+        let err = AppState::new(Arc::new(unrunnable_hook), None, "digest".to_string())
+            .err()
+            .expect("a zero timeout kills the hook before it can do anything");
+        assert!(err.to_string().contains("timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn the_default_rules_build_a_relay() {
+        assert!(
+            AppState::new(
+                Arc::new(config(DetectConfig::default(), NotifyConfig::default())),
+                None,
+                "digest".to_string(),
+            )
+            .is_ok()
+        );
     }
 }
