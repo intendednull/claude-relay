@@ -1,6 +1,6 @@
-# Milestone 1 + 2 config shape. Later milestones add `[profiles.*]`,
-# `[policy]`, and `[notify]` sections (see docs/spec.md §8) — not implemented
-# yet, so don't add them here.
+# Milestone 1 + 2 config shape. Later milestones add `[profiles.*]` and
+# `[policy]` sections (see docs/spec.md §8) — not implemented yet, so don't add
+# them here.
 
 listen = "127.0.0.1:8484"
 
@@ -61,3 +61,22 @@ format = "unix-seconds"
 # from = "header"
 # name = "anthropic-ratelimit-requests-reset"
 # format = "rfc3339"
+
+# Optional. A command run when the route state changes, so a limit doesn't have
+# to be noticed by polling /status. Omit the section, or leave `command` out, to
+# disable notifications entirely — that is the default.
+#
+# The command runs through `sh -c`, so it can be a whole shell line rather than
+# only a path to a script. It receives the event in its environment:
+#
+#   RELAY_EVENT     failover_engaged | recovered
+#   RELAY_RESET_AT  RFC3339 window end for failover_engaged, empty otherwise
+#                   (the same value /status reports as `limited_until`)
+#   RELAY_DETAIL    a one-line human-readable summary
+#
+# It is fire-and-forget: nothing about a request waits on it, its output is
+# whatever it writes to the relay's own stdout/stderr, and a command that has
+# not exited within `timeout_secs` is killed and logged as a warning.
+# [notify]
+# command = "notify-send 'claude-relay' \"$RELAY_DETAIL\""
+# timeout_secs = 5

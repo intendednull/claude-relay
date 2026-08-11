@@ -19,12 +19,61 @@ pub struct Config {
     pub anthropic: AnthropicConfig,
     #[serde(default)]
     pub detect: DetectConfig,
+    #[serde(default)]
+    pub notify: NotifyConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnthropicConfig {
     pub base_url: String,
+}
+
+/// The command run on route state transitions (spec §4). No `command` is the
+/// default and means no notifications at all, not an error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifyConfig {
+    /// Run through `sh -c`, so spec §3's own integration examples
+    /// (`notify-send …`, `osascript -e …`, `ntfy publish …`) work as written
+    /// instead of each needing a wrapper script. Nothing outside this config
+    /// file is ever interpolated into that string: the event reaches the
+    /// command through the environment, never as shell text.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_timeout_secs() -> u64 {
+    5
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            timeout_secs: default_timeout_secs(),
+        }
+    }
+}
+
+impl NotifyConfig {
+    /// Both ways a configured hook can be silently unable to ever run: a blank
+    /// command is a shell that does nothing, and a zero timeout kills the hook
+    /// before it can do anything.
+    pub fn validate(&self) -> Result<()> {
+        let Some(command) = &self.command else {
+            return Ok(());
+        };
+        if command.trim().is_empty() {
+            bail!("`notify.command` is empty; remove the key to disable notifications");
+        }
+        if self.timeout_secs == 0 {
+            bail!("`notify.timeout_secs` must be at least 1");
+        }
+        Ok(())
+    }
 }
 
 /// A parsed config plus the SHA-256 digest of the exact bytes it was parsed
@@ -137,6 +186,77 @@ mod tests {
         assert!(config.state_file.is_none());
         assert_eq!(config.detect.status, DetectConfig::default().status);
         assert_eq!(config.state_file().expect("should validate"), None);
+        assert!(config.notify.command.is_none());
+        assert!(config.notify.validate().is_ok());
+    }
+
+    #[test]
+    fn parses_a_notify_section_and_defaults_its_timeout() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [notify]
+            command = "/path/to/notify-hook"
+        "#;
+
+        let config = Config::from_toml_str(raw).expect("should parse");
+        assert_eq!(
+            config.notify.command.as_deref(),
+            Some("/path/to/notify-hook")
+        );
+        assert_eq!(config.notify.timeout_secs, 5);
+        assert!(config.notify.validate().is_ok());
+    }
+
+    #[test]
+    fn an_unknown_notify_field_is_a_parse_error() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [notify]
+            cmd = "/path/to/notify-hook"
+        "#;
+        let err = Config::from_toml_str(raw).expect_err("should fail to parse");
+        assert!(err.to_string().contains("cmd"));
+    }
+
+    /// Both configs describe a hook that can never run, and both would do so
+    /// silently — the notifier's failures are all warnings by design.
+    #[test]
+    fn a_notify_hook_that_could_never_run_is_rejected() {
+        let blank = NotifyConfig {
+            command: Some("   ".to_string()),
+            timeout_secs: 5,
+        };
+        assert!(blank.validate().unwrap_err().to_string().contains("empty"));
+
+        let no_time = NotifyConfig {
+            command: Some("notify-send hi".to_string()),
+            timeout_secs: 0,
+        };
+        assert!(
+            no_time
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("timeout_secs")
+        );
+
+        // A zero timeout with no command is still just "no notifications".
+        assert!(
+            NotifyConfig {
+                command: None,
+                timeout_secs: 0,
+            }
+            .validate()
+            .is_ok()
+        );
     }
 
     #[test]
@@ -251,6 +371,7 @@ mod tests {
                 base_url: "https://api.anthropic.com".to_string(),
             },
             detect: DetectConfig::default(),
+            notify: NotifyConfig::default(),
         }
     }
 
@@ -277,6 +398,7 @@ mod tests {
                 base_url: base_url.to_string(),
             },
             detect: DetectConfig::default(),
+            notify: NotifyConfig::default(),
         }
     }
 

@@ -2,6 +2,7 @@ pub mod capture;
 pub mod cli;
 pub mod config;
 pub mod detect;
+pub mod notify;
 pub mod proxy;
 pub mod route_state;
 pub mod route_updates;

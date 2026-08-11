@@ -5,6 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 /// Random slack added past a reported reset time before transitioning to
 /// `Limited`, so the first probe after `until` doesn't race the upstream
@@ -53,6 +55,30 @@ fn transition(state: RouteState, event: RouteEvent) -> RouteState {
         (RouteState::Probing, RouteEvent::Succeeded) => RouteState::Active,
         (state, _) => state,
     }
+}
+
+/// Renders a state time for the two places one leaves the process: `/status`'s
+/// `limited_until` and the notifier's `RELAY_RESET_AT`, which must agree.
+///
+/// Whole seconds, because that is the resolution `state_file` persists: any
+/// finer and the same window reads differently before and after a restart.
+///
+/// A `Limited` window always renders in practice — detection bounds every one
+/// it produces — so the only way to `None` is a hand-edited state file naming a
+/// year RFC3339 cannot express. Failing that silently is what would leave an
+/// operator with a stuck route and nothing to read.
+pub fn rfc3339(time: SystemTime) -> Option<String> {
+    let rendered = time
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|since_epoch| {
+            OffsetDateTime::from_unix_timestamp(since_epoch.as_secs() as i64).ok()
+        })
+        .and_then(|time| time.format(&Rfc3339).ok());
+    if rendered.is_none() {
+        tracing::warn!("route state `until` is outside the representable range");
+    }
+    rendered
 }
 
 fn add_jitter(reset_at: SystemTime) -> SystemTime {

@@ -12,10 +12,10 @@ or extend it: [`docs/decisions.md`](docs/decisions.md).
 
 Pre-alpha. Milestone 1 (transparent passthrough proxy, `/status`,
 `--capture-errors`) is complete — see [`docs/plans/`](docs/plans/). Milestone
-2 is in progress: limit detection and the route state machine are in, the
-notifier is not. There is still no fallback routing (Milestone 3), so every
-request goes to Anthropic and a detected limit only changes what `/status`
-reports.
+2 is in progress: limit detection, the route state machine and the notifier
+are in. There is still no fallback routing (Milestone 3), so every request
+goes to Anthropic, and a detected limit only changes what `/status` reports
+and fires a notification.
 
 ## Running it
 
@@ -100,6 +100,40 @@ current state and `limited_until`.
 - A compressed error body cannot be classified — the proxy carries no
   decompression, by design (see `Cargo.toml`). It logs a warning and passes
   the response through rather than guessing.
+
+## Notifications
+
+Set `notify.command` to be told when the route state changes instead of
+polling `/status`. The command runs through `sh -c` and gets the event in its
+environment:
+
+| Variable | Value |
+|---|---|
+| `RELAY_EVENT` | `failover_engaged` when the route becomes `LIMITED`, `recovered` when it returns to `ACTIVE` |
+| `RELAY_RESET_AT` | RFC3339 end of the window on `failover_engaged`, the same value `/status` reports as `limited_until`; empty otherwise |
+| `RELAY_DETAIL` | A one-line human-readable summary |
+
+```toml
+[notify]
+command = "notify-send 'claude-relay' \"$RELAY_DETAIL\""
+timeout_secs = 5
+```
+
+Every variable is always set, empty rather than absent where an event has
+nothing to say, so a hook can run under `set -u`.
+
+- **Nothing waits on it.** The command is spawned on a thread of its own; a
+  slow or hanging hook delays neither the proxied response nor the tracking of
+  any later state change. One that has not exited within `timeout_secs` is
+  killed, and every failure — a command that will not start, a non-zero exit,
+  a timeout — is a log warning and nothing more.
+- **It is not a re-limit alarm.** A limit detected while the route is already
+  `LIMITED` does not extend the window, so it is not a state change and does
+  not notify. Nor does the window merely elapsing (`LIMITED` → `PROBING`),
+  which means nothing until a request actually succeeds.
+- It inherits the relay's environment, which a desktop notifier needs
+  (`DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`), and writes to the relay's own
+  stdout/stderr.
 
 ## Logging
 

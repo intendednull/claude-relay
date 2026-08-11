@@ -14,7 +14,7 @@ use futures_core::Stream;
 use tokio::sync::mpsc;
 
 use relay::build_router;
-use relay::config::{AnthropicConfig, Config};
+use relay::config::{AnthropicConfig, Config, NotifyConfig};
 use relay::detect::DetectConfig;
 use relay::state::AppState;
 
@@ -47,6 +47,7 @@ pub fn relay_config(base_url: String) -> Config {
         state_file: None,
         anthropic: AnthropicConfig { base_url },
         detect: DetectConfig::default(),
+        notify: NotifyConfig::default(),
     }
 }
 

@@ -4,6 +4,7 @@ use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::SystemTime;
 
+use crate::notify::Notifier;
 use crate::route_state::{RouteStateMachine, RouteTransition};
 
 /// What one proxied response said about the upstream route.
@@ -26,7 +27,7 @@ pub struct RouteUpdates {
 }
 
 impl RouteUpdates {
-    pub fn spawn(machine: Arc<RouteStateMachine>) -> Self {
+    pub fn spawn(machine: Arc<RouteStateMachine>, notifier: Notifier) -> Self {
         let (outcomes, inbox) = mpsc::channel::<RequestOutcome>();
         thread::spawn(move || {
             // Ends when the last `RouteUpdates` clone — and so the last
@@ -35,7 +36,7 @@ impl RouteUpdates {
                 // A panic here would otherwise end the thread, and every
                 // outcome after it would vanish into a channel nobody reads
                 // while the relay went on looking healthy.
-                if catch_unwind(AssertUnwindSafe(|| apply(&machine, outcome))).is_err() {
+                if catch_unwind(AssertUnwindSafe(|| apply(&machine, &notifier, outcome))).is_err() {
                     tracing::error!("route state update panicked; route state may now be stale");
                 }
             }
@@ -54,7 +55,7 @@ impl RouteUpdates {
     }
 }
 
-fn apply(machine: &RouteStateMachine, outcome: RequestOutcome) {
+fn apply(machine: &RouteStateMachine, notifier: &Notifier, outcome: RequestOutcome) {
     // `Limited -> Probing` is checked lazily on a state query (spec §4), so a
     // window that has already elapsed has to be settled here first — otherwise
     // a success lands on a stale `Limited`, where it is a no-op, and the route
@@ -66,16 +67,26 @@ fn apply(machine: &RouteStateMachine, outcome: RequestOutcome) {
         RequestOutcome::LimitDetected { reset_at } => machine.on_limit_detected(reset_at),
     };
 
-    if let Some(RouteTransition { from, to }) = transition {
+    if let Some(transition) = transition {
+        let RouteTransition { from, to } = transition;
         tracing::info!(from = ?from, to = ?to, "route state changed");
+        // Hands the event to the notifier's own thread and returns; this loop
+        // is what applies every future transition, so it waits on nothing.
+        notifier.notify(transition);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::NotifyConfig;
     use crate::route_state::RouteState;
     use std::time::{Duration, Instant};
+
+    /// The default: no command configured, so no hook and no thread.
+    fn notifier() -> Notifier {
+        Notifier::spawn(&NotifyConfig::default())
+    }
 
     /// Outcomes are applied asynchronously, so tests wait for the state they
     /// expect rather than assuming the applier has run.
@@ -94,7 +105,7 @@ mod tests {
     #[test]
     fn a_detected_limit_moves_the_machine_to_limited() {
         let machine = Arc::new(RouteStateMachine::new(None).unwrap());
-        let updates = RouteUpdates::spawn(machine.clone());
+        let updates = RouteUpdates::spawn(machine.clone(), notifier());
 
         updates.record(RequestOutcome::LimitDetected {
             reset_at: SystemTime::now() + Duration::from_secs(3600),
@@ -108,7 +119,7 @@ mod tests {
     #[test]
     fn a_success_recovers_from_probing() {
         let machine = Arc::new(RouteStateMachine::new(None).unwrap());
-        let updates = RouteUpdates::spawn(machine.clone());
+        let updates = RouteUpdates::spawn(machine.clone(), notifier());
 
         updates.record(RequestOutcome::LimitDetected {
             reset_at: SystemTime::now() - Duration::from_secs(120),
@@ -126,7 +137,7 @@ mod tests {
     #[test]
     fn a_success_recovers_without_an_intervening_state_query() {
         let machine = Arc::new(RouteStateMachine::new(None).unwrap());
-        let updates = RouteUpdates::spawn(machine.clone());
+        let updates = RouteUpdates::spawn(machine.clone(), notifier());
 
         updates.record(RequestOutcome::LimitDetected {
             reset_at: SystemTime::now() - Duration::from_secs(120),
@@ -141,7 +152,7 @@ mod tests {
     #[test]
     fn outcomes_are_applied_in_order() {
         let machine = Arc::new(RouteStateMachine::new(None).unwrap());
-        let updates = RouteUpdates::spawn(machine.clone());
+        let updates = RouteUpdates::spawn(machine.clone(), notifier());
 
         updates.record(RequestOutcome::Succeeded);
         updates.record(RequestOutcome::LimitDetected {

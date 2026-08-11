@@ -23,6 +23,7 @@ async fn main() -> Result<()> {
     loaded.config.anthropic_base_url()?;
     loaded.config.state_file()?;
     loaded.config.detect.validate()?;
+    loaded.config.notify.validate()?;
 
     init_tracing();
 

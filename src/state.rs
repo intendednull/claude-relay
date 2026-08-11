@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 
 use crate::capture::Capture;
 use crate::config::Config;
+use crate::notify::Notifier;
 use crate::route_state::RouteStateMachine;
 use crate::route_updates::RouteUpdates;
 
@@ -64,7 +65,7 @@ impl AppState {
         let capture = capture_errors.map(Capture::new).transpose()?;
 
         let route = Arc::new(RouteStateMachine::new(config.state_file()?)?);
-        let route_updates = RouteUpdates::spawn(route.clone());
+        let route_updates = RouteUpdates::spawn(route.clone(), Notifier::spawn(&config.notify));
 
         Ok(Self {
             config,

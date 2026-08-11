@@ -58,3 +58,39 @@ follow-up — add a decompression dependency for the classification path, or
 stop forwarding the client's `accept-encoding` on the Anthropic route. A
 fixture with `"body_base64"` instead of `"body"` (see the README) is the
 tell.
+
+## 2026-08-10 — The notifier runs on its own thread, not on the tokio runtime
+
+Milestone 2's plan (Global Constraint 4, Task 3) says the notifier hook uses
+`tokio::process::Command`, on the assumption that transitions are applied
+inside the async request path. They are not: Task 2 landed the applier as a
+plain `std::thread` reading a channel (`src/route_updates.rs`), because the
+state machine persists synchronously and the point where a non-2xx body is
+fully known is a stream callback that cannot await. There is no runtime under
+that thread, and blocking it would be worse than any notifier failure — its
+loop applies *every* future transition, so a hook that hung would silently
+stop route tracking for the whole process.
+
+So the notifier is the same shape as the applier: a thread of its own, fed by
+a channel, spawning the hook with `std::process::Command` and enforcing the
+timeout by polling `try_wait` and killing at the deadline. Firing a
+notification is a non-blocking channel send. No new dependency, and the
+constraint's actual concern — "no new process-spawning crate" — is met more
+directly than by tokio.
+
+**Rejected:** capturing a `tokio::runtime::Handle` at startup and
+`handle.spawn`-ing the hook onto the runtime from the applier thread. It
+works, but it puts a runtime dependency into a component that otherwise has
+none (the state machine and its applier are deliberately runtime-free and
+unit-testable without one), needs two more tokio features, and buys nothing
+the channel hand-off doesn't already provide.
+
+**The hook runs through `sh -c`.** Spec §8's example is a path to a script,
+but §3 names `notify-send`, `osascript` and `ntfy` as the integration points
+and every one of those needs arguments — a bare-exec field would force a
+wrapper script for all of them. Nothing outside the config file is ever
+interpolated into that string: the event reaches the hook through the
+environment, never as shell text. The cost is that killing a timed-out hook
+reaches the `sh`, so a hook that forks its own children can outlive its
+timeout; the relay is unaffected either way, and killing the process group
+would mean a libc dependency for one signal.

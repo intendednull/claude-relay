@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use relay::build_router;
-use relay::config::{AnthropicConfig, Config};
+use relay::config::{AnthropicConfig, Config, NotifyConfig};
 use relay::detect::DetectConfig;
 use relay::state::AppState;
 
@@ -14,6 +14,7 @@ async fn healthz_returns_200_ok() {
             base_url: "https://api.anthropic.com".to_string(),
         },
         detect: DetectConfig::default(),
+        notify: NotifyConfig::default(),
     };
     let state = AppState::new(Arc::new(config), None, "test-digest".to_string())
         .expect("failed to build app state");
