@@ -60,6 +60,10 @@ async fn status_returns_documented_shape_with_stable_digest() {
         assert_eq!(body["state"], "ACTIVE");
         assert!(body["limited_until"].is_null());
         assert_eq!(body["fallback_requests_served"], 0);
+        assert!(
+            body["active_profile"].is_null(),
+            "no profiles configured and no policy.active_profile set"
+        );
         assert_eq!(body["config_digest"], expected_digest);
     }
 

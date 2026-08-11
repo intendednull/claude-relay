@@ -517,3 +517,64 @@ answer: a 202 or 206 does not silently become a 200.
 answered with, and not requests that never reached one (untranslatable body,
 missing key, unreachable endpoint). `/status` reads it now rather than keeping
 its hardcoded `0`, since the field was already in the documented response shape.
+
+## 2026-08-11 — The control API (Task 4): what the plan left open
+
+`src/control.rs`. Spec §8b names the two endpoints and the loopback rule;
+these are the places it left the shape to the implementer.
+
+**Loopback enforcement is a route-registration decision, not a per-request
+one.** `control::enabled(&Config)` re-parses `listen` via the same
+`Config::listen_addr` `main` already calls, and `build_router` only adds the
+`/control/*` routes when it says loopback. A `listen` that fails to parse is
+treated as not loopback (fail closed: unparsed is not "proven safe," and the
+real binary never gets this far on one anyway). The alternative — register the
+routes unconditionally and gate inside each handler — was rejected: gating at
+registration means a non-loopback bind gets axum's own 404 for an unmatched
+path, so there is no handler-shaped place to accidentally return a 403, a 500,
+or a body that admits the surface exists.
+
+**Consequence for Milestone 4, flagged rather than solved here:** this check
+runs once, when `build_router` is called at startup. Milestone 3 has no config
+hot-reload, so that is every time it matters today. If Milestone 4's hot
+reload lets `listen` change without a restart, `control::enabled`'s result
+would go stale until the next rebuild — hot-reloading `listen` at all is a
+bigger question than this task's scope, so this only records the coupling for
+whoever picks that up.
+
+**The runtime switch is `AppState`-local, read once per request.**
+`AppState::active_profile()` folds `policy.active_profile` and a
+`POST /control/profile` override into one value; every routing call site
+reads it exactly once and holds the result for the rest of that request. This
+is what makes "a switch applies to new requests only" (spec §8b) true by
+construction rather than by a lucky timing window — nothing downstream of the
+initial read ever re-consults either source.
+
+**`GET /control/profiles` returns `name`, `format`, `serves`, `model_map`,
+`api_key_env` (the *name*, never read or returned as a value), and `active`.**
+Spec §8b says "list profile names + their model maps; mark active" and leaves
+the rest of the shape open; the extra fields were judged worth exposing since
+an operator switching profiles blind on `name` alone would have to cross-
+reference the config file anyway to know what a name even routes to.
+
+**`profile_switched` reuses the existing three env vars; no `RELAY_PROFILE`
+was added.** Spec §4 names exactly `RELAY_EVENT`, `RELAY_RESET_AT`,
+`RELAY_DETAIL` and spec §8b adds no fourth for a profile name. The switched-to
+name rides in `RELAY_DETAIL` ("active profile switched to <name>"), with
+`RELAY_RESET_AT` empty — not applicable to this event, same "empty rather than
+absent" rule `Recovered` already uses. Considered and rejected: a dedicated
+env var, which would be more convenient for a hook to parse structurally but
+is not anything spec asks for, and this project's other additions to the
+config/event surface have consistently matched spec's stated shape rather than
+extended it speculatively.
+
+**`NotifyEvent` dropped `Copy` for `Clone`, and `Notifier` gained a second
+entry point.** `ProfileSwitched { name: String }` cannot be `Copy`.
+`Notifier::notify(RouteTransition)` stays as the route-state path;
+`Notifier::notify_event(NotifyEvent)` is new and is what `notify` now calls
+internally, and what `/control/profile` calls directly — a profile switch is
+not a route transition, so routing it through `notify` would have meant
+manufacturing a fake `RouteTransition` to smuggle it through. `Notifier`
+itself is now `Clone` (`mpsc::Sender<T>` is `Clone` regardless of `T`), so
+`AppState` can hold one end for `/control/profile` while `RouteUpdates` holds
+the other, both backed by the same channel.

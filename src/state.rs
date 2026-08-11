@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -32,6 +32,29 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A request dying at almost exactly this mark is this constant, not the network.
 const READ_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Runtime override for `policy.active_profile`, set by `POST /control/profile`
+/// (spec §8b). `None` until a switch happens, so a request falls through to
+/// the startup default until then; never persisted, so a restart drops it and
+/// reads `policy.active_profile` fresh — "ephemeral by design", per spec.
+///
+/// Wrapped rather than a bare `Mutex<Option<String>>` field on `AppState` so
+/// the only way to read or write it is `AppState::active_profile`/
+/// `set_active_profile`, which is what keeps "read once per request, at
+/// routing time" a property of the API rather than a convention callers have
+/// to remember.
+#[derive(Debug, Default)]
+struct ActiveProfileOverride(Mutex<Option<String>>);
+
+impl ActiveProfileOverride {
+    fn get(&self) -> Option<String> {
+        self.0.lock().expect("active profile lock poisoned").clone()
+    }
+
+    fn set(&self, name: String) {
+        *self.0.lock().expect("active profile lock poisoned") = Some(name);
+    }
+}
+
 /// Shared application state handed to axum handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -46,6 +69,11 @@ pub struct AppState {
     /// path never blocks on the state file.
     pub route: Arc<RouteStateMachine>,
     pub route_updates: RouteUpdates,
+    /// The other end of the same channel `route_updates` feeds into on a
+    /// transition; kept here too so `/control/profile` can fire
+    /// `profile_switched` directly, without a fake `RouteTransition` to
+    /// smuggle it through `route_updates`.
+    pub notifier: Notifier,
     /// Spec §9's `/status` counter: requests a fallback profile answered,
     /// whatever it answered with. A request that never reached one — an
     /// untranslatable body, a missing key, an unreachable endpoint — is not
@@ -57,6 +85,7 @@ pub struct AppState {
     /// 8 MiB fixture. Deliberately not a config key: no deployment should need
     /// it changed.
     pub routing_body_cap: usize,
+    active_profile_override: Arc<ActiveProfileOverride>,
 }
 
 impl AppState {
@@ -92,7 +121,8 @@ impl AppState {
             config.state_file()?,
             config.policy.reset_jitter_secs,
         )?);
-        let route_updates = RouteUpdates::spawn(route.clone(), Notifier::spawn(&config.notify));
+        let notifier = Notifier::spawn(&config.notify);
+        let route_updates = RouteUpdates::spawn(route.clone(), notifier.clone());
 
         Ok(Self {
             config,
@@ -101,9 +131,31 @@ impl AppState {
             http,
             route,
             route_updates,
+            notifier,
             fallback_requests_served: Arc::new(AtomicU64::new(0)),
             routing_body_cap: crate::proxy::ROUTING_BODY_CAP,
+            active_profile_override: Arc::new(ActiveProfileOverride::default()),
         })
+    }
+
+    /// The profile a request routes against right now (spec §8b): the
+    /// runtime switch if `/control/profile` has made one, else
+    /// `policy.active_profile`, the startup default. Callers must read this
+    /// once per request at routing time and hold onto the result rather than
+    /// re-consulting it — that is what keeps an in-flight stream on the
+    /// profile it started with even if a switch lands mid-stream.
+    pub fn active_profile(&self) -> Option<String> {
+        self.active_profile_override
+            .get()
+            .or_else(|| self.config.policy.active_profile.clone())
+    }
+
+    /// Sets the runtime override read by `active_profile`. Trusts `name` the
+    /// same way `router::route` trusts its `active_profile` parameter: the
+    /// caller — `/control/profile`'s 404 check — has already validated it
+    /// names a configured profile, so this never re-checks.
+    pub fn set_active_profile(&self, name: String) {
+        self.active_profile_override.set(name);
     }
 }
 
@@ -212,5 +264,81 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    fn profile() -> crate::config::ProfileConfig {
+        crate::config::ProfileConfig {
+            base_url: "https://example.com".to_string(),
+            api_key_env: "RELAY_KEY".to_string(),
+            format: "openai".to_string(),
+            serves: Vec::new(),
+            model_map: IndexMap::new(),
+        }
+    }
+
+    /// Before any switch, `active_profile()` reads the startup default —
+    /// proving the fallthrough half of spec §8b, not just the override half.
+    #[test]
+    fn active_profile_falls_through_to_the_policy_default_before_any_switch() {
+        let mut wired = config(DetectConfig::default(), NotifyConfig::default());
+        wired.profiles.insert("deepseek".to_string(), profile());
+        wired.policy.active_profile = Some("deepseek".to_string());
+        let state =
+            AppState::new(Arc::new(wired), None, "digest".to_string()).expect("should build");
+
+        assert_eq!(state.active_profile(), Some("deepseek".to_string()));
+    }
+
+    /// The override half: once set, it wins over the startup default, and
+    /// stays in effect across repeated reads — a runtime switch is not a
+    /// one-shot signal.
+    #[test]
+    fn set_active_profile_overrides_the_policy_default() {
+        let mut wired = config(DetectConfig::default(), NotifyConfig::default());
+        wired.profiles.insert("deepseek".to_string(), profile());
+        wired.profiles.insert("kimi".to_string(), profile());
+        wired.policy.active_profile = Some("deepseek".to_string());
+        let state =
+            AppState::new(Arc::new(wired), None, "digest".to_string()).expect("should build");
+
+        state.set_active_profile("kimi".to_string());
+
+        assert_eq!(state.active_profile(), Some("kimi".to_string()));
+        assert_eq!(
+            state.active_profile(),
+            Some("kimi".to_string()),
+            "a second read must see the same switch, not consume it"
+        );
+    }
+
+    /// `AppState::clone()` is how axum hands state to every handler; a switch
+    /// made through one clone (a request on one worker) must be visible from
+    /// another (a request on a different worker) — which only holds if the
+    /// override is shared state, not a plain field copied by `derive(Clone)`.
+    #[test]
+    fn a_switch_is_visible_through_a_cloned_appstate() {
+        let mut wired = config(DetectConfig::default(), NotifyConfig::default());
+        wired.profiles.insert("deepseek".to_string(), profile());
+        let state =
+            AppState::new(Arc::new(wired), None, "digest".to_string()).expect("should build");
+        let cloned = state.clone();
+
+        cloned.set_active_profile("deepseek".to_string());
+
+        assert_eq!(state.active_profile(), Some("deepseek".to_string()));
+    }
+
+    /// No profile configured at all and no startup default is a valid state
+    /// (a zero-profile relay), and must read as `None`, not panic.
+    #[test]
+    fn active_profile_is_none_with_nothing_configured_or_switched() {
+        let state = AppState::new(
+            Arc::new(config(DetectConfig::default(), NotifyConfig::default())),
+            None,
+            "digest".to_string(),
+        )
+        .expect("should build");
+
+        assert_eq!(state.active_profile(), None);
     }
 }

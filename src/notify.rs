@@ -12,13 +12,19 @@ use crate::route_state::{RouteState, RouteTransition, rfc3339};
 /// out of band, so latency here costs nothing.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// A transition worth announcing (spec §4). `Limited -> Probing` is not one:
-/// the window merely elapsed, and nothing has changed for the user until a
-/// request actually succeeds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A transition worth announcing (spec §4), plus `ProfileSwitched` for
+/// `POST /control/profile` (spec §8b) — not a route transition at all, which
+/// is why it arrives through `notify_event` rather than `from_transition`.
+/// `Limited -> Probing` is not one of these: the window merely elapsed, and
+/// nothing has changed for the user until a request actually succeeds.
+///
+/// `Copy` dropped to `Clone` for this variant's `name: String` — every other
+/// variant would still be `Copy` alone, but the enum is one type.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifyEvent {
     FailoverEngaged { reset_at: SystemTime },
     Recovered,
+    ProfileSwitched { name: String },
 }
 
 impl NotifyEvent {
@@ -32,10 +38,11 @@ impl NotifyEvent {
         }
     }
 
-    fn name(self) -> &'static str {
+    fn name(&self) -> &'static str {
         match self {
             Self::FailoverEngaged { .. } => "failover_engaged",
             Self::Recovered => "recovered",
+            Self::ProfileSwitched { .. } => "profile_switched",
         }
     }
 }
@@ -45,10 +52,14 @@ impl NotifyEvent {
 ///
 /// A variable the event has nothing to say in is empty rather than absent: a
 /// hook run under `set -u` would otherwise die on `$RELAY_RESET_AT`.
-fn env_vars(event: NotifyEvent) -> [(&'static str, String); 3] {
+///
+/// `profile_switched` carries its name in `RELAY_DETAIL`: spec §4 and §8b
+/// name exactly these three vars and no fourth for a profile, so this reuses
+/// the contract that exists rather than inventing one.
+fn env_vars(event: &NotifyEvent) -> [(&'static str, String); 3] {
     let reset_at = match event {
-        NotifyEvent::FailoverEngaged { reset_at } => rfc3339(reset_at).unwrap_or_default(),
-        NotifyEvent::Recovered => String::new(),
+        NotifyEvent::FailoverEngaged { reset_at } => rfc3339(*reset_at).unwrap_or_default(),
+        NotifyEvent::Recovered | NotifyEvent::ProfileSwitched { .. } => String::new(),
     };
     let detail = match event {
         NotifyEvent::FailoverEngaged { .. } if reset_at.is_empty() => {
@@ -58,6 +69,7 @@ fn env_vars(event: NotifyEvent) -> [(&'static str, String); 3] {
             format!("anthropic route limited until {reset_at}")
         }
         NotifyEvent::Recovered => "anthropic route recovered".to_string(),
+        NotifyEvent::ProfileSwitched { name } => format!("active profile switched to {name}"),
     };
     [
         ("RELAY_EVENT", event.name().to_string()),
@@ -75,6 +87,11 @@ fn env_vars(event: NotifyEvent) -> [(&'static str, String); 3] {
 /// worse failure than the missed notification the timeout exists to bound.
 /// Handing the event over a channel keeps spawning, waiting and killing over
 /// here, where the only thing a slow hook can delay is the next notification.
+///
+/// `Clone`: `AppState` hands one end to `RouteUpdates` and keeps another for
+/// `/control/profile` to fire `profile_switched` directly — both are the same
+/// underlying channel, so either can send without the other's cooperation.
+#[derive(Clone)]
 pub struct Notifier {
     /// `None` when no command is configured: no thread, no work, no error.
     events: Option<Sender<NotifyEvent>>,
@@ -106,10 +123,17 @@ impl Notifier {
     /// Never blocks and never fails: a hook that hangs, fails to start, or
     /// exits non-zero is the notifier's problem alone.
     pub fn notify(&self, transition: RouteTransition) {
-        let Some(events) = &self.events else {
+        let Some(event) = NotifyEvent::from_transition(transition) else {
             return;
         };
-        let Some(event) = NotifyEvent::from_transition(transition) else {
+        self.notify_event(event);
+    }
+
+    /// Same guarantee as `notify`, for an event that is not itself a route
+    /// transition — `profile_switched` (spec §8b), fired directly by the
+    /// `/control/profile` handler rather than derived from `RouteTransition`.
+    pub fn notify_event(&self, event: NotifyEvent) {
+        let Some(events) = &self.events else {
             return;
         };
         if events.send(event).is_err() {
@@ -125,7 +149,7 @@ fn run(command: &str, timeout: Duration, event: NotifyEvent) {
     let spawned = Command::new("sh")
         .arg("-c")
         .arg(command)
-        .envs(env_vars(event))
+        .envs(env_vars(&event))
         // A hook that reads stdin would otherwise read the relay's.
         .stdin(Stdio::null())
         .spawn();
@@ -216,7 +240,7 @@ mod tests {
         }
     }
 
-    fn value_of(event: NotifyEvent, key: &str) -> String {
+    fn value_of(event: &NotifyEvent, key: &str) -> String {
         env_vars(event)
             .into_iter()
             .find(|(name, _)| *name == key)
@@ -284,21 +308,24 @@ mod tests {
     fn failover_engaged_carries_the_reset_time() {
         let reset_at = SystemTime::now() + Duration::from_secs(3600);
         let event = NotifyEvent::FailoverEngaged { reset_at };
-        assert_eq!(value_of(event, "RELAY_EVENT"), "failover_engaged");
+        assert_eq!(value_of(&event, "RELAY_EVENT"), "failover_engaged");
         assert_eq!(
-            value_of(event, "RELAY_RESET_AT"),
+            value_of(&event, "RELAY_RESET_AT"),
             rfc3339(reset_at).expect("should render")
         );
-        assert!(value_of(event, "RELAY_DETAIL").contains("limited until"));
+        assert!(value_of(&event, "RELAY_DETAIL").contains("limited until"));
     }
 
     /// Set-but-empty, not absent, so a hook under `set -u` survives it.
     #[test]
     fn recovered_carries_an_empty_reset_time() {
         let event = NotifyEvent::Recovered;
-        assert_eq!(value_of(event, "RELAY_EVENT"), "recovered");
-        assert_eq!(value_of(event, "RELAY_RESET_AT"), "");
-        assert_eq!(value_of(event, "RELAY_DETAIL"), "anthropic route recovered");
+        assert_eq!(value_of(&event, "RELAY_EVENT"), "recovered");
+        assert_eq!(value_of(&event, "RELAY_RESET_AT"), "");
+        assert_eq!(
+            value_of(&event, "RELAY_DETAIL"),
+            "anthropic route recovered"
+        );
     }
 
     #[test]
@@ -307,8 +334,24 @@ mod tests {
         let event = NotifyEvent::FailoverEngaged {
             reset_at: UNIX_EPOCH + Duration::from_secs(1_000_000_000_000),
         };
-        assert_eq!(value_of(event, "RELAY_RESET_AT"), "");
-        assert_eq!(value_of(event, "RELAY_DETAIL"), "anthropic route limited");
+        assert_eq!(value_of(&event, "RELAY_RESET_AT"), "");
+        assert_eq!(value_of(&event, "RELAY_DETAIL"), "anthropic route limited");
+    }
+
+    /// `profile_switched` has no reset time to carry — the name is what
+    /// matters, and `RELAY_DETAIL` is where it lands (spec §4/§8b name no
+    /// dedicated env var for it).
+    #[test]
+    fn profile_switched_carries_the_name_in_detail_and_an_empty_reset_at() {
+        let event = NotifyEvent::ProfileSwitched {
+            name: "kimi".to_string(),
+        };
+        assert_eq!(value_of(&event, "RELAY_EVENT"), "profile_switched");
+        assert_eq!(value_of(&event, "RELAY_RESET_AT"), "");
+        assert_eq!(
+            value_of(&event, "RELAY_DETAIL"),
+            "active profile switched to kimi"
+        );
     }
 
     // --- running the hook ---
@@ -337,6 +380,33 @@ mod tests {
 
         let line = wait_for_file(&log, Duration::from_secs(5));
         assert_eq!(line, "recovered||anthropic route recovered");
+        let _ = fs::remove_file(&log);
+    }
+
+    /// `notify_event` is the entry point a caller with an event already in
+    /// hand uses — `/control/profile` — rather than one deriving from a
+    /// `RouteTransition`. Proven separately from `notify` because nothing
+    /// else in this file calls it.
+    #[test]
+    fn notify_event_runs_the_hook_for_an_event_with_no_route_transition() {
+        let log = temp_path("profile-switched");
+        let notifier = Notifier::spawn(&NotifyConfig {
+            command: Some(format!(
+                r#"printf '%s|%s|%s' "$RELAY_EVENT" "$RELAY_RESET_AT" "$RELAY_DETAIL" > {}"#,
+                log.display()
+            )),
+            timeout_secs: 5,
+        });
+
+        notifier.notify_event(NotifyEvent::ProfileSwitched {
+            name: "deepseek".to_string(),
+        });
+
+        let line = wait_for_file(&log, Duration::from_secs(5));
+        assert_eq!(
+            line,
+            "profile_switched||active profile switched to deepseek"
+        );
         let _ = fs::remove_file(&log);
     }
 

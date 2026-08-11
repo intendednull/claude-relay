@@ -13,6 +13,11 @@ pub struct StatusResponse {
     state: &'static str,
     limited_until: Option<String>,
     fallback_requests_served: u64,
+    /// Spec §8b's stated `/status` extension: the profile new requests
+    /// currently route against — the runtime switch if one has happened,
+    /// else `policy.active_profile`. `null` with zero profiles configured or
+    /// no default and no switch.
+    active_profile: Option<String>,
     config_digest: String,
 }
 
@@ -39,6 +44,7 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
         state: state_label,
         limited_until,
         fallback_requests_served: state.fallback_requests_served.load(Ordering::Relaxed),
+        active_profile: state.active_profile(),
         config_digest: state.config_digest.to_string(),
     }))
 }

@@ -87,11 +87,13 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
         return to_anthropic(&state, start, &parts, body.into(), None).await;
     };
 
-    let named = router::route(
-        &model,
-        &state.config.profiles,
-        state.config.policy.active_profile.as_deref(),
-    );
+    // Read once, here, at the point the route is decided: `active_profile`
+    // covers both the startup default and any `/control/profile` switch, and
+    // this value — not a later re-read of either — is what the rest of this
+    // request (including a streamed response) is bound to (spec §8b: a
+    // switch applies to new requests only).
+    let active_profile = state.active_profile();
+    let named = router::route(&model, &state.config.profiles, active_profile.as_deref());
     let target = match named {
         // §7d: routed by name, so the name is passed through unremapped. A
         // `count_tokens` request may only go to a profile that can actually
@@ -262,8 +264,11 @@ fn counts_tokens(state: &AppState, profile: &str) -> bool {
 /// `None` leaves it on Anthropic, where a limit error passes through to the
 /// client as the visible failure the mode asked for.
 async fn failover(state: &AppState, view: &RoutingView) -> Option<String> {
+    // Same one-read-per-request rule as the name-routing call site above:
+    // `active_profile()` folds in a `/control/profile` switch, read exactly
+    // once, before the eligibility and state checks below.
+    let active = state.active_profile()?;
     let policy = &state.config.policy;
-    let active = policy.active_profile.as_deref()?;
     let eligible = match policy.mode.as_str() {
         "all" => true,
         // The session-start heuristic: a conversation with no assistant turn
@@ -281,7 +286,7 @@ async fn failover(state: &AppState, view: &RoutingView) -> Option<String> {
     if !eligible || !is_limited(state).await {
         return None;
     }
-    Some(active.to_string())
+    Some(active)
 }
 
 async fn is_limited(state: &AppState) -> bool {
