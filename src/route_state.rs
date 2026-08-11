@@ -195,6 +195,12 @@ impl PersistedState {
     }
 }
 
+/// A missing file, and a `Limited` record with no `until`, are both handled
+/// by `PersistedState`/its caller elsewhere; this also fails open to
+/// `Active` on a file that fails to *parse* at all. `state_file` isn't
+/// written atomically, so an ordinary unclean shutdown mid-write is a
+/// realistic way to produce one, and spec §4 calls persistence "optional" —
+/// a corrupt file must not turn it into a hard startup dependency.
 fn load(path: &Path) -> Result<RouteState> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -204,9 +210,17 @@ fn load(path: &Path) -> Result<RouteState> {
                 .with_context(|| format!("failed to read state file: {}", path.display()));
         }
     };
-    let persisted: PersistedState = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse state file: {}", path.display()))?;
-    Ok(persisted.into_route_state())
+    match serde_json::from_slice::<PersistedState>(&bytes) {
+        Ok(persisted) => Ok(persisted.into_route_state()),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "state file is corrupt; starting Active"
+            );
+            Ok(RouteState::Active)
+        }
+    }
 }
 
 fn save(path: &Path, state: RouteState) -> Result<()> {
@@ -477,13 +491,17 @@ mod tests {
     #[test]
     fn persistence_round_trips_active() {
         let path = unique_temp_path("round-trip-active");
-        let machine = RouteStateMachine::new(Some(path.clone())).unwrap();
-        // Active is the default; exercise the round trip via an explicit save.
-        save(&path, RouteState::Active).unwrap();
+        let machine = RouteStateMachine {
+            state: Mutex::new(RouteState::Probing),
+            state_file: Some(path.clone()),
+        };
+        // Drive the real Probing -> Active transition so this exercises
+        // `apply`'s persist call, not just the free `save` function.
+        let transitioned = machine.on_success().unwrap();
+        assert_eq!(transitioned.to, RouteState::Active);
 
         let reloaded = RouteStateMachine::new(Some(path.clone())).unwrap();
         assert_eq!(reloaded.current_state(), RouteState::Active);
-        drop(machine);
         let _ = fs::remove_file(&path);
     }
 
@@ -555,6 +573,28 @@ mod tests {
             machine.current_state(),
             RouteState::Limited { .. }
         ));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn corrupt_state_file_fails_open_to_active() {
+        let path = unique_temp_path("corrupt-file");
+        fs::write(&path, b"{not valid json at all").unwrap();
+
+        let machine =
+            RouteStateMachine::new(Some(path.clone())).expect("a corrupt file must not error");
+        assert_eq!(machine.current_state(), RouteState::Active);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn state_file_with_wrong_types_fails_open_to_active() {
+        let path = unique_temp_path("wrong-types");
+        fs::write(&path, br#"{"state": "LIMITED", "until": "not-a-number"}"#).unwrap();
+
+        let machine =
+            RouteStateMachine::new(Some(path.clone())).expect("wrong field types must not error");
+        assert_eq!(machine.current_state(), RouteState::Active);
         let _ = fs::remove_file(&path);
     }
 
