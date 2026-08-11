@@ -162,21 +162,33 @@ that only ever looks at error responses.
 Recorded so none of it reads as an oversight, and so Milestone 3 makes the
 compatibility call deliberately.
 
-**`min_reset_horizon_secs` and `max_reset_horizon_secs` live in `[detect]`, not
-`[policy]`.** Spec §8 puts `min_reset_horizon_secs` (and `reset_jitter_secs`)
-under `[policy]`; Milestone 2's plan banned a `[policy]` section outright
-(Global Constraint 5), so they went where the code that reads them lives.
-**Forward-compat question for Milestone 3:** every config struct is
-`deny_unknown_fields`, so if M3 introduces `[policy]` and moves these keys to
-match spec §8 literally, every Milestone-2-era config carrying them under
-`[detect]` fails to parse. M3 has to pick one — move them (matching the spec,
-breaking existing configs) or leave them in `[detect]` (deviating from the
-spec's section names, staying compatible). Not decided here.
+**Resolved 2026-08-10, Milestone 3 Task 1: moved to `[policy]`, matching spec
+§8 literally.** `min_reset_horizon_secs`, `max_reset_horizon_secs`, and the
+now-configurable `reset_jitter_secs` all live in the new `PolicyConfig`
+(`src/config.rs`) as of this milestone. `DetectConfig::classify` and
+`route_state::add_jitter` take the horizon bounds and jitter range as
+parameters instead of reading their own fields. This is the deliberate
+breaking move flagged below, not a deviation: no external configs exist yet
+beyond this repo's own `relay.example.toml` (updated alongside), so matching
+the spec now costs nothing. A Milestone-2-era config that still puts
+`min_reset_horizon_secs` under `[detect]` now fails to parse — `[detect]` is
+`deny_unknown_fields` and no longer has that field — which is the intended
+effect of choosing "move" over "leave in `[detect]`, deviating from the
+spec's section names."
 
-**`reset_jitter_secs` is not a config field at all.** Spec §8 lists it; Task 1
-implemented the jitter as a hardcoded 15–60s window in `src/route_state.rs`,
-again a plan-scope decision rather than an oversight. Same forward-compat
-question as above if it ever becomes configurable.
+**`max_reset_horizon_secs` moved too, though spec §8's `[policy]` example
+doesn't list it.** It was never part of the original spec text — Milestone 2
+added it as an implementation-level ceiling on top of `min_reset_horizon_secs`
+(see the ceiling entry below) — but it is the same horizon pair as
+`min_reset_horizon_secs` and reads identically in `classify`/`bounded`, so
+splitting them across two config sections would be the more surprising
+outcome. Moved together, on the same reasoning as the resolution above.
+
+**`reset_jitter_secs` is now a real config field.** Previously a hardcoded
+15–60s window in `src/route_state.rs` (Milestone 2, `[policy]` being banned
+that milestone); `RouteStateMachine` now takes `jitter_secs: [u64; 2]` at
+construction (`policy.reset_jitter_secs`, default `[15, 60]`, matching the old
+hardcoded values so an omitted key changes nothing).
 
 **`RELAY_RESET_AT` carries the jittered `until`, not the raw upstream
 `reset_at`.** Spec §4's text names the upstream reset time, but the value an
@@ -193,8 +205,9 @@ It does not need to be generous, because once a limit is genuinely hit the
 days covers the known windows with room to spare. If the captured fixture (still
 pending, above) shows different periods, this default moves with it. The
 ceiling now has a ceiling of its own — 10 years, enforced in
-`DetectConfig::validate` — because a `max_reset_horizon_secs` written in
-milliseconds is not a bound at all: large enough and `bounded`'s `checked_add`
-returns `None`, silently disabling every marked classification; merely huge and
-`/status` reports `LIMITED` with a `limited_until` too far out for RFC3339 to
-render, which is a stuck route with nothing to read.
+`PolicyConfig::validate` (`src/config.rs`, moved from `DetectConfig::validate`
+alongside the field, Milestone 3) — because a `max_reset_horizon_secs` written
+in milliseconds is not a bound at all: large enough and `detect::bounded`'s
+`checked_add` returns `None`, silently disabling every marked classification;
+merely huge and `/status` reports `LIMITED` with a `limited_until` too far out
+for RFC3339 to render, which is a stuck route with nothing to read.

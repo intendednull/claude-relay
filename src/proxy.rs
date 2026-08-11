@@ -186,10 +186,14 @@ impl ErrorObservation {
 
     fn finish(self, incomplete: bool) {
         if let Some(config) = &self.detect
-            && let Some(reset_at) =
-                config
-                    .detect
-                    .classify(&self.headers, &self.body, incomplete, SystemTime::now())
+            && let Some(reset_at) = config.detect.classify(
+                &self.headers,
+                &self.body,
+                incomplete,
+                SystemTime::now(),
+                config.policy.min_reset_horizon_secs,
+                config.policy.max_reset_horizon_secs,
+            )
         {
             self.route_updates
                 .record(RequestOutcome::LimitDetected { reset_at });

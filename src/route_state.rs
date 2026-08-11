@@ -8,12 +8,6 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-/// Random slack added past a reported reset time before transitioning to
-/// `Limited`, so the first probe after `until` doesn't race the upstream
-/// window boundary (spec §4).
-const JITTER_MIN_SECS: u64 = 15;
-const JITTER_MAX_SECS: u64 = 60;
-
 /// The Anthropic route's state per spec §4. Distinct from `AppState`
 /// (`src/state.rs`), which is the per-request axum handler state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,8 +75,10 @@ pub fn rfc3339(time: SystemTime) -> Option<String> {
     rendered
 }
 
-fn add_jitter(reset_at: SystemTime) -> SystemTime {
-    let jitter_secs: u64 = rand::random_range(JITTER_MIN_SECS..=JITTER_MAX_SECS);
+/// `jitter_range` is `policy.reset_jitter_secs`, `[min, max]` inclusive.
+fn add_jitter(reset_at: SystemTime, jitter_range: [u64; 2]) -> SystemTime {
+    let [min, max] = jitter_range;
+    let jitter_secs: u64 = rand::random_range(min..=max);
     // `reset_at` is derived from an upstream-supplied reset time, and plain
     // `SystemTime` addition panics on overflow — here that would kill the
     // thread applying transitions and stop state tracking for good.
@@ -97,6 +93,10 @@ fn add_jitter(reset_at: SystemTime) -> SystemTime {
 pub struct RouteStateMachine {
     state: Mutex<RouteState>,
     state_file: Option<PathBuf>,
+    /// `policy.reset_jitter_secs` (spec §4): random slack added past a
+    /// reported reset time before transitioning to `Limited`, so the first
+    /// probe after `until` doesn't race the upstream window boundary.
+    jitter_secs: [u64; 2],
 }
 
 impl RouteStateMachine {
@@ -104,7 +104,7 @@ impl RouteStateMachine {
     /// starts `Active` otherwise, including when `state_file` is `None`
     /// (in-memory only, per spec §4's stated default) or the file doesn't
     /// exist yet (first run).
-    pub fn new(state_file: Option<PathBuf>) -> Result<Self> {
+    pub fn new(state_file: Option<PathBuf>, jitter_secs: [u64; 2]) -> Result<Self> {
         let state = match &state_file {
             Some(path) => load(path)?,
             None => RouteState::Active,
@@ -112,6 +112,7 @@ impl RouteStateMachine {
         Ok(Self {
             state: Mutex::new(state),
             state_file,
+            jitter_secs,
         })
     }
 
@@ -134,7 +135,7 @@ impl RouteStateMachine {
     /// callers should not pre-jitter it.
     pub fn on_limit_detected(&self, reset_at: SystemTime) -> Option<RouteTransition> {
         self.apply(RouteEvent::LimitDetected {
-            until: add_jitter(reset_at),
+            until: add_jitter(reset_at, self.jitter_secs),
         })
     }
 
@@ -393,7 +394,7 @@ mod tests {
 
     #[test]
     fn current_state_stays_limited_before_until() {
-        let machine = RouteStateMachine::new(None).unwrap();
+        let machine = RouteStateMachine::new(None, [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         machine.on_limit_detected(future(3600));
         assert!(matches!(
             machine.current_state(),
@@ -406,13 +407,14 @@ mod tests {
         let machine = RouteStateMachine {
             state: Mutex::new(RouteState::Limited { until: past(1) }),
             state_file: None,
+            jitter_secs: [JITTER_MIN_SECS, JITTER_MAX_SECS],
         };
         assert_eq!(machine.current_state(), RouteState::Probing);
     }
 
     #[test]
     fn current_state_defaults_to_active() {
-        let machine = RouteStateMachine::new(None).unwrap();
+        let machine = RouteStateMachine::new(None, [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         assert_eq!(machine.current_state(), RouteState::Active);
     }
 
@@ -420,7 +422,7 @@ mod tests {
 
     #[test]
     fn on_limit_detected_from_active_reports_the_transition() {
-        let machine = RouteStateMachine::new(None).unwrap();
+        let machine = RouteStateMachine::new(None, [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         let transitioned = machine.on_limit_detected(future(1000)).unwrap();
         assert_eq!(transitioned.from, RouteState::Active);
         assert!(matches!(transitioned.to, RouteState::Limited { .. }));
@@ -431,6 +433,7 @@ mod tests {
         let machine = RouteStateMachine {
             state: Mutex::new(RouteState::Probing),
             state_file: None,
+            jitter_secs: [JITTER_MIN_SECS, JITTER_MAX_SECS],
         };
         let transitioned = machine.on_success().unwrap();
         assert_eq!(
@@ -444,7 +447,7 @@ mod tests {
 
     #[test]
     fn on_success_from_active_reports_no_transition() {
-        let machine = RouteStateMachine::new(None).unwrap();
+        let machine = RouteStateMachine::new(None, [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         assert!(machine.on_success().is_none());
         assert_eq!(machine.current_state(), RouteState::Active);
     }
@@ -454,6 +457,7 @@ mod tests {
         let machine = RouteStateMachine {
             state: Mutex::new(RouteState::Active),
             state_file: None,
+            jitter_secs: [JITTER_MIN_SECS, JITTER_MAX_SECS],
         };
 
         let to_limited = machine.on_limit_detected(future(0)).unwrap();
@@ -479,11 +483,17 @@ mod tests {
 
     // --- jitter range ---
 
+    /// The documented default (`config::default_reset_jitter_secs`, spec §8's
+    /// `reset_jitter_secs = [15, 60]`), restated here so `RouteStateMachine`
+    /// stays testable without depending on `crate::config`.
+    const JITTER_MIN_SECS: u64 = 15;
+    const JITTER_MAX_SECS: u64 = 60;
+
     #[test]
     fn jitter_always_falls_within_the_configured_range() {
         let reset_at = SystemTime::now();
         for _ in 0..500 {
-            let jittered = add_jitter(reset_at);
+            let jittered = add_jitter(reset_at, [JITTER_MIN_SECS, JITTER_MAX_SECS]);
             let delta = jittered
                 .duration_since(reset_at)
                 .expect("jittered time must be after reset_at")
@@ -495,6 +505,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn jitter_respects_a_configured_range() {
+        let reset_at = SystemTime::now();
+        for _ in 0..50 {
+            let jittered = add_jitter(reset_at, [100, 120]);
+            let delta = jittered.duration_since(reset_at).unwrap().as_secs();
+            assert!(
+                (100..=120).contains(&delta),
+                "jitter {delta}s outside [100, 120]"
+            );
+        }
+    }
+
     /// `SystemTime + Duration` panics on overflow, and `reset_at` is derived
     /// from an upstream-supplied reset time. A panic here would kill the thread
     /// that applies transitions, silently ending state tracking for the process.
@@ -502,7 +525,7 @@ mod tests {
     fn add_jitter_saturates_instead_of_panicking_at_the_edge_of_representable_time() {
         let edge = UNIX_EPOCH + Duration::from_secs(i64::MAX as u64 - 10);
         assert_eq!(
-            add_jitter(edge),
+            add_jitter(edge, [JITTER_MIN_SECS, JITTER_MAX_SECS]),
             edge,
             "no jitter fits, so the un-jittered time stands"
         );
@@ -510,7 +533,7 @@ mod tests {
 
     #[test]
     fn on_limit_detected_applies_jitter_via_the_machine() {
-        let machine = RouteStateMachine::new(None).unwrap();
+        let machine = RouteStateMachine::new(None, [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         let reset_at = SystemTime::now();
         for _ in 0..50 {
             let transitioned = machine.on_limit_detected(reset_at).unwrap();
@@ -530,6 +553,7 @@ mod tests {
         let machine = RouteStateMachine {
             state: Mutex::new(RouteState::Probing),
             state_file: None,
+            jitter_secs: [JITTER_MIN_SECS, JITTER_MAX_SECS],
         };
         let reset_at = SystemTime::now();
         let transitioned = machine.on_limit_detected(reset_at).unwrap();
@@ -552,13 +576,15 @@ mod tests {
         let machine = RouteStateMachine {
             state: Mutex::new(RouteState::Probing),
             state_file: Some(path.clone()),
+            jitter_secs: [JITTER_MIN_SECS, JITTER_MAX_SECS],
         };
         // Drive the real Probing -> Active transition so this exercises
         // `apply`'s persist call, not just the free `save` function.
         let transitioned = machine.on_success().unwrap();
         assert_eq!(transitioned.to, RouteState::Active);
 
-        let reloaded = RouteStateMachine::new(Some(path.clone())).unwrap();
+        let reloaded =
+            RouteStateMachine::new(Some(path.clone()), [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         assert_eq!(reloaded.current_state(), RouteState::Active);
         let _ = fs::remove_file(&path);
     }
@@ -566,7 +592,8 @@ mod tests {
     #[test]
     fn persistence_round_trips_limited() {
         let path = unique_temp_path("round-trip-limited");
-        let machine = RouteStateMachine::new(Some(path.clone())).unwrap();
+        let machine =
+            RouteStateMachine::new(Some(path.clone()), [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         let until = future(3600);
         machine.on_limit_detected(until - Duration::from_secs(JITTER_MAX_SECS));
         // Read back the exact `until` the machine persisted (jitter makes it
@@ -576,7 +603,8 @@ mod tests {
             other => panic!("expected Limited, got {other:?}"),
         };
 
-        let reloaded = RouteStateMachine::new(Some(path.clone())).unwrap();
+        let reloaded =
+            RouteStateMachine::new(Some(path.clone()), [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         assert_eq!(
             reloaded.current_state(),
             RouteState::Limited {
@@ -598,13 +626,15 @@ mod tests {
         let machine = RouteStateMachine {
             state: Mutex::new(RouteState::Active),
             state_file: Some(path.clone()),
+            jitter_secs: [JITTER_MIN_SECS, JITTER_MAX_SECS],
         };
         machine.on_limit_detected(past(JITTER_MAX_SECS + 1));
         // `until` is already behind `now` even after jitter, so the next
         // query lazily flips to Probing and persists it.
         assert_eq!(machine.current_state(), RouteState::Probing);
 
-        let reloaded = RouteStateMachine::new(Some(path.clone())).unwrap();
+        let reloaded =
+            RouteStateMachine::new(Some(path.clone()), [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         assert_eq!(reloaded.current_state(), RouteState::Probing);
         let _ = fs::remove_file(&path);
     }
@@ -615,7 +645,8 @@ mod tests {
         let stale = SystemTime::now() - Duration::from_secs(3600);
         save(&path, RouteState::Limited { until: stale }).unwrap();
 
-        let machine = RouteStateMachine::new(Some(path.clone())).unwrap();
+        let machine =
+            RouteStateMachine::new(Some(path.clone()), [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         assert_eq!(machine.current_state(), RouteState::Active);
         let _ = fs::remove_file(&path);
     }
@@ -626,7 +657,8 @@ mod tests {
         let until = future(3600);
         save(&path, RouteState::Limited { until }).unwrap();
 
-        let machine = RouteStateMachine::new(Some(path.clone())).unwrap();
+        let machine =
+            RouteStateMachine::new(Some(path.clone()), [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         assert!(matches!(
             machine.current_state(),
             RouteState::Limited { .. }
@@ -640,7 +672,8 @@ mod tests {
         fs::write(&path, b"{not valid json at all").unwrap();
 
         let machine =
-            RouteStateMachine::new(Some(path.clone())).expect("a corrupt file must not error");
+            RouteStateMachine::new(Some(path.clone()), [JITTER_MIN_SECS, JITTER_MAX_SECS])
+                .expect("a corrupt file must not error");
         assert_eq!(machine.current_state(), RouteState::Active);
         let _ = fs::remove_file(&path);
     }
@@ -657,7 +690,8 @@ mod tests {
         .unwrap();
 
         let machine =
-            RouteStateMachine::new(Some(path.clone())).expect("an absurd `until` must not error");
+            RouteStateMachine::new(Some(path.clone()), [JITTER_MIN_SECS, JITTER_MAX_SECS])
+                .expect("an absurd `until` must not error");
         assert_eq!(machine.current_state(), RouteState::Active);
         let _ = fs::remove_file(&path);
     }
@@ -668,7 +702,8 @@ mod tests {
         fs::write(&path, br#"{"state": "LIMITED", "until": "not-a-number"}"#).unwrap();
 
         let machine =
-            RouteStateMachine::new(Some(path.clone())).expect("wrong field types must not error");
+            RouteStateMachine::new(Some(path.clone()), [JITTER_MIN_SECS, JITTER_MAX_SECS])
+                .expect("wrong field types must not error");
         assert_eq!(machine.current_state(), RouteState::Active);
         let _ = fs::remove_file(&path);
     }
@@ -677,13 +712,14 @@ mod tests {
     fn missing_state_file_starts_active() {
         let path = unique_temp_path("missing-file");
         let _ = fs::remove_file(&path);
-        let machine = RouteStateMachine::new(Some(path)).unwrap();
+        let machine =
+            RouteStateMachine::new(Some(path), [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         assert_eq!(machine.current_state(), RouteState::Active);
     }
 
     #[test]
     fn no_state_file_configured_is_in_memory_only() {
-        let machine = RouteStateMachine::new(None).unwrap();
+        let machine = RouteStateMachine::new(None, [JITTER_MIN_SECS, JITTER_MAX_SECS]).unwrap();
         machine.on_limit_detected(future(100));
         assert!(matches!(
             machine.current_state(),

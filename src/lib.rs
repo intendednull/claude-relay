@@ -6,6 +6,7 @@ pub mod notify;
 pub mod proxy;
 pub mod route_state;
 pub mod route_updates;
+pub mod router;
 pub mod state;
 pub mod status;
 

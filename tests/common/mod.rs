@@ -13,8 +13,10 @@ use axum::body::{Body, Bytes};
 use futures_core::Stream;
 use tokio::sync::mpsc;
 
+use indexmap::IndexMap;
+
 use relay::build_router;
-use relay::config::{AnthropicConfig, Config, NotifyConfig};
+use relay::config::{AnthropicConfig, Config, NotifyConfig, PolicyConfig};
 use relay::detect::DetectConfig;
 use relay::state::AppState;
 
@@ -48,6 +50,8 @@ pub fn relay_config(base_url: String) -> Config {
         anthropic: AnthropicConfig { base_url },
         detect: DetectConfig::default(),
         notify: NotifyConfig::default(),
+        profiles: IndexMap::new(),
+        policy: PolicyConfig::default(),
     }
 }
 

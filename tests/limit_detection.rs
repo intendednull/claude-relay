@@ -26,7 +26,7 @@ const SERVER_ERROR_BODY: &str =
 
 const LIMIT_RETRY_AFTER: u64 = 3600;
 const BURST_RETRY_AFTER: u64 = 12;
-/// `detect.max_reset_horizon_secs`'s default, restated so the test fails if it
+/// `policy.max_reset_horizon_secs`'s default, restated so the test fails if it
 /// changes silently.
 const MAX_RESET_HORIZON_SECS: u64 = 7 * 24 * 60 * 60;
 

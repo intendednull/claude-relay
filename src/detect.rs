@@ -38,19 +38,6 @@ pub struct DetectConfig {
     /// Reset-time sources in preference order: the first that yields a time wins.
     #[serde(default = "default_reset")]
     pub reset: Vec<ResetSource>,
-    /// Without a marker, a reset horizon must exceed this to count as the
-    /// subscription limit rather than a burst 429 (spec §5). It is also the
-    /// floor every classified window gets, so no match ever produces one that
-    /// has already expired.
-    #[serde(default = "default_min_reset_horizon_secs")]
-    pub min_reset_horizon_secs: u64,
-    /// The ceiling on a classified window. This is a units/format sanity check,
-    /// not a judgement about how long Anthropic's windows are: a reset read in
-    /// the wrong unit (epoch *milliseconds* through a rule expecting seconds)
-    /// lands ~55,000 years out, and without a ceiling that window is persisted,
-    /// survives every restart, and never elapses.
-    #[serde(default = "default_max_reset_horizon_secs")]
-    pub max_reset_horizon_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,18 +98,6 @@ fn default_reset() -> Vec<ResetSource> {
     ]
 }
 
-fn default_min_reset_horizon_secs() -> u64 {
-    300
-}
-
-/// A week. Claude subscription limits include weekly windows, so a tighter
-/// ceiling would reject a legitimate reset — and it costs nothing against what
-/// the ceiling is actually for, since every wrong-unit or garbage value is
-/// orders of magnitude past it.
-fn default_max_reset_horizon_secs() -> u64 {
-    7 * 24 * 60 * 60
-}
-
 impl Default for DetectConfig {
     fn default() -> Self {
         Self {
@@ -131,22 +106,9 @@ impl Default for DetectConfig {
             marker_field: default_marker_field(),
             markers: default_markers(),
             reset: default_reset(),
-            min_reset_horizon_secs: default_min_reset_horizon_secs(),
-            max_reset_horizon_secs: default_max_reset_horizon_secs(),
         }
     }
 }
-
-/// The ceiling on the ceiling. `max_reset_horizon_secs` is what stops a
-/// wrong-unit reset from producing a window that never elapses — but written in
-/// the wrong unit *itself* (milliseconds for seconds) it stops being a bound:
-/// large enough and `bounded`'s `checked_add` returns `None`, silently killing
-/// every marked classification; merely huge and it yields a `Limited` state
-/// whose `until` is past what `rfc3339` can render, so `/status` shows a stuck
-/// route with a null window and nothing says why. 10 years is orders of
-/// magnitude past any subscription window and orders of magnitude short of
-/// either failure.
-const MAX_RESET_HORIZON_CEILING_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 
 impl DetectConfig {
     /// A status the proxy never classifies (2xx, or not a status at all) would
@@ -157,19 +119,6 @@ impl DetectConfig {
             bail!(
                 "`detect.status` must be a 4xx or 5xx status code, got {}",
                 self.status
-            );
-        }
-        if self.max_reset_horizon_secs > MAX_RESET_HORIZON_CEILING_SECS {
-            bail!(
-                "`detect.max_reset_horizon_secs` must be at most {MAX_RESET_HORIZON_CEILING_SECS} (10 years), got {}",
-                self.max_reset_horizon_secs
-            );
-        }
-        if self.min_reset_horizon_secs > self.max_reset_horizon_secs {
-            bail!(
-                "`detect.min_reset_horizon_secs` ({}) must not exceed `detect.max_reset_horizon_secs` ({})",
-                self.min_reset_horizon_secs,
-                self.max_reset_horizon_secs
             );
         }
         Ok(())
@@ -184,12 +133,18 @@ impl DetectConfig {
     /// subscription-limit signature, `None` for everything else — including a
     /// partial match, which passes through unchanged (spec §5's conservative
     /// rule: never transition on an ambiguous response).
+    ///
+    /// `min_reset_horizon_secs`/`max_reset_horizon_secs` come from
+    /// `policy.PolicyConfig` (`src/config.rs`), not from this struct — the
+    /// caller is expected to have validated `min <= max` there.
     pub fn classify(
         &self,
         headers: &HeaderMap,
         body: &[u8],
         truncated: bool,
         now: SystemTime,
+        min_reset_horizon_secs: u64,
+        max_reset_horizon_secs: u64,
     ) -> Option<SystemTime> {
         if truncated {
             return None;
@@ -215,27 +170,23 @@ impl DetectConfig {
             // never expire it, so the window is held inside the configured
             // bounds. Guessing short is self-correcting: the probe after it
             // re-detects and re-limits.
-            (true, Some(reset_at)) => self.bounded(reset_at, now),
-            (true, None) => self.bounded(now, now),
+            (true, Some(reset_at)) => bounded(
+                reset_at,
+                now,
+                min_reset_horizon_secs,
+                max_reset_horizon_secs,
+            ),
+            (true, None) => bounded(now, now, min_reset_horizon_secs, max_reset_horizon_secs),
             // Without a marker the horizon *is* the evidence, so an
             // implausible one is a reason to disbelieve the classification
             // rather than to clamp it: pass the response through untouched.
             (false, Some(reset_at)) => {
                 let horizon = reset_at.duration_since(now).ok()?.as_secs();
-                (horizon > self.min_reset_horizon_secs && horizon <= self.max_reset_horizon_secs)
+                (horizon > min_reset_horizon_secs && horizon <= max_reset_horizon_secs)
                     .then_some(reset_at)
             }
             (false, None) => None,
         }
-    }
-
-    /// `max`/`min` rather than `clamp`, which panics when the bounds cross —
-    /// `validate` rejects that config, but a panic here would be in the request
-    /// path.
-    fn bounded(&self, reset_at: SystemTime, now: SystemTime) -> Option<SystemTime> {
-        let floor = now.checked_add(Duration::from_secs(self.min_reset_horizon_secs))?;
-        let ceiling = now.checked_add(Duration::from_secs(self.max_reset_horizon_secs))?;
-        Some(reset_at.max(floor).min(ceiling))
     }
 
     fn marker_matches(&self, json: &Value) -> bool {
@@ -250,6 +201,20 @@ impl DetectConfig {
             .iter()
             .any(|marker| text.contains(&marker.to_lowercase()))
     }
+}
+
+/// `max`/`min` rather than `clamp`, which panics when the bounds cross —
+/// `PolicyConfig::validate` (`src/config.rs`) rejects that config, but a panic
+/// here would be in the request path.
+pub(crate) fn bounded(
+    reset_at: SystemTime,
+    now: SystemTime,
+    min_reset_horizon_secs: u64,
+    max_reset_horizon_secs: u64,
+) -> Option<SystemTime> {
+    let floor = now.checked_add(Duration::from_secs(min_reset_horizon_secs))?;
+    let ceiling = now.checked_add(Duration::from_secs(max_reset_horizon_secs))?;
+    Some(reset_at.max(floor).min(ceiling))
 }
 
 impl ResetSource {
@@ -386,8 +351,27 @@ mod tests {
     const LIMIT_BODY: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"You have reached your Claude Pro usage limit. Your limit will reset at 6pm."}}"#;
     const BURST_BODY: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of requests has exceeded your per-minute rate limit."}}"#;
 
+    /// `min_reset_horizon_secs`/`max_reset_horizon_secs` moved to
+    /// `policy.PolicyConfig` (`src/config.rs`); these read its defaults so the
+    /// horizon-dependent tests below keep testing the real default, not a
+    /// duplicated literal.
+    fn default_min_reset_horizon_secs() -> u64 {
+        crate::config::PolicyConfig::default().min_reset_horizon_secs
+    }
+
+    fn default_max_reset_horizon_secs() -> u64 {
+        crate::config::PolicyConfig::default().max_reset_horizon_secs
+    }
+
     fn classify(body: &str, pairs: &[(&str, &str)]) -> Option<SystemTime> {
-        DetectConfig::default().classify(&headers(pairs), body.as_bytes(), false, now())
+        DetectConfig::default().classify(
+            &headers(pairs),
+            body.as_bytes(),
+            false,
+            now(),
+            default_min_reset_horizon_secs(),
+            default_max_reset_horizon_secs(),
+        )
     }
 
     fn horizon_secs(reset_at: SystemTime) -> u64 {
@@ -590,6 +574,8 @@ mod tests {
             LIMIT_BODY.as_bytes(),
             true,
             now(),
+            default_min_reset_horizon_secs(),
+            default_max_reset_horizon_secs(),
         );
         assert!(result.is_none());
     }
@@ -605,7 +591,14 @@ mod tests {
     }
 
     fn classify_gzipped(body: &str, pairs: &[(&str, &str)]) -> Option<SystemTime> {
-        DetectConfig::default().classify(&headers(pairs), &gzip(body.as_bytes()), false, now())
+        DetectConfig::default().classify(
+            &headers(pairs),
+            &gzip(body.as_bytes()),
+            false,
+            now(),
+            default_min_reset_horizon_secs(),
+            default_max_reset_horizon_secs(),
+        )
     }
 
     #[test]
@@ -648,6 +641,8 @@ mod tests {
             &bomb,
             false,
             now(),
+            default_min_reset_horizon_secs(),
+            default_max_reset_horizon_secs(),
         );
         assert!(result.is_none());
     }
@@ -676,6 +671,8 @@ mod tests {
             LIMIT_BODY.as_bytes(),
             false,
             now(),
+            default_min_reset_horizon_secs(),
+            default_max_reset_horizon_secs(),
         );
         assert!(
             result.is_none(),
@@ -692,6 +689,8 @@ mod tests {
             cut,
             false,
             now(),
+            default_min_reset_horizon_secs(),
+            default_max_reset_horizon_secs(),
         );
         assert!(result.is_none(), "a partial document must never classify");
     }
@@ -706,6 +705,8 @@ mod tests {
                 LIMIT_BODY.as_bytes(),
                 false,
                 now(),
+                default_min_reset_horizon_secs(),
+                default_max_reset_horizon_secs(),
             );
             assert!(result.is_none(), "{encoding} must not be guessed at");
         }
@@ -720,6 +721,8 @@ mod tests {
             &gzip(LIMIT_BODY.as_bytes()),
             true,
             now(),
+            default_min_reset_horizon_secs(),
+            default_max_reset_horizon_secs(),
         );
         assert!(result.is_none());
     }
@@ -731,6 +734,8 @@ mod tests {
             LIMIT_BODY.as_bytes(),
             false,
             now(),
+            default_min_reset_horizon_secs(),
+            default_max_reset_horizon_secs(),
         );
         assert!(result.is_some());
     }
@@ -816,6 +821,8 @@ mod tests {
                 LIMIT_BODY.as_bytes(),
                 false,
                 now(),
+                default_min_reset_horizon_secs(),
+                default_max_reset_horizon_secs(),
             )
             .expect("should classify");
         assert_eq!(
@@ -848,7 +855,14 @@ mod tests {
             ),
         ] {
             let reset_at = config
-                .classify(&HeaderMap::new(), body.as_bytes(), false, now())
+                .classify(
+                    &HeaderMap::new(),
+                    body.as_bytes(),
+                    false,
+                    now(),
+                    default_min_reset_horizon_secs(),
+                    default_max_reset_horizon_secs(),
+                )
                 .expect("should classify from the body");
             assert!(horizon_secs(reset_at) > 7000);
         }
@@ -890,17 +904,13 @@ mod tests {
             config.match_body.get("error.type").map(String::as_str),
             Some("rate_limit_error")
         );
-        assert_eq!(config.min_reset_horizon_secs, 300);
-        assert_eq!(config.max_reset_horizon_secs, 7 * 24 * 60 * 60);
         assert_eq!(config.reset.len(), 2);
     }
 
     #[test]
     fn a_partial_section_keeps_the_defaults_for_everything_else() {
-        let config: DetectConfig =
-            toml::from_str("min_reset_horizon_secs = 900").expect("should parse");
-        assert_eq!(config.min_reset_horizon_secs, 900);
-        assert_eq!(config.status, default_status());
+        let config: DetectConfig = toml::from_str("status = 503").expect("should parse");
+        assert_eq!(config.status, 503);
         assert_eq!(config.markers, default_markers());
     }
 
@@ -945,70 +955,18 @@ mod tests {
         assert!(DetectConfig::default().validate().is_ok());
     }
 
-    /// Crossed bounds would make every classified window collapse onto the
-    /// ceiling; catching it at startup keeps `bounded` out of that situation.
-    #[test]
-    fn validate_rejects_crossed_horizon_bounds() {
-        let config = DetectConfig {
-            min_reset_horizon_secs: 900,
-            max_reset_horizon_secs: 300,
-            ..DetectConfig::default()
-        };
-        let err = config.validate().expect_err("should reject");
-        assert!(err.to_string().contains("max_reset_horizon_secs"));
-    }
-
-    /// The ceiling is what keeps a wrong-unit *reset* survivable, so a
-    /// wrong-unit ceiling is the same bug one level up — and it is reachable by
-    /// an ordinary TOML integer. Past `bounded`'s `checked_add` every marked
-    /// classification silently stops happening; short of it, `Limited` renders
-    /// a null window `/status` cannot explain.
-    #[test]
-    fn validate_rejects_a_max_reset_horizon_that_is_not_a_bound_at_all() {
-        for max_reset_horizon_secs in [
-            7 * 24 * 60 * 60 * 1000, // 7 days written in milliseconds
-            i64::MAX as u64,
-            u64::MAX,
-        ] {
-            let config = DetectConfig {
-                max_reset_horizon_secs,
-                ..DetectConfig::default()
-            };
-            let err = config
-                .validate()
-                .expect_err("an unbounded ceiling bounds nothing")
-                .to_string();
-            assert!(
-                err.contains("max_reset_horizon_secs"),
-                "{max_reset_horizon_secs}: {err}"
-            );
-        }
-
-        assert!(
-            DetectConfig {
-                max_reset_horizon_secs: MAX_RESET_HORIZON_CEILING_SECS,
-                ..DetectConfig::default()
-            }
-            .validate()
-            .is_ok(),
-            "the ceiling itself is a valid configuration"
-        );
-    }
-
-    /// The two failures the ceiling exists to keep unreachable, checked against
-    /// the machinery itself rather than assumed from the number.
+    /// The two failures `MAX_RESET_HORIZON_CEILING_SECS` (`src/config.rs`,
+    /// enforced by `PolicyConfig::validate`) exists to keep unreachable,
+    /// checked against `bounded` itself rather than assumed from the number.
     #[test]
     fn a_horizon_at_the_ceiling_still_produces_a_renderable_window() {
-        let config = DetectConfig {
-            max_reset_horizon_secs: MAX_RESET_HORIZON_CEILING_SECS,
-            ..DetectConfig::default()
-        };
-        let at_ceiling = config
-            .bounded(
-                SystemTime::now() + Duration::from_secs(u32::MAX as u64),
-                now(),
-            )
-            .expect("`checked_add` must not overflow inside the ceiling");
+        let at_ceiling = bounded(
+            SystemTime::now() + Duration::from_secs(u32::MAX as u64),
+            now(),
+            default_min_reset_horizon_secs(),
+            crate::config::MAX_RESET_HORIZON_CEILING_SECS,
+        )
+        .expect("`checked_add` must not overflow inside the ceiling");
         assert!(
             crate::route_state::rfc3339(at_ceiling).is_some(),
             "a window `/status` cannot render is a stuck route with no diagnosis"
@@ -1032,6 +990,8 @@ mod tests {
             LIMIT_BODY.as_bytes(),
             false,
             now(),
+            default_min_reset_horizon_secs(),
+            default_max_reset_horizon_secs(),
         );
         assert!(
             result.is_none(),

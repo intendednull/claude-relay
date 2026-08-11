@@ -58,6 +58,12 @@ impl AppState {
         // rejections the binary does.
         config.detect.validate()?;
         config.notify.validate()?;
+        for (name, profile) in &config.profiles {
+            profile
+                .validate()
+                .with_context(|| format!("profile {name:?}"))?;
+        }
+        config.policy.validate(&config.profiles)?;
 
         let http = reqwest::Client::builder()
             // A proxy hands 3xx back to its client rather than chasing it: the
@@ -70,7 +76,10 @@ impl AppState {
 
         let capture = capture_errors.map(Capture::new).transpose()?;
 
-        let route = Arc::new(RouteStateMachine::new(config.state_file()?)?);
+        let route = Arc::new(RouteStateMachine::new(
+            config.state_file()?,
+            config.policy.reset_jitter_secs,
+        )?);
         let route_updates = RouteUpdates::spawn(route.clone(), Notifier::spawn(&config.notify));
 
         Ok(Self {
@@ -87,8 +96,9 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AnthropicConfig, NotifyConfig};
+    use crate::config::{AnthropicConfig, NotifyConfig, PolicyConfig};
     use crate::detect::DetectConfig;
+    use indexmap::IndexMap;
 
     fn config(detect: DetectConfig, notify: NotifyConfig) -> Config {
         Config {
@@ -99,6 +109,8 @@ mod tests {
             },
             detect,
             notify,
+            profiles: IndexMap::new(),
+            policy: PolicyConfig::default(),
         }
     }
 
@@ -130,6 +142,20 @@ mod tests {
             .err()
             .expect("a zero timeout kills the hook before it can do anything");
         assert!(err.to_string().contains("timeout_secs"), "{err}");
+    }
+
+    /// `policy.active_profile` naming a profile that doesn't exist is another
+    /// rule that fails silently if left to the request path: the router would
+    /// have nothing to fall through to and every non-`claude-*` request would
+    /// 500 with no indication why.
+    #[test]
+    fn an_active_profile_naming_no_configured_profile_is_rejected_at_construction() {
+        let mut bad_config = config(DetectConfig::default(), NotifyConfig::default());
+        bad_config.policy.active_profile = Some("ghost".to_string());
+        let err = AppState::new(Arc::new(bad_config), None, "digest".to_string())
+            .err()
+            .expect("an unconfigured active_profile must not silently build a relay");
+        assert!(err.to_string().contains("active_profile"), "{err}");
     }
 
     #[test]

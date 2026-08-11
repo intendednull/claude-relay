@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use indexmap::IndexMap;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -21,6 +23,165 @@ pub struct Config {
     pub detect: DetectConfig,
     #[serde(default)]
     pub notify: NotifyConfig,
+    /// Fallback targets (spec §8b), keyed by name. An `IndexMap`, not a
+    /// `HashMap`: §7d resolves the first `serves` match *in config order*,
+    /// which only a map that preserves declaration order can give.
+    #[serde(default)]
+    pub profiles: IndexMap<String, ProfileConfig>,
+    #[serde(default)]
+    pub policy: PolicyConfig,
+}
+
+/// A named fallback target (spec §8, §8b). Reachable by name-based routing
+/// via `serves`, by `policy.active_profile`, or both.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileConfig {
+    pub base_url: String,
+    /// Name of the env var carrying the profile's API key — read at request
+    /// time, never stored in the config file and never logged (spec §7b).
+    pub api_key_env: String,
+    /// `"anthropic"` (passthrough) or `"openai"` (translated); validated in
+    /// `validate`, not by the type, so a bad value names the config key
+    /// instead of failing with a generic enum-variant parse error.
+    pub format: String,
+    /// Model-name prefixes this profile claims (spec §7d); empty means it is
+    /// reachable only via `policy.active_profile`.
+    #[serde(default)]
+    pub serves: Vec<String>,
+    /// Prefix-matched against the incoming `model` field when remapping a
+    /// failed-over `claude-*` request (spec §7a); `"*"` is the catch-all. A
+    /// name-routed request's model name passes through unchanged instead.
+    #[serde(default)]
+    pub model_map: HashMap<String, String>,
+}
+
+impl ProfileConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.format.as_str(), "anthropic" | "openai") {
+            bail!(
+                "`profiles.*.format` must be \"anthropic\" or \"openai\", got {:?}",
+                self.format
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Failover policy and the moved-from-`[detect]` horizon/jitter settings
+/// (spec §8; see `docs/decisions.md` for why they now live here rather than
+/// in `[detect]`, where Milestone 2 put them).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConfig {
+    /// Which `claude-*` requests fail over to `active_profile` while
+    /// Anthropic is `Limited` — `new-sessions` (default) | `all` |
+    /// `notify-only`. Only the field is validated here; what each mode does
+    /// is Milestone 3's later routing-wiring task, not this one.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// Startup default; a runtime switch via `/control/profile` overrides it
+    /// for new requests only and is never written back here (spec §8b).
+    #[serde(default)]
+    pub active_profile: Option<String>,
+    /// Without a marker, a reset horizon must exceed this to count as the
+    /// subscription limit rather than a burst 429 (spec §5). Also the floor
+    /// every classified window gets, so no match ever produces one that has
+    /// already expired.
+    #[serde(default = "default_min_reset_horizon_secs")]
+    pub min_reset_horizon_secs: u64,
+    /// The ceiling on a classified window — a units/format sanity check, not
+    /// a claim about how long Anthropic's windows are: a reset read in the
+    /// wrong unit (epoch *milliseconds* through a rule expecting seconds)
+    /// lands ~55,000 years out, and without a ceiling that window is
+    /// persisted, survives every restart, and never elapses.
+    #[serde(default = "default_max_reset_horizon_secs")]
+    pub max_reset_horizon_secs: u64,
+    /// `[min, max]` inclusive: random slack added past a reported reset time
+    /// before transitioning to `Limited`, so the first probe after the
+    /// window doesn't race the upstream reset boundary (spec §4).
+    #[serde(default = "default_reset_jitter_secs")]
+    pub reset_jitter_secs: [u64; 2],
+}
+
+fn default_mode() -> String {
+    "new-sessions".to_string()
+}
+
+fn default_min_reset_horizon_secs() -> u64 {
+    300
+}
+
+/// A week. Claude subscription limits include weekly windows, so a tighter
+/// ceiling would reject a legitimate reset — and it costs nothing against what
+/// the ceiling is actually for, since every wrong-unit or garbage value is
+/// orders of magnitude past it.
+fn default_max_reset_horizon_secs() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+fn default_reset_jitter_secs() -> [u64; 2] {
+    [15, 60]
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_mode(),
+            active_profile: None,
+            min_reset_horizon_secs: default_min_reset_horizon_secs(),
+            max_reset_horizon_secs: default_max_reset_horizon_secs(),
+            reset_jitter_secs: default_reset_jitter_secs(),
+        }
+    }
+}
+
+/// The ceiling on `max_reset_horizon_secs` itself. Written in the wrong unit
+/// (milliseconds for seconds) it stops bounding anything: large enough and
+/// `detect::bounded`'s `checked_add` returns `None`, silently killing every
+/// marked classification; merely huge and it yields a `Limited` window
+/// `/status` cannot render. 10 years is far past any real subscription window
+/// and far short of either failure.
+pub(crate) const MAX_RESET_HORIZON_CEILING_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+
+impl PolicyConfig {
+    /// An unrecognized `mode`, an `active_profile` naming a profile that
+    /// isn't configured, crossed or absurd horizon bounds, and inverted
+    /// jitter bounds (which would panic `rand::random_range`) are all
+    /// startup-time errors rather than silent misbehavior.
+    pub fn validate(&self, profiles: &IndexMap<String, ProfileConfig>) -> Result<()> {
+        if !matches!(self.mode.as_str(), "new-sessions" | "all" | "notify-only") {
+            bail!(
+                "`policy.mode` must be one of new-sessions, all, notify-only, got {:?}",
+                self.mode
+            );
+        }
+        if let Some(name) = &self.active_profile
+            && !profiles.contains_key(name)
+        {
+            bail!("`policy.active_profile` names an unconfigured profile: {name:?}");
+        }
+        if self.max_reset_horizon_secs > MAX_RESET_HORIZON_CEILING_SECS {
+            bail!(
+                "`policy.max_reset_horizon_secs` must be at most {MAX_RESET_HORIZON_CEILING_SECS} (10 years), got {}",
+                self.max_reset_horizon_secs
+            );
+        }
+        if self.min_reset_horizon_secs > self.max_reset_horizon_secs {
+            bail!(
+                "`policy.min_reset_horizon_secs` ({}) must not exceed `policy.max_reset_horizon_secs` ({})",
+                self.min_reset_horizon_secs,
+                self.max_reset_horizon_secs
+            );
+        }
+        let [jitter_min, jitter_max] = self.reset_jitter_secs;
+        if jitter_min > jitter_max {
+            bail!(
+                "`policy.reset_jitter_secs` min ({jitter_min}) must not exceed max ({jitter_max})"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -313,13 +474,15 @@ mod tests {
 
             [detect]
             status = 429
-            min_reset_horizon_secs = 900
             match_body = { "error.type" = "rate_limit_error" }
 
             [[detect.reset]]
             from = "header"
             name = "retry-after"
             format = "delta-seconds"
+
+            [policy]
+            min_reset_horizon_secs = 900
         "#;
 
         let config = Config::from_toml_str(raw).expect("should parse");
@@ -327,7 +490,7 @@ mod tests {
             config.state_file().expect("should validate"),
             Some(PathBuf::from("/var/lib/relay/state.json"))
         );
-        assert_eq!(config.detect.min_reset_horizon_secs, 900);
+        assert_eq!(config.policy.min_reset_horizon_secs, 900);
         assert_eq!(config.detect.reset.len(), 1);
     }
 
@@ -415,6 +578,8 @@ mod tests {
             },
             detect: DetectConfig::default(),
             notify: NotifyConfig::default(),
+            profiles: IndexMap::new(),
+            policy: PolicyConfig::default(),
         }
     }
 
@@ -442,6 +607,8 @@ mod tests {
             },
             detect: DetectConfig::default(),
             notify: NotifyConfig::default(),
+            profiles: IndexMap::new(),
+            policy: PolicyConfig::default(),
         }
     }
 
@@ -501,5 +668,281 @@ mod tests {
             );
             assert!(rendered.contains("anthropic.base_url"));
         }
+    }
+
+    // --- [profiles.*] ---
+
+    fn profile(format: &str) -> ProfileConfig {
+        ProfileConfig {
+            base_url: "https://api.together.ai".to_string(),
+            api_key_env: "RELAY_TOGETHER_KEY".to_string(),
+            format: format.to_string(),
+            serves: vec!["deepseek-ai/".to_string()],
+            model_map: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn profile_format_accepts_anthropic_and_openai() {
+        assert!(profile("anthropic").validate().is_ok());
+        assert!(profile("openai").validate().is_ok());
+    }
+
+    #[test]
+    fn profile_format_rejects_anything_else() {
+        let err = profile("claude").validate().unwrap_err().to_string();
+        assert!(err.contains("format"), "{err}");
+    }
+
+    #[test]
+    fn profiles_parse_from_toml_in_declaration_order() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [profiles.kimi]
+            base_url = "https://kimi.example"
+            api_key_env = "RELAY_MOONSHOT_KEY"
+            format = "anthropic"
+            serves = ["moonshotai/"]
+            model_map = { "*" = "moonshotai/Kimi-K3" }
+
+            [profiles.deepseek]
+            base_url = "https://deepseek.example"
+            api_key_env = "RELAY_TOGETHER_KEY"
+            format = "openai"
+            serves = ["deepseek-ai/", "Qwen/"]
+            model_map = { "claude-opus" = "deepseek-ai/DeepSeek-V4" }
+        "#;
+
+        let config = Config::from_toml_str(raw).expect("should parse");
+        assert_eq!(config.profiles.len(), 2);
+        // §7d resolves the first `serves` match *in config order* — this is
+        // only meaningful if the map preserves the file's declaration order
+        // rather than a hash-based one.
+        assert_eq!(
+            config.profiles.keys().collect::<Vec<_>>(),
+            vec!["kimi", "deepseek"]
+        );
+        let deepseek = &config.profiles["deepseek"];
+        assert_eq!(deepseek.format, "openai");
+        assert_eq!(deepseek.serves, vec!["deepseek-ai/", "Qwen/"]);
+        assert_eq!(
+            deepseek.model_map.get("claude-opus").map(String::as_str),
+            Some("deepseek-ai/DeepSeek-V4")
+        );
+    }
+
+    #[test]
+    fn zero_profiles_is_valid() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+        "#;
+        let config = Config::from_toml_str(raw).expect("should parse");
+        assert!(config.profiles.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_profile_field_is_a_parse_error() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [profiles.deepseek]
+            base_url = "https://deepseek.example"
+            api_key_env = "RELAY_TOGETHER_KEY"
+            format = "openai"
+            region = "us-east"
+        "#;
+        let err = Config::from_toml_str(raw).expect_err("should fail to parse");
+        assert!(err.to_string().contains("region"));
+    }
+
+    // --- [policy] ---
+
+    #[test]
+    fn policy_defaults_match_the_documented_shape() {
+        let policy = PolicyConfig::default();
+        assert_eq!(policy.mode, "new-sessions");
+        assert_eq!(policy.active_profile, None);
+        assert_eq!(policy.min_reset_horizon_secs, 300);
+        assert_eq!(policy.max_reset_horizon_secs, 7 * 24 * 60 * 60);
+        assert_eq!(policy.reset_jitter_secs, [15, 60]);
+        assert!(policy.validate(&IndexMap::new()).is_ok());
+    }
+
+    #[test]
+    fn policy_mode_rejects_anything_but_the_three_documented_values() {
+        for mode in ["new-sessions", "all", "notify-only"] {
+            let policy = PolicyConfig {
+                mode: mode.to_string(),
+                ..PolicyConfig::default()
+            };
+            assert!(policy.validate(&IndexMap::new()).is_ok(), "{mode}");
+        }
+        let policy = PolicyConfig {
+            mode: "always".to_string(),
+            ..PolicyConfig::default()
+        };
+        let err = policy.validate(&IndexMap::new()).unwrap_err().to_string();
+        assert!(err.contains("policy.mode"), "{err}");
+    }
+
+    #[test]
+    fn active_profile_naming_a_nonexistent_profile_is_rejected() {
+        let policy = PolicyConfig {
+            active_profile: Some("ghost".to_string()),
+            ..PolicyConfig::default()
+        };
+        let err = policy.validate(&IndexMap::new()).unwrap_err().to_string();
+        assert!(err.contains("active_profile"), "{err}");
+    }
+
+    #[test]
+    fn active_profile_naming_a_configured_profile_is_accepted() {
+        let mut profiles = IndexMap::new();
+        profiles.insert("deepseek".to_string(), profile("openai"));
+        let policy = PolicyConfig {
+            active_profile: Some("deepseek".to_string()),
+            ..PolicyConfig::default()
+        };
+        assert!(policy.validate(&profiles).is_ok());
+    }
+
+    #[test]
+    fn no_active_profile_configured_is_valid() {
+        assert!(PolicyConfig::default().validate(&IndexMap::new()).is_ok());
+    }
+
+    /// Crossed bounds would make every classified window collapse onto the
+    /// ceiling; catching it at startup keeps `detect::bounded` out of that
+    /// situation. (Moved from `DetectConfig::validate` with the fields.)
+    #[test]
+    fn validate_rejects_crossed_horizon_bounds() {
+        let policy = PolicyConfig {
+            min_reset_horizon_secs: 900,
+            max_reset_horizon_secs: 300,
+            ..PolicyConfig::default()
+        };
+        let err = policy.validate(&IndexMap::new()).unwrap_err().to_string();
+        assert!(err.contains("max_reset_horizon_secs"));
+    }
+
+    /// A `max_reset_horizon_secs` written in the wrong unit is not a bound at
+    /// all: large enough and `bounded`'s `checked_add` returns `None`,
+    /// silently killing every marked classification; merely huge and
+    /// `/status` renders a `Limited` window it cannot express.
+    #[test]
+    fn validate_rejects_a_max_reset_horizon_that_is_not_a_bound_at_all() {
+        for max_reset_horizon_secs in [
+            7 * 24 * 60 * 60 * 1000, // 7 days written in milliseconds
+            i64::MAX as u64,
+            u64::MAX,
+        ] {
+            let policy = PolicyConfig {
+                max_reset_horizon_secs,
+                ..PolicyConfig::default()
+            };
+            let err = policy
+                .validate(&IndexMap::new())
+                .expect_err("an unbounded ceiling bounds nothing")
+                .to_string();
+            assert!(
+                err.contains("max_reset_horizon_secs"),
+                "{max_reset_horizon_secs}: {err}"
+            );
+        }
+
+        assert!(
+            PolicyConfig {
+                max_reset_horizon_secs: MAX_RESET_HORIZON_CEILING_SECS,
+                ..PolicyConfig::default()
+            }
+            .validate(&IndexMap::new())
+            .is_ok(),
+            "the ceiling itself is a valid configuration"
+        );
+    }
+
+    /// Inverted jitter bounds would panic `rand::random_range` in the request
+    /// path (`route_state::add_jitter`), not fail cleanly.
+    #[test]
+    fn validate_rejects_inverted_jitter_bounds() {
+        let policy = PolicyConfig {
+            reset_jitter_secs: [60, 15],
+            ..PolicyConfig::default()
+        };
+        let err = policy.validate(&IndexMap::new()).unwrap_err().to_string();
+        assert!(err.contains("reset_jitter_secs"), "{err}");
+    }
+
+    #[test]
+    fn policy_parses_from_toml_and_moved_fields_are_gone_from_detect() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [policy]
+            mode = "all"
+            active_profile = "deepseek"
+            min_reset_horizon_secs = 900
+            max_reset_horizon_secs = 3600
+            reset_jitter_secs = [10, 30]
+
+            [profiles.deepseek]
+            base_url = "https://deepseek.example"
+            api_key_env = "RELAY_TOGETHER_KEY"
+            format = "openai"
+        "#;
+        let config = Config::from_toml_str(raw).expect("should parse");
+        assert_eq!(config.policy.mode, "all");
+        assert_eq!(config.policy.active_profile.as_deref(), Some("deepseek"));
+        assert_eq!(config.policy.min_reset_horizon_secs, 900);
+        assert_eq!(config.policy.max_reset_horizon_secs, 3600);
+        assert_eq!(config.policy.reset_jitter_secs, [10, 30]);
+        assert!(config.policy.validate(&config.profiles).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_policy_field_is_a_parse_error() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [policy]
+            hot_reload = true
+        "#;
+        let err = Config::from_toml_str(raw).expect_err("should fail to parse");
+        assert!(err.to_string().contains("hot_reload"));
+    }
+
+    /// Milestone-2-era configs that put these fields under `[detect]` (per
+    /// `docs/decisions.md`'s recorded divergence) fail to parse now that
+    /// `[detect]` is `deny_unknown_fields` and no longer has them — this is
+    /// the deliberate breaking move `docs/decisions.md` resolves, not a bug.
+    #[test]
+    fn a_milestone_2_style_detect_section_with_the_moved_fields_is_a_parse_error() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [detect]
+            min_reset_horizon_secs = 900
+        "#;
+        let err = Config::from_toml_str(raw).expect_err("should fail to parse");
+        assert!(err.to_string().contains("min_reset_horizon_secs"));
     }
 }
