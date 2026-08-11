@@ -56,12 +56,23 @@ impl Config {
     /// Same fail-fast reason as `listen_addr`, and a worse failure without it:
     /// reqwest defers a bad URL to `.send()`, where every request 502s with a
     /// bare "builder error" naming neither the field nor the problem.
+    ///
+    /// These errors name the key but never echo the value: a URL can carry
+    /// credentials in its userinfo, the same leak `without_url()` guards against
+    /// on the request path.
     pub fn anthropic_base_url(&self) -> Result<reqwest::Url> {
-        let raw = &self.anthropic.base_url;
-        let url = reqwest::Url::parse(raw)
-            .with_context(|| format!("invalid `anthropic.base_url`: {raw:?}"))?;
+        let url = reqwest::Url::parse(&self.anthropic.base_url)
+            .context("invalid `anthropic.base_url`")?;
         if url.host_str().is_none() {
-            bail!("`anthropic.base_url` has no host: {raw:?}");
+            bail!("`anthropic.base_url` has no host");
+        }
+        // Any other scheme parses cleanly here and then fails per-request as the
+        // opaque "builder error" this check exists to keep out of the hot path.
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!(
+                "`anthropic.base_url` must be http or https, got {:?}",
+                url.scheme()
+            );
         }
         Ok(url)
     }
@@ -178,5 +189,37 @@ mod tests {
             .anthropic_base_url()
             .expect_err("a hostless URL must not reach the request path");
         assert!(err.to_string().contains("no host"));
+    }
+
+    /// A non-HTTP scheme parses and has a host, so only an explicit check keeps
+    /// it from reaching reqwest and failing there as an opaque builder error.
+    #[test]
+    fn anthropic_base_url_rejects_a_non_http_scheme() {
+        let err = config_with_base_url("ftp://example.com")
+            .anthropic_base_url()
+            .expect_err("a non-http scheme must not reach the request path");
+        assert!(err.to_string().contains("http or https"));
+    }
+
+    /// A URL can carry credentials in its userinfo, so these errors name the
+    /// config key and never the value — the same rule the request path follows
+    /// with `without_url()`.
+    #[test]
+    fn anthropic_base_url_errors_never_echo_the_value() {
+        let secret = "sk-ant-oat01-DO-NOT-ECHO-THIS";
+        for base_url in [
+            format!("https://user:{secret}@"),
+            format!("ftp://user:{secret}@example.com"),
+        ] {
+            let err = config_with_base_url(&base_url)
+                .anthropic_base_url()
+                .expect_err("should reject");
+            let rendered = format!("{err:?}");
+            assert!(
+                !rendered.contains(secret),
+                "error leaked a credential from base_url: {rendered}"
+            );
+            assert!(rendered.contains("anthropic.base_url"));
+        }
     }
 }

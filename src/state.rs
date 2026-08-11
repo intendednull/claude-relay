@@ -13,9 +13,20 @@ use crate::config::Config;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds silence *after* the connection is up, which `CONNECT_TIMEOUT` cannot:
 /// an upstream that accepts and then says nothing would otherwise hang the
-/// client forever. Unlike an overall timeout this one resets on every byte, so
-/// an SSE stream keeps it at bay with its own keepalives.
-const READ_TIMEOUT: Duration = Duration::from_secs(90);
+/// client forever. It applies in two different shapes, and the second is why
+/// this value is generous rather than snappy:
+///
+/// - Until response headers arrive it is a single deadline that does not reset,
+///   so it also caps time-to-first-byte. A non-streaming request holds its
+///   headers until generation finishes, so a short value here would fail
+///   requests a direct connection would have served — the one thing this proxy
+///   must not do. 10 minutes is Anthropic's own ceiling for a non-streaming
+///   request, so nothing the API itself would allow can trip this.
+/// - While the body streams it resets on every frame received, so an SSE stream
+///   keeps it at bay with its own keepalives.
+///
+/// A request dying at almost exactly this mark is this constant, not the network.
+const READ_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Shared application state handed to axum handlers.
 #[derive(Clone)]
