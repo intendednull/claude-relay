@@ -209,6 +209,33 @@ looks likely from the start, consider whether running LiteLLM as the translation
 sidecar (relay handles only detection/policy/routing and forwards fallback traffic to
 LiteLLM) beats reimplementing it — legitimate design fork, implementor's call.
 
+### 7d. Name-based routing (always-on, independent of limit state)
+
+The router's first rule is the request's `model` field, evaluated before limit state:
+
+1. `claude-*` → Anthropic route, subject to the failover state machine and policy
+   exactly as designed.
+2. Any other model name → the profile that claims it, regardless of Anthropic's
+   state. This is ordinary routing, not failover: no notification, no state change,
+   no model remap (the name is passed through as-is).
+
+Profiles claim names via a `serves` prefix list (see §8). Resolution: first profile
+whose `serves` entry prefix-matches wins, in config order; a non-`claude-*` name no
+profile claims falls through to the active profile. A name the active profile's
+endpoint rejects surfaces as that provider's error — the proxy does not validate
+model names.
+
+This makes deliberate mixed-backend use a client-side choice: `/model` (or
+`--model`, or `CLAUDE_CODE_SUBAGENT_MODEL`, or agent-view dispatch pickers) selects
+an open model by name and the proxy routes it, while `claude-*` selections continue
+on subscription. The failover machinery only ever concerns `claude-*` traffic.
+
+Client-side picker exposure is configuration outside this tool's scope (the
+`ANTHROPIC_CUSTOM_MODEL_OPTION` env vars for a single additive picker entry, or an
+`availableModels` list, or typing names directly — with a custom base URL, Claude
+Code skips model-name validation). Document the recommended combo in the README, but
+the proxy itself needs no knowledge of it.
+
 ## 8. Configuration
 
 Single TOML file. Everything hot-reloadable except the listen address (SIGHUP or file
@@ -226,12 +253,14 @@ base_url = "https://api.anthropic.com"
 base_url = "https://<provider-anthropic-compat-endpoint>"
 api_key_env = "RELAY_TOGETHER_KEY"     # read from env, never stored in the file
 format = "anthropic"                   # or "openai" (enables translator)
+serves = ["deepseek-ai/", "Qwen/"]     # §7d: model-name prefixes this profile claims
 model_map = { "claude-opus" = "deepseek-ai/DeepSeek-V4", "*" = "deepseek-ai/DeepSeek-V4-Flash" }
 
 [profiles.kimi]
 base_url = "https://<other-endpoint>"
 api_key_env = "RELAY_MOONSHOT_KEY"
 format = "anthropic"
+serves = ["moonshotai/"]
 model_map = { "*" = "moonshotai/Kimi-K3" }
 
 [policy]
@@ -312,7 +341,7 @@ benchmarks don't capture; every switch is an explicit, instantly-revertible comm
 |---|---|---|
 | 1 | Transparent passthrough proxy, streaming intact, `/status`, `--capture-errors` | Real session indistinguishable from direct; subscription billing confirmed intact |
 | 2 | Limit detection + state machine + notifier + state persistence | Fixture tests pass; real limit event flips state and fires notification; burst 429 does not |
-| 3 | Failover to Anthropic-compatible fallback (profile schema §8b, model remap, header hygiene, `new-sessions` policy, `POST /control/profile`) | E2E drill passes; auth-stripping invariant tested; profile switch applies to new requests only |
+| 3 | Name-based routing (§7d) + failover to Anthropic-compatible fallback (profile schema §8b, model remap, header hygiene, `new-sessions` policy, `POST /control/profile`) | E2E drill passes; auth-stripping invariant tested; explicit open-model requests route by name with Anthropic ACTIVE; profile switch applies to new requests only |
 | 4 | Policy modes + `/control/mode`, `relay ctl` CLI wrapper, hot reload, jittered recovery, `x-relay-route` marker | Recovery observed across a real reset window; switch-and-revert of profiles verified under concurrent streams |
 | 5 | (Conditional) OpenAI translator or LiteLLM sidecar integration | Golden-file suite green; tool-heavy session completes on fallback |
 
