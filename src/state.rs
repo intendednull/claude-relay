@@ -51,6 +51,12 @@ pub struct AppState {
     /// untranslatable body, a missing key, an unreachable endpoint — is not
     /// one the fallback served.
     pub fallback_requests_served: Arc<AtomicU64>,
+    /// How much of a request body may be read to decide its route. A field
+    /// rather than a constant read in place, so a test can drive the over-cap
+    /// path — and the hand-rolled stream reassembly behind it — without an
+    /// 8 MiB fixture. Deliberately not a config key: no deployment should need
+    /// it changed.
+    pub routing_body_cap: usize,
 }
 
 impl AppState {
@@ -96,6 +102,7 @@ impl AppState {
             route,
             route_updates,
             fallback_requests_served: Arc::new(AtomicU64::new(0)),
+            routing_body_cap: crate::proxy::ROUTING_BODY_CAP,
         })
     }
 }

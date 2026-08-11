@@ -18,7 +18,10 @@ use axum::routing::any;
 use indexmap::IndexMap;
 use serde_json::Value;
 
-use common::{relay_config, serve, serve_relay_with, truncated_body};
+use common::{
+    relay_config, serve, serve_relay_with, serve_relay_with_routing_cap, truncated_body,
+    unique_temp_dir,
+};
 use relay::config::{Config, ProfileConfig};
 
 /// The client's own credentials. Every one of them must reach Anthropic
@@ -45,6 +48,7 @@ const OPEN_MODEL: &str = "deepseek-ai/DeepSeek-V4";
 const LIMIT_BODY: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"You have reached your Claude Pro usage limit. Your limit will reset at 6pm."}}"#;
 const ANTHROPIC_OK: &str = r#"{"id":"msg_anthropic","type":"message","content":[{"type":"text","text":"from anthropic"}]}"#;
 const COMPAT_OK: &str = r#"{"id":"msg_compat","type":"message","content":[{"type":"text","text":"from the compat profile"}]}"#;
+const COMPAT_COUNT: &str = r#"{"input_tokens":41}"#;
 const OPENAI_COMPLETION: &str = concat!(
     r#"{"id":"chatcmpl-1","object":"chat.completion","model":"target/Big-Model","#,
     r#""choices":[{"index":0,"message":{"role":"assistant","content":"from the openai profile"},"#,
@@ -115,6 +119,29 @@ impl Recorded {
     fn json(&self) -> Value {
         serde_json::from_str(&self.body).expect("recorded body must be JSON")
     }
+
+    /// Every header name the upstream saw, sorted — so a test can assert the
+    /// *whole* set rather than the absence of the few names someone thought to
+    /// list. Spec §7b calls the fallback's headers an allowlist; only an
+    /// equality assertion actually tests one.
+    fn header_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.headers.keys().map(|name| name.as_str()).collect();
+        names.sort_unstable();
+        names
+    }
+}
+
+/// What hyper and reqwest put on the wire themselves whatever the relay asked
+/// for: the connection's `host`, the framing `content-length`, and reqwest's
+/// default `accept`. Not part of the allowlist, but part of what an upstream
+/// sees.
+const TRANSPORT_HEADERS: [&str; 3] = ["accept", "content-length", "host"];
+
+fn expected_headers(allowlist: &[&'static str]) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = TRANSPORT_HEADERS.to_vec();
+    names.extend_from_slice(allowlist);
+    names.sort_unstable();
+    names
 }
 
 async fn record(recorder: &Recorder, request: Request) -> Value {
@@ -213,16 +240,28 @@ fn openai_upstream(recorder: Recorder, stream_dies: bool) -> Router {
 }
 
 fn compat_upstream(recorder: Recorder) -> Router {
-    Router::new().route(
-        "/v1/messages",
-        any(move |request: Request| {
-            let recorder = recorder.clone();
-            async move {
-                record(&recorder, request).await;
-                json(StatusCode::OK, COMPAT_OK)
-            }
-        }),
-    )
+    let count_tokens = recorder.clone();
+    Router::new()
+        .route(
+            "/v1/messages",
+            any(move |request: Request| {
+                let recorder = recorder.clone();
+                async move {
+                    record(&recorder, request).await;
+                    json(StatusCode::OK, COMPAT_OK)
+                }
+            }),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            any(move |request: Request| {
+                let recorder = count_tokens.clone();
+                async move {
+                    record(&recorder, request).await;
+                    json(StatusCode::OK, COMPAT_COUNT)
+                }
+            }),
+        )
 }
 
 fn profile(base: SocketAddr, format: &str, api_key_env: &str) -> ProfileConfig {
@@ -622,6 +661,15 @@ async fn the_clients_credentials_never_reach_a_fallback_profile() {
         "the client asks for gzip; a compressed body is one the translator cannot read"
     );
 
+    // The allowlist itself, not a list of names someone remembered to deny: a
+    // regression that started forwarding `cookie`, `user-agent`, or any client
+    // `x-*` header would pass a blocklist-shaped assertion and fails this one.
+    assert_eq!(
+        to_fallback.header_names(),
+        expected_headers(&["authorization", "content-type"]),
+        "an openai profile's request is built from exactly these headers"
+    );
+
     let raw = format!("{:?}", to_fallback.headers);
     for secret in [CLIENT_AUTH, CLIENT_API_KEY, CLIENT_BETA, "sk-ant"] {
         assert!(
@@ -685,6 +733,16 @@ async fn an_anthropic_format_profile_is_a_hygienic_remapped_passthrough() {
         "the profile's own key in the scheme the Anthropic API documents"
     );
     assert_eq!(seen.header("anthropic-version"), Some("2023-06-01"));
+    assert_eq!(
+        seen.header_names(),
+        expected_headers(&[
+            "anthropic-version",
+            "authorization",
+            "content-type",
+            "x-api-key",
+        ]),
+        "an anthropic profile's request is built from exactly these headers"
+    );
     assert!(
         !format!("{:?}", seen.headers).contains("sk-ant"),
         "no client credential reached the profile"
@@ -873,4 +931,358 @@ async fn status_counts_fallback_requests_and_only_those() {
         .expect("failed to read body");
 
     assert_eq!(status(relay.addr).await["fallback_requests_served"], 1);
+}
+
+/// Global Constraint 7, narrowed. An `anthropic`-format profile has a
+/// `/v1/messages/count_tokens` of its own, which this route mirrors, so a
+/// name-routed count reaches the provider that owns the tokenizer being asked
+/// about.
+#[tokio::test]
+async fn count_tokens_routes_by_name_to_an_anthropic_format_profile() {
+    let relay = start(
+        "notify-only",
+        false,
+        compat_upstream,
+        "anthropic",
+        COMPAT_KEY_ENV,
+    )
+    .await;
+
+    let response = client()
+        .post(format!("http://{}/v1/messages/count_tokens", relay.addr))
+        .body(session_start(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    assert_eq!(
+        response.bytes().await.expect("failed to read body"),
+        COMPAT_COUNT.as_bytes()
+    );
+    assert_eq!(relay.anthropic.count(), 0);
+    let seen = relay.fallback.only();
+    assert_eq!(seen.path, "/v1/messages/count_tokens");
+    assert_eq!(
+        seen.json()["model"],
+        OPEN_MODEL,
+        "a name-routed count is not remapped"
+    );
+}
+
+/// The other half of the same rule: an `openai` profile has no counting
+/// endpoint at all. Routing there would send the request to
+/// `/v1/chat/completions` — a billed inference call answering with a `message`
+/// where the client wants `{"input_tokens": N}` — so it keeps the Anthropic
+/// pin instead.
+#[tokio::test]
+async fn count_tokens_for_an_openai_profiles_model_stays_on_anthropic() {
+    let relay = start_openai("notify-only", false).await;
+
+    let response = client()
+        .post(format!("http://{}/v1/messages/count_tokens", relay.addr))
+        .body(session_start(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("x-relay-route").is_none());
+    assert_eq!(
+        response.bytes().await.expect("failed to read body"),
+        br#"{"input_tokens":7}"#.as_slice()
+    );
+    assert_eq!(relay.fallback.count(), 0);
+    assert_eq!(
+        relay.anthropic.only().json()["model"],
+        OPEN_MODEL,
+        "the open-model name reaches Anthropic, which is what rejects it"
+    );
+}
+
+/// Spec §7d's fall-through, with no limit state involved at all: a name no
+/// profile's `serves` claims goes to `active_profile`. This is the path a
+/// model-name typo takes, so it is worth proving it lands where the spec says
+/// and nowhere else.
+#[tokio::test]
+async fn an_unclaimed_name_falls_through_to_the_active_profile_while_active() {
+    let relay = start_openai("notify-only", false).await;
+
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(session_start("typo-provider/DeepSeek-V4"))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    response.bytes().await.expect("failed to read body");
+    assert_eq!(relay.anthropic.count(), 0);
+    assert_eq!(
+        relay.fallback.only().json()["model"],
+        "typo-provider/DeepSeek-V4",
+        "fall-through is still name routing: no remap"
+    );
+}
+
+/// Item 2 of review round 1. With no profile configured the router could only
+/// ever answer `Anthropic`, so reading the body would buy a decision already
+/// made — and Milestone 1's streamed passthrough would have been given up for
+/// nothing. `transfer-encoding: chunked` is the observable difference: a
+/// buffered body is sent with a `content-length` instead.
+#[tokio::test]
+async fn a_zero_profile_relay_never_reads_the_request_body() {
+    set_profile_keys();
+    let recorder = Recorder::default();
+    let anthropic_addr = serve(anthropic_upstream(recorder.clone(), false)).await;
+    let relay = serve_relay_with(relay_config(format!("http://{anthropic_addr}")), None).await;
+
+    client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(session_start(OPUS))
+        .send()
+        .await
+        .expect("request failed")
+        .bytes()
+        .await
+        .expect("failed to read body");
+
+    let seen = recorder.only();
+    assert_eq!(
+        seen.header("transfer-encoding"),
+        Some("chunked"),
+        "a zero-profile relay must stream the request body through, not buffer it"
+    );
+    assert_eq!(seen.header("content-length"), None);
+}
+
+/// The contrast case, so the assertion above is about the guard rather than
+/// about how hyper happens to frame things.
+#[tokio::test]
+async fn a_relay_with_a_profile_does_buffer_the_request_body() {
+    let relay = start_openai("notify-only", false).await;
+
+    client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(session_start(OPUS))
+        .send()
+        .await
+        .expect("request failed")
+        .bytes()
+        .await
+        .expect("failed to read body");
+
+    let seen = relay.anthropic.only();
+    assert!(seen.header("content-length").is_some());
+    assert_eq!(seen.header("transfer-encoding"), None);
+}
+
+/// The over-cap path reassembles the body from the prefix already read plus
+/// the rest of the client's stream. Nothing may be dropped or duplicated
+/// across that split, and the request must still reach Anthropic — the cap
+/// costs a routing decision, never a byte.
+#[tokio::test]
+async fn a_body_past_the_routing_cap_reaches_anthropic_byte_for_byte() {
+    set_profile_keys();
+    let anthropic = Recorder::default();
+    let fallback = Recorder::default();
+    let anthropic_addr = serve(anthropic_upstream(anthropic.clone(), false)).await;
+    let fallback_addr = serve(openai_upstream(fallback.clone(), false)).await;
+    // Small enough that the split lands inside the body, and far below any
+    // single frame hyper will deliver, so the prefix really is a partial read.
+    let relay = serve_relay_with_routing_cap(
+        config(
+            anthropic_addr,
+            "all",
+            profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+        ),
+        512,
+    )
+    .await;
+    drive_to_limited(relay).await;
+
+    // Every byte distinct enough that a duplicated or dropped chunk cannot
+    // coincidentally still compare equal.
+    let filler: String = (0..40_000)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
+    let body = format!(
+        r#"{{"model":"{OPUS}","max_tokens":64,"messages":[{{"role":"user","content":"{filler}"}}]}}"#
+    );
+    assert!(
+        body.len() > 512 * 8,
+        "the body must cross the cap by a margin"
+    );
+
+    let response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(body.clone())
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("failed to read body");
+
+    let seen = anthropic.only();
+    assert_eq!(
+        seen.body.len(),
+        body.len(),
+        "the reassembled body changed length"
+    );
+    assert_eq!(
+        seen.body, body,
+        "the reassembled body is not byte-identical"
+    );
+    assert_eq!(
+        fallback.count(),
+        0,
+        "an uninspectable body cannot have been routed by its model name"
+    );
+}
+
+/// The documented invariant, tested rather than left to hold by accident: a
+/// fallback provider's error says nothing about Anthropic's limit window. If
+/// it did, one 429 from the fallback would pin every later request to the
+/// fallback that produced it.
+#[tokio::test]
+async fn a_fallback_limit_error_never_changes_anthropics_route_state() {
+    set_profile_keys();
+    let anthropic = Recorder::default();
+    let anthropic_addr = serve(anthropic_upstream(anthropic.clone(), false)).await;
+    // A fallback that answers with the exact body `[detect]` classifies as the
+    // subscription limit — the strongest possible version of this test.
+    let fallback_addr =
+        serve(Router::new().route("/v1/chat/completions", any(|| async { limit_response() })))
+            .await;
+    let fixtures = unique_temp_dir("fallback-no-state-change");
+    let relay = serve_relay_with(
+        config(
+            anthropic_addr,
+            "notify-only",
+            profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+        ),
+        Some(fixtures.clone()),
+    )
+    .await;
+
+    // Name-routed (§7d), so Anthropic is ACTIVE throughout and nothing but the
+    // fallback's own response could move it.
+    let response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(session_start(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    assert_eq!(
+        response.bytes().await.expect("failed to read body"),
+        LIMIT_BODY.as_bytes(),
+        "the provider's own error surfaces, untranslated"
+    );
+
+    // Give the state applier and any fixture write a chance to happen, so this
+    // is an assertion about behavior rather than about being fast.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        status(relay).await["state"],
+        "ACTIVE",
+        "a fallback's 429 must not put the Anthropic route into LIMITED"
+    );
+    // `.expect`, not a default of 0: `Capture::new` creates this directory at
+    // startup, so a missing one means the assertion below never looked at
+    // anything.
+    let fixtures_written = std::fs::read_dir(&fixtures)
+        .expect("--capture-errors creates its directory at startup")
+        .count();
+    assert_eq!(
+        fixtures_written, 0,
+        "capture fixtures exist to derive Anthropic detection rules; a fallback's \
+         error is not one"
+    );
+    assert_eq!(anthropic.count(), 0);
+    let _ = std::fs::remove_dir_all(&fixtures);
+}
+
+/// The relay's own audit marker must mean the relay said so. An upstream that
+/// emits `x-relay-route` — misconfigured, or a `base_url` pointed somewhere it
+/// shouldn't be — cannot forge it.
+#[tokio::test]
+async fn an_upstream_cannot_forge_the_route_marker() {
+    set_profile_keys();
+    let anthropic_addr = serve(Router::new().route(
+        "/v1/messages",
+        any(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("x-relay-route", "fallback")
+                .header("content-type", "application/json")
+                .body(Body::from(ANTHROPIC_OK))
+                .expect("failed to build mock response")
+        }),
+    ))
+    .await;
+    let relay = serve_relay_with(relay_config(format!("http://{anthropic_addr}")), None).await;
+
+    // Straight at the mock first: the absence assertion below is only about
+    // stripping if the header was really being sent.
+    let direct = client()
+        .post(format!("http://{anthropic_addr}/v1/messages"))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(direct.headers()["x-relay-route"], "fallback");
+
+    let response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(session_start(OPUS))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get("x-relay-route").is_none(),
+        "only the relay may set the marker"
+    );
+}
+
+/// A translated response is synthesized by the relay, but the status it
+/// carries is still the provider's answer — a 202 must not silently become a
+/// 200.
+#[tokio::test]
+async fn a_translated_response_keeps_the_upstreams_status() {
+    set_profile_keys();
+    let anthropic_addr = serve(anthropic_upstream(Recorder::default(), false)).await;
+    let fallback_addr = serve(Router::new().route(
+        "/v1/chat/completions",
+        any(|| async { json(StatusCode::ACCEPTED, OPENAI_COMPLETION) }),
+    ))
+    .await;
+    let relay = serve_relay_with(
+        config(
+            anthropic_addr,
+            "notify-only",
+            profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+        ),
+        None,
+    )
+    .await;
+
+    let response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(session_start(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("the translated response must be JSON");
+    assert_eq!(body["content"][0]["text"], "from the openai profile");
 }

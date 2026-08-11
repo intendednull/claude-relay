@@ -61,6 +61,15 @@ pub async fn serve_relay_with(config: Config, capture_errors: Option<PathBuf>) -
     serve(build_router(state)).await
 }
 
+/// Same, with the routing-decision body cap lowered, so a test can drive the
+/// over-cap path without an 8 MiB fixture.
+pub async fn serve_relay_with_routing_cap(config: Config, cap: usize) -> SocketAddr {
+    let mut state = AppState::new(Arc::new(config), None, "test-digest".to_string())
+        .expect("failed to build app state");
+    state.routing_body_cap = cap;
+    serve(build_router(state)).await
+}
+
 /// A directory under the OS temp dir that doesn't collide with other tests or
 /// runs; the caller creates it (or lets `Capture::new` create it) as needed.
 pub fn unique_temp_dir(label: &str) -> PathBuf {

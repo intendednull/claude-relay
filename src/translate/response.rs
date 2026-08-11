@@ -68,12 +68,12 @@ pub(super) fn tool_arguments(arguments: &str, id: &str) -> Result<Value> {
     }
     let value: Value = serde_json::from_str(arguments).map_err(|err| {
         parse_failure(
-            &format!("tool call {id}: arguments are not valid JSON"),
+            &format!("tool call {id:?}: arguments are not valid JSON"),
             &err,
         )
     })?;
     if !value.is_object() {
-        bail!("tool call {id}: arguments are valid JSON but not an object");
+        bail!("tool call {id:?}: arguments are valid JSON but not an object");
     }
     Ok(value)
 }

@@ -28,8 +28,10 @@ use crate::translate::{self, BUFFER_CAP};
 
 /// Spec §9's audit marker. Only the fallback route sets it: the Anthropic
 /// route's response is a verbatim copy of Anthropic's own, and adding a header
-/// to it would end that.
-const ROUTE_MARKER: HeaderName = HeaderName::from_static("x-relay-route");
+/// to it would end that. `proxy::forwardable` strips it from everything an
+/// upstream sends, on both routes, so the relay is the only thing that can
+/// ever put it on a response.
+pub(crate) const ROUTE_MARKER: HeaderName = HeaderName::from_static("x-relay-route");
 
 /// The one thing this route buffers whole: a non-streaming upstream response,
 /// which has to be complete before it can be translated. Shared with the SSE
@@ -167,6 +169,9 @@ pub async fn forward(
             log,
         ));
         let mut response = Response::new(body);
+        // The upstream's own 2xx, not a flat 200: a provider that answers 206
+        // or 202 is saying something the client should see.
+        *response.status_mut() = status;
         *response.headers_mut() = translated_headers("text/event-stream");
         response
             .headers_mut()
@@ -199,6 +204,7 @@ pub async fn forward(
     log.emit(anthropic.len() as u64);
 
     let mut response = Response::new(Body::from(anthropic));
+    *response.status_mut() = status;
     *response.headers_mut() = translated_headers("application/json");
     response
 }

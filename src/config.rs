@@ -69,10 +69,14 @@ impl ProfileConfig {
     }
 
     /// An unrecognized `format`, a `base_url` that can't route a request
-    /// (see `base_url`), and a `serves` entry that is an empty string (which
-    /// would `starts_with`-match every non-`claude-*` model, silently
-    /// shadowing every profile declared after it) are all startup-time
-    /// errors rather than silent misrouting.
+    /// (see `base_url`) or would carry the profile's key in cleartext (see
+    /// `require_encrypted_transport`), a `serves` entry that is an empty
+    /// string (which would `starts_with`-match every non-`claude-*` model,
+    /// silently shadowing every profile declared after it), and an empty
+    /// `model_map` key (which is the same trap one level down: it prefix-
+    /// matches every name and, being a match rather than a fallthrough, beats
+    /// the explicit `"*"` catch-all) are all startup-time errors rather than
+    /// silent misrouting.
     pub fn validate(&self) -> Result<()> {
         if !matches!(self.format.as_str(), "anthropic" | "openai") {
             bail!(
@@ -80,14 +84,47 @@ impl ProfileConfig {
                 self.format
             );
         }
-        self.base_url()?;
+        require_encrypted_transport(&self.base_url()?)?;
         if self.serves.iter().any(String::is_empty) {
             bail!(
                 "`profiles.*.serves` entries must not be empty — an empty prefix matches every model name"
             );
         }
+        if self.model_map.keys().any(String::is_empty) {
+            bail!(
+                "`profiles.*.model_map` keys must not be empty — an empty prefix matches every model name and shadows the \"*\" catch-all"
+            );
+        }
         Ok(())
     }
+}
+
+/// A profile's `base_url` is where its own API key travels, so plaintext
+/// `http` to anywhere but this machine is refused at startup rather than
+/// leaked once per request. Loopback stays allowed: that is a local mock or a
+/// sidecar, and the key never leaves the host.
+///
+/// Deliberately not applied to `anthropic.base_url`: that one carries the
+/// client's own credentials to a fixed, always-HTTPS endpoint, and Milestone 1
+/// settled its rules. Host resolution is textual — no DNS lookup happens at
+/// startup, so a name that merely *resolves* to loopback is still refused.
+fn require_encrypted_transport(url: &reqwest::Url) -> Result<()> {
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    // `validated_base_url` already refused a URL with no host.
+    let host = url.host_str().unwrap_or_default();
+    let loopback = match host.trim_start_matches('[').trim_end_matches(']').parse() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => host == "localhost" || host.ends_with(".localhost"),
+    };
+    if !loopback {
+        bail!(
+            "`profiles.*.base_url` must be https for a non-loopback host — a profile's API key must not travel in cleartext"
+        );
+    }
+    Ok(())
 }
 
 /// Failover policy and the moved-from-`[detect]` horizon/jitter settings
@@ -780,6 +817,51 @@ mod tests {
             .base_url()
             .expect_err("a non-http scheme must not reach the request path");
         assert!(err.to_string().contains("http or https"));
+    }
+
+    /// A profile's `base_url` is where its own API key travels, so plaintext
+    /// off-host is refused. Loopback stays allowed — that is a local mock or a
+    /// sidecar, and every test fixture in this repo depends on it.
+    #[test]
+    fn a_profiles_base_url_must_be_https_unless_it_is_loopback() {
+        for allowed in [
+            "https://api.together.ai",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "http://localhost:8080",
+        ] {
+            profile_with_base_url(allowed)
+                .validate()
+                .unwrap_or_else(|err| panic!("{allowed} should be accepted: {err}"));
+        }
+        for refused in [
+            "http://api.together.ai",
+            // Not loopback by name, whatever it might resolve to: no DNS
+            // lookup happens at startup, so this is the only honest answer.
+            "http://127.0.0.1.example.com",
+            "http://10.0.0.5:8080",
+        ] {
+            let err = profile_with_base_url(refused)
+                .validate()
+                .expect_err("a profile key must not travel in cleartext off this host");
+            assert!(err.to_string().contains("https"), "{err}");
+        }
+    }
+
+    /// The same trap `serves` already guards against, one level down: an empty
+    /// prefix matches every name, and because it is a *match* it returns
+    /// before the explicit `"*"` catch-all is ever consulted.
+    #[test]
+    fn an_empty_model_map_key_is_rejected() {
+        let mut profile = profile("openai");
+        profile.model_map = [("", "shadow/Model"), ("*", "intended/Model")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let err = profile
+            .validate()
+            .expect_err("an empty model_map key silently shadows the catch-all");
+        assert!(err.to_string().contains("model_map"), "{err}");
     }
 
     #[test]

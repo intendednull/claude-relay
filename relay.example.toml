@@ -57,7 +57,9 @@ format = "unix-seconds"
 # `base_url` is the provider's API *root*, not a full endpoint URL: the relay
 # appends the path the format implies — `/v1/chat/completions` for an "openai"
 # profile, whatever Anthropic path the client called, and the client's own path
-# for an "anthropic" one.
+# for an "anthropic" one. It must be https unless the host is loopback: this is
+# where the profile's own API key travels, and plaintext off this machine is
+# refused at startup rather than leaked once per request.
 #
 # `api_key_env` names an environment variable the relay reads at request time.
 # The key is sent as `Authorization: Bearer <key>`, and to an "anthropic"

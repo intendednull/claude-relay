@@ -398,37 +398,65 @@ Milestone 3 Task 3 (`src/proxy.rs` routing, `src/fallback.rs`). Spec §6, §7a,
 §7b, §7d say what must happen; these are the places they did not say how, or
 where two sections pulled in different directions.
 
-**Only `/v1/messages` has its request body read.** The routing decision needs
-the `model` inside the body, so that body cannot stay a stream. It is bounded
-(32 MiB, well past Anthropic's own request-size limit) and a body past the cap
-is not inspected at all — the bytes already read go back in front of the rest of
-the stream and the request takes the Anthropic route unchanged, so the cap
-degrades routing rather than rejecting a request the proxy used to serve.
-`count_tokens` and the `/v1/*` catch-all never buffer: neither has a routing
-decision to make. One visible consequence for `/v1/messages`: the upstream
-request is now framed with `content-length` instead of `transfer-encoding:
-chunked`. The bytes are identical; the framing is not.
+**A routable request has its body read, and the Anthropic route stops being a
+streaming passthrough for it.** The routing decision needs the `model` inside
+the body, so that body cannot stay a stream: `/v1/messages` and
+`/v1/messages/count_tokens` are read into memory before their route is known,
+and the upstream request is then framed with `content-length` rather than
+`transfer-encoding: chunked`. The bytes Anthropic receives are identical, but
+"verbatim streaming passthrough" is no longer an accurate description of the
+request half of that route — the response half is untouched. The `/v1/*`
+catch-all still streams: it carries no `model` to route on.
 
-**`count_tokens` is pinned to Anthropic unconditionally — including for a
-non-`claude-*` model name.** §6 says "always go to Anthropic regardless of
-state"; §7d says any non-`claude-*` name routes to the profile that claims it,
-"regardless of Anthropic's state". They collide on `POST
-/v1/messages/count_tokens {"model": "deepseek-ai/…"}`. §6 wins, because its
-stated reason — a count against the wrong tokenizer is worse than an error —
-is about the *tokenizer*, which is exactly what changes when the name is an
-open model, and because an `openai`-format profile has no token-counting
-endpoint to route to at all. The cost: a client that selects an open model by
-name gets Anthropic's "unknown model" error for its count_tokens calls rather
-than a count. Revisit if that turns out to break Claude Code's context
-management rather than degrade it.
+**...but only when a profile is configured at all.** With none, the router
+could only ever answer `Anthropic`, so reading the body would buy a decision
+already made — and would have given up Milestone 1's streaming for nothing. A
+zero-profile relay is therefore byte-for-byte *and* frame-for-frame what
+Milestone 1 was, which is what anyone not using the fallback feature is
+running. It also narrows who pays for the buffer below.
 
-**`x-relay-route` marks fallback responses only.** Spec §9 offers either that or
-an explicit `x-relay-route: anthropic`; the Anthropic route's response is a
-verbatim copy of Anthropic's own (Milestone 1's whole purpose) and adding a
-header would end that. Absence therefore means Anthropic. Every response the
-fallback route produces carries the marker, relay-generated errors included:
-the question it answers afterwards is "did this come from Anthropic", and a
-failed fallback attempt did not.
+**The routing buffer is 8 MiB, per request, unbounded across concurrent ones.**
+Far past any real Claude Code request including one carrying images, so what it
+bounds is a runaway rather than ordinary traffic; kept as small as that allows
+rather than as large as Anthropic's own request-size limit, precisely because
+nothing bounds the number of requests in flight. A body past the cap is not
+inspected at all — the bytes already read go back in front of the rest of the
+stream and the request takes the Anthropic route — so the cap costs a routing
+decision, never a byte and never a request. It is a field on `AppState` rather
+than a constant read in place, so a test can drive that reassembly path
+without an 8 MiB fixture; it is deliberately not a config key.
+
+**`count_tokens` is pinned to Anthropic for every `claude-*` model and for
+every `openai`-format profile's models — but a non-`claude-*` name routes by
+name when the profile that claims it is `anthropic`-format.** §6 says "always
+go to Anthropic regardless of state"; §7d says any non-`claude-*` name routes
+to the profile that claims it, "regardless of Anthropic's state". They collide
+on `POST /v1/messages/count_tokens {"model": "deepseek-ai/…"}`, and the honest
+answer differs by format:
+
+- An `anthropic`-format profile has a `/v1/messages/count_tokens` of its own,
+  which this route already mirrors, and it owns the tokenizer being asked
+  about. §7d applies; §6's stated reason (a count against the wrong tokenizer
+  is worse than an error) is *satisfied* by routing there, not violated.
+- An `openai`-format profile has no counting endpoint at all. The fallback
+  route sends every translated request to `/v1/chat/completions`, so routing a
+  count there would bill a real inference call and answer with a `message`
+  object where the client wanted `{"input_tokens": N}` — strictly worse than
+  the error §6 prefers. So the Anthropic pin stays.
+
+Failover never applies to `count_tokens` in either case: route state and policy
+mode are not consulted for it at all.
+
+**`x-relay-route` marks fallback responses only, and only the relay may set
+it.** Spec §9 offers either that or an explicit `x-relay-route: anthropic`; the
+Anthropic route's response is a verbatim copy of Anthropic's own (Milestone 1's
+whole purpose) and adding a header would end that. Absence therefore means
+Anthropic. Every response the fallback route produces carries the marker,
+relay-generated errors included: the question it answers afterwards is "did
+this come from Anthropic", and a failed fallback attempt did not. Because
+absence is the *claim* on the Anthropic route, `forwardable` strips the marker
+from every upstream response on both routes — otherwise an upstream, or a
+`base_url` pointed somewhere it should not be, could forge it.
 
 **The fallback's header allowlist is empty.** §7b says allowlist, not denylist;
 taken to its end that means *nothing* from the client is copied and the outgoing
@@ -444,10 +472,17 @@ belt-and-braces for a code path no real provider has ever exercised (Global
 Constraint 10) — if a provider rejects a request carrying both, that is the
 first thing to cut.
 
-**`base_url` is an API root, not an endpoint.** An `openai` profile is served at
-`{base_url}/v1/chat/completions` whatever Anthropic path the client called; an
-`anthropic` profile mirrors the incoming path. The relay owns the path because
-the format determines it.
+**`base_url` is an API root, not an endpoint, and must be https off-host.** An
+`openai` profile is served at `{base_url}/v1/chat/completions` whatever
+Anthropic path the client called; an `anthropic` profile mirrors the incoming
+path. The relay owns the path because the format determines it. A profile's
+`base_url` is also a second place a real credential now travels — its own API
+key — so plaintext `http` to a non-loopback host is refused at startup rather
+than leaked once per request. Loopback stays allowed (local mocks, a sidecar).
+The rule is deliberately not applied to `anthropic.base_url`, whose rules
+Milestone 1 settled and which carries the client's credentials to a fixed,
+always-HTTPS endpoint. Host classification is textual: no DNS lookup happens at
+startup, so a name that merely resolves to loopback is still refused.
 
 **A fallback's non-2xx passes through verbatim, untranslated.** Spec §7d already
 says a provider's error surfaces as that provider's error. Translating an error
@@ -462,11 +497,15 @@ into `LIMITED`, a 200 from it must not recover the route out of it, and its
 error bodies are not fixtures Anthropic detection rules can be derived from.
 
 **A model nothing can route is a 400, not a silent forward.** `router::route`'s
-clean error (no profile claims the name, no active profile) becomes
-`400 {"error": "no_route_for_model"}` rather than being forwarded to Anthropic
-to be rejected there. With zero profiles configured — a Milestone 1/2 config —
-this is the only behavior change for a non-`claude-*` name: an error from the
-relay instead of an error from Anthropic.
+clean error (profiles are configured, none claims the name, no active profile)
+becomes `400 {"error": "no_route_for_model"}` rather than being forwarded to
+Anthropic to be rejected there. A zero-profile relay never reaches this at all
+— it does not read the body — so a Milestone 1/2 config keeps forwarding every
+name to Anthropic exactly as it did.
+
+**A fallback's 2xx keeps its own status.** A translated response is
+synthesized by the relay, but the status it carries is still the provider's
+answer: a 202 or 206 does not silently become a 200.
 
 **`fallback_requests_served` counts requests a profile answered**, whatever it
 answered with, and not requests that never reached one (untranslatable body,

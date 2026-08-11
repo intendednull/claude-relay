@@ -21,32 +21,42 @@ use crate::route_updates::{RequestOutcome, RouteUpdates};
 use crate::router::{self, RouteDecision};
 use crate::state::AppState;
 
-/// The only path whose body is inspected. `count_tokens` goes to Anthropic
-/// whatever the route state or policy says (spec §6 — a token count against
-/// the wrong tokenizer is worse than an error), and the catch-all carries no
-/// `model` to route on, so both keep Milestone 1's streamed verbatim forward
-/// and never pay to buffer a body.
 const MESSAGES_PATH: &str = "/v1/messages";
+const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 
-/// A `/v1/messages` body has to be in hand before its route is known — the
-/// `model` that decides it is inside. This is what keeps that bounded (Global
+/// A request body has to be in hand before its route is known — the `model`
+/// that decides it is inside. This is what keeps that bounded (Global
 /// Constraint 3): a body past the cap is not inspected at all, and the bytes
 /// already read are handed back in front of the rest of the stream, so the
-/// Anthropic route still forwards exactly what the client sent. Set well past
-/// Anthropic's own request-size limit so no request it would have served ever
-/// loses its routing decision to it.
-const ROUTING_BODY_CAP: usize = 32 * 1024 * 1024;
+/// Anthropic route still forwards exactly what the client sent. Far larger
+/// than any real Claude Code request, including one carrying images, so what
+/// it protects against is a runaway rather than ordinary traffic — and it is
+/// per request, with no bound across concurrent ones, which is the reason to
+/// keep it as small as that allows rather than as large as Anthropic's own
+/// request-size limit.
+///
+/// The cost of exceeding it is a lost routing decision, not a failed request:
+/// a `claude-*` request that would have failed over goes to Anthropic instead,
+/// and a name-routed one reaches Anthropic under a name Anthropic will reject.
+pub(crate) const ROUTING_BODY_CAP: usize = 8 * 1024 * 1024;
 
 pub async fn forward(State(state): State<AppState>, request: Request) -> Response {
     let start = Instant::now();
     let (parts, body) = request.into_parts();
 
-    if parts.uri.path() != MESSAGES_PATH {
+    let path = parts.uri.path();
+    let count_tokens = path == COUNT_TOKENS_PATH;
+    // Every other path under `/v1` carries no `model` to route on. With no
+    // profile configured, nothing can route anywhere else either: the router
+    // could only ever answer `Anthropic`, so reading the body would buy a
+    // decision that is already made. Both cases keep Milestone 1's streamed
+    // verbatim forward, body untouched.
+    if !(count_tokens || path == MESSAGES_PATH) || state.config.profiles.is_empty() {
         let body = reqwest::Body::wrap_stream(body.into_data_stream());
         return to_anthropic(&state, start, &parts, body, None).await;
     }
 
-    let buffered = match read_for_routing(body).await {
+    let buffered = match read_for_routing(body, state.routing_body_cap).await {
         Ok(buffered) => buffered,
         Err(err) => {
             tracing::warn!(error = %err, "could not read the request body");
@@ -61,7 +71,7 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
     let body = match buffered {
         RequestBody::TooLarge(rest) => {
             tracing::warn!(
-                cap_bytes = ROUTING_BODY_CAP,
+                cap_bytes = state.routing_body_cap,
                 "request body too large to route on; forwarding to Anthropic"
             );
             let body = reqwest::Body::wrap_stream(rest);
@@ -83,10 +93,16 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
         state.config.policy.active_profile.as_deref(),
     );
     let target = match named {
-        // §7d: routed by name, so the name is passed through unremapped.
-        Ok(RouteDecision::Profile(name)) => Some((name, false)),
-        // §6: a `claude-*` request may still fail over while Anthropic is
-        // `Limited`, and that one *is* remapped (§7a).
+        // §7d: routed by name, so the name is passed through unremapped. A
+        // `count_tokens` request may only go to a profile that can actually
+        // count — see `counts_tokens`.
+        Ok(RouteDecision::Profile(name)) => {
+            (!count_tokens || counts_tokens(&state, &name)).then_some((name, false))
+        }
+        // Spec §6: `count_tokens` never fails over, whatever the route state
+        // and whatever the policy mode. Anything else may, and that one *is*
+        // remapped (§7a).
+        Ok(RouteDecision::Anthropic) if count_tokens => None,
         Ok(RouteDecision::Anthropic) => failover(&state, &view).await.map(|name| (name, true)),
         Err(err) => {
             tracing::warn!(model = %model, error = %err, "no route for the requested model");
@@ -217,6 +233,24 @@ async fn to_anthropic(
     response
 }
 
+/// Whether a `count_tokens` request may be routed to this profile at all.
+///
+/// Global Constraint 7 pins `count_tokens` to Anthropic; spec §7d routes every
+/// non-`claude-*` name to the profile that claims it. They only reconcile for
+/// an `anthropic`-format profile, whose `/v1/messages/count_tokens` this route
+/// mirrors and which answers in the shape the client is expecting. An
+/// `openai`-format profile has no counting endpoint at all: the request would
+/// go to `/v1/chat/completions`, bill a real inference call, and come back as
+/// a `message` where the client wanted `{"input_tokens": N}`. So that one
+/// keeps the Anthropic pin — not a route this can safely extend to.
+fn counts_tokens(state: &AppState, profile: &str) -> bool {
+    state
+        .config
+        .profiles
+        .get(profile)
+        .is_some_and(|profile| profile.format == "anthropic")
+}
+
 /// Spec §6's failover decision, reached only by a `claude-*` request the
 /// router already pointed at Anthropic. `Some(profile)` fails it over;
 /// `None` leaves it on Anthropic, where a limit error passes through to the
@@ -295,7 +329,7 @@ enum RequestBody {
     TooLarge(Prefixed),
 }
 
-async fn read_for_routing(body: Body) -> Result<RequestBody, axum::Error> {
+async fn read_for_routing(body: Body, cap: usize) -> Result<RequestBody, axum::Error> {
     let mut stream = Box::pin(body.into_data_stream());
     let mut buffered: Vec<u8> = Vec::new();
     loop {
@@ -303,7 +337,7 @@ async fn read_for_routing(body: Body) -> Result<RequestBody, axum::Error> {
             return Ok(RequestBody::Buffered(Bytes::from(buffered)));
         };
         let chunk = chunk?;
-        let over_cap = buffered.len() + chunk.len() > ROUTING_BODY_CAP;
+        let over_cap = buffered.len() + chunk.len() > cap;
         buffered.extend_from_slice(&chunk);
         if over_cap {
             return Ok(RequestBody::TooLarge(Prefixed {
@@ -343,16 +377,19 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 }
 
 /// Everything the peer sent, minus the hop-by-hop headers the next connection
-/// recomputes for itself.
+/// recomputes for itself and minus the relay's own audit marker, which only
+/// the relay may set: an upstream that emits `x-relay-route` — misconfigured,
+/// or hostile in the case of a `base_url` pointed somewhere it shouldn't be —
+/// must not be able to forge a claim about which route served a response.
 ///
 /// This is the *Anthropic* route's rule, and a denylist on purpose: that route
 /// exists to forward what the client sent. The fallback route must never reuse
-/// it — see `fallback::outgoing_headers`, which builds its request headers from
-/// nothing instead (spec §7b).
+/// it for a request — see `fallback::outgoing_headers`, which builds its
+/// request headers from nothing instead (spec §7b).
 pub(crate) fn forwardable(headers: &HeaderMap) -> HeaderMap {
     let mut forwarded = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers {
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name) || name == crate::fallback::ROUTE_MARKER {
             continue;
         }
         // `append`, not `insert`: repeated headers (`set-cookie`) must survive.
