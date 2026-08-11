@@ -341,9 +341,9 @@ benchmarks don't capture; every switch is an explicit, instantly-revertible comm
 |---|---|---|
 | 1 | Transparent passthrough proxy, streaming intact, `/status`, `--capture-errors` | Real session indistinguishable from direct; subscription billing confirmed intact |
 | 2 | Limit detection + state machine + notifier + state persistence | Fixture tests pass; real limit event flips state and fires notification; burst 429 does not |
-| 3 | Name-based routing (§7d) + failover to Anthropic-compatible fallback (profile schema §8b, model remap, header hygiene, `new-sessions` policy, `POST /control/profile`) | E2E drill passes; auth-stripping invariant tested; explicit open-model requests route by name with Anthropic ACTIVE; profile switch applies to new requests only |
+| 3 | Name-based routing (§7d) + failover to the fallback provider (profile schema §8b, model remap, header hygiene, `new-sessions` policy, `POST /control/profile`) + the §7c wire-format layer the chosen provider actually needs | E2E drill passes; auth-stripping invariant tested; explicit open-model requests route by name with Anthropic ACTIVE; profile switch applies to new requests only |
 | 4 | Policy modes + `/control/mode`, `relay ctl` CLI wrapper, hot reload, jittered recovery, `x-relay-route` marker | Recovery observed across a real reset window; switch-and-revert of profiles verified under concurrent streams |
-| 5 | (Conditional) OpenAI translator or LiteLLM sidecar integration | Golden-file suite green; tool-heavy session completes on fallback |
+| 5 | (Only if a later profile needs a wire format Milestone 3 didn't already build) another §7c translator | Golden-file suite green; tool-heavy session completes on fallback |
 
 ## 12. Risks and mitigations
 

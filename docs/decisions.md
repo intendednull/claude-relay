@@ -11,11 +11,29 @@ target is Together AI. `docs/spec.md` §8's `deepseek`/`kimi` profiles are
 illustrative placeholders from the original design, not a commitment to
 those providers.
 
-**Open question for Milestone 3 (fallback route):** whether Together AI
-exposes an Anthropic Messages-compatible endpoint (spec §7c Phase 1) or
-only an OpenAI-format endpoint (Phase 2, translator required). Per spec §5's
-own philosophy, verify this empirically against Together's current API
-docs/catalog when Milestone 3 starts — do not assume either shape here.
+**Resolved 2026-08-10:** Together AI has no Anthropic Messages-compatible
+endpoint — verified against Together's own current documentation
+(docs.together.ai/docs/openai-api-compatibility, checked live, no mention
+of Anthropic/Claude/`/v1/messages` anywhere in their docs or sitemap). Only
+an OpenAI-format endpoint exists: `POST https://api.together.ai/v1/chat/completions`,
+Bearer auth, confirmed supporting streaming SSE, tool/function calling,
+system messages, and image content parts. So Milestone 3 needs spec §7c's
+**Phase 2** (the OpenAI-format translator) — Phase 1 (passthrough + remap
+only) is not available for this provider. See the spec.md §11 milestone-table
+update and the Milestone 3 plan for how this reshapes scope: the translator
+is no longer conditional/deferred (former milestone-table row 5) — it is
+required for Milestone 3 to meet its own acceptance criterion at all, since
+there is no fallback provider in play yet that Phase 1 would work against.
+
+**Build vs. LiteLLM sidecar (user decision, 2026-08-10):** build the
+translator directly in `relay`, not as a LiteLLM sidecar. Matches spec §2's
+own non-goal ("not a general multi-provider gateway... deliberately a
+single-purpose, single-user tool") and keeps `relay` a single static binary
+with nothing else to install or keep alive — the whole point of the tool
+for a single operator. The translation surface itself is bounded (spec
+§7c's table is the full mapping); the genuinely hard part (tool-use
+fidelity, SSE synthesis) needs the same golden-file rigor either way, so a
+sidecar doesn't buy safety, only avoids writing the mapping code.
 
 **Confirmed requirement:** a manual way to switch to the fallback (not just
 automatic failover on limit-detection) is required, not optional. This is
