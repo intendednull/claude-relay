@@ -25,3 +25,22 @@ CLI wrapper. No design change needed; noting here so Milestone 3/4 planning
 treats the control API as load-bearing rather than a nice-to-have.
 
 Does not affect Milestone 1 (pure passthrough, no fallback routing at all).
+
+## 2026-08-10 — Milestone 2 detection rule is provisional, no real fixture yet
+
+Spec §5 is explicit that the subscription-limit detection signature "must be
+captured empirically" via `--capture-errors` against a real rate-limit
+event, not trusted from documentation. This environment has no live
+Anthropic credentials and no real usage history, so no such fixture exists.
+
+Milestone 2's default `[detect]` rule is built directly from spec §5's
+"Expected shape" paragraph (HTTP 429, `error.type == "rate_limit_error"`,
+reset via `retry-after`/`anthropic-ratelimit-*`) — explicitly a best guess,
+not a verified fixture. This is safe to ship because the design already
+anticipates it: detection rules are config data, not code, specifically so
+"a server-side wording change is a config edit, not a rebuild" (spec §5).
+
+**Follow-up, not blocking:** once the user runs `relay --capture-errors
+<dir>` against real traffic and actually hits the subscription limit, the
+captured fixture should replace the guessed `[detect]` defaults — a config
+edit, per the design's own intent, not a code change.
