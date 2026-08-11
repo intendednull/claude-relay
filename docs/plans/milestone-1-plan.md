@@ -1,5 +1,12 @@
 # Milestone 1 implementation plan — transparent passthrough proxy
 
+**Status: complete**, merged to `main` at `a4cda8f`. All 3 tasks landed,
+each reviewed twice with fix rounds; two full whole-branch review rounds
+(2 reviewers each) before merge. Review history lived in
+`.superpowers/sdd/milestone-1-plan/` during execution — removed after
+merge per the subagent-driven-development skill's convention; git history
+is the record now.
+
 Source of truth: `docs/spec.md` (the design doc), specifically §1
 (Purpose), §3 (Architecture — Ingress/Router/Status only; no fallback in
 this milestone), §5 (limit-detection's `--capture-errors` debug flag), §7b
