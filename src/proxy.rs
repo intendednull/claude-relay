@@ -397,9 +397,24 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
     )
 }
 
+/// Whether the relay's client may read a response is the relay's decision, not
+/// an upstream's: a `base_url` answering `access-control-allow-origin: *` (a
+/// misconfigured or hostile one, or a CORS-permissive provider) would otherwise
+/// have it forwarded verbatim and turn `install_gate`'s blind cross-origin
+/// refusal into a page that can read the response it provoked. The relay sets
+/// no CORS headers of its own, so stripping the whole family — rather than
+/// naming the two that matter today — leaves nothing to keep in sync with the
+/// CORS spec. Same rule read forwards on the request side: a client's
+/// `access-control-*` header is a browser preflight artifact that says nothing
+/// to the upstream this relay talks to.
+fn is_cors(name: &HeaderName) -> bool {
+    name.as_str().starts_with("access-control-")
+}
+
 /// Everything the peer sent, minus the hop-by-hop headers the next connection
-/// recomputes for itself and minus the relay's own audit marker, which only
-/// the relay may set.
+/// recomputes for itself, minus the relay's own audit marker, which only the
+/// relay may set, and minus the CORS family (`is_cors`), which is the relay's
+/// answer to give and not an upstream's.
 ///
 /// Both of the Anthropic route's call sites share this, so `x-relay-route` is
 /// stripped in both directions. On the response it is the anti-forgery rule: an
@@ -416,7 +431,7 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 pub(crate) fn forwardable(headers: &HeaderMap) -> HeaderMap {
     let mut forwarded = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers {
-        if is_hop_by_hop(name) || name == crate::fallback::ROUTE_MARKER {
+        if is_hop_by_hop(name) || is_cors(name) || name == crate::fallback::ROUTE_MARKER {
             continue;
         }
         // `append`, not `insert`: repeated headers (`set-cookie`) must survive.
@@ -626,12 +641,19 @@ mod tests {
     use axum::http::HeaderValue;
 
     #[test]
-    fn drops_hop_by_hop_headers_only() {
+    fn drops_hop_by_hop_and_cors_headers_only() {
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("relay.local"));
         headers.insert("content-length", HeaderValue::from_static("12"));
         headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
         headers.insert("connection", HeaderValue::from_static("keep-alive"));
+        // Whether the client may read this response is the relay's answer to
+        // give, not an upstream's (`is_cors`).
+        headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+        headers.insert(
+            "access-control-allow-credentials",
+            HeaderValue::from_static("true"),
+        );
         headers.insert("authorization", HeaderValue::from_static("Bearer token"));
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
 
