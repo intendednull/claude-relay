@@ -7,6 +7,7 @@ pub mod fallback;
 pub mod log_file;
 pub(crate) mod log_safety;
 pub mod notify;
+pub(crate) mod provider_error;
 pub mod proxy;
 pub mod route_state;
 pub mod route_updates;

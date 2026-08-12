@@ -22,6 +22,7 @@ use indexmap::IndexMap;
 use serde_json::{Value, json};
 
 use crate::config::ProfileConfig;
+use crate::provider_error::ProviderError;
 use crate::proxy::{CountingStream, RequestLog, elapsed_ms, forwardable};
 use crate::state::AppState;
 use crate::translate::{self, BUFFER_CAP};
@@ -151,20 +152,7 @@ pub async fn forward(
     // fallback provider must not put the Anthropic route into `Limited`, and a
     // 200 from it must not recover the route out of it.
     if !status.is_success() {
-        // Spec §7d: the provider's own error is what surfaces, untranslated.
-        // The shape is captured now, not guessed: real Together AI error
-        // bodies (`tests/fixtures/together/{A,F,H,I,J}*`) are all
-        // OpenAI-style `{"error": {message, type, param, code}}` plus a
-        // harmless top-level `id`, pinned by
-        // `tests/translate_together_fixtures.rs`'s
-        // `every_real_error_capture_is_openai_shaped`. The decision to pass
-        // through rather than translate is unchanged and better supported
-        // than when it was a guess. Status codes are not uniform across
-        // those captures (400, 401, 404 — for an unknown model, unusually —
-        // and 422 were all observed): nothing here depends on that today
-        // since this branch only checks `!is_success()`, but a future change
-        // that assumes "provider errors are 400" would be wrong.
-        return passthrough_response(status, upstream, log);
+        return provider_error_response(profile, request.profile_name, status, upstream, log).await;
     }
 
     if !translated {
@@ -375,9 +363,90 @@ fn translated_headers(content_type: &'static str) -> HeaderMap {
     headers
 }
 
+/// Spec §7d: a provider's error reaches the client in Anthropic's envelope,
+/// with the provider's own status and message preserved. It used to pass through
+/// verbatim; the shapes were unknown when that rule was written and are captured
+/// now, and for a context-limit error the passthrough cost the user the whole
+/// session — Claude Code's compact-and-retry keys on Anthropic's wording, which
+/// no provider here uses (`docs/decisions.md`).
+async fn provider_error_response(
+    profile: &ProfileConfig,
+    profile_name: &str,
+    status: StatusCode,
+    upstream: reqwest::Response,
+    log: RequestLog,
+) -> Response {
+    let mut headers = translated_headers("application/json");
+    // An allowlist of one, not `forwardable`'s denylist: this body is the
+    // relay's, so the provider's `content-length` and `content-encoding`
+    // describe bytes that are no longer being sent. `retry-after` is the only
+    // header on an error the client acts on, so it is the only one kept.
+    if let Some(retry_after) = upstream.headers().get("retry-after").cloned() {
+        headers.insert("retry-after", retry_after);
+    }
+
+    let raw = match read_capped(upstream, RESPONSE_CAP).await {
+        Ok(raw) => raw,
+        Err(reason) => {
+            tracing::warn!(
+                profile = profile_name,
+                reason,
+                "the fallback provider's error body was unreadable"
+            );
+            // Not a 502: the provider's status is the honest answer, and losing
+            // it would tell the client a different thing went wrong.
+            Vec::new()
+        }
+    };
+    // The envelope necessarily reshapes what the provider sent, so the raw bytes
+    // have to stay findable by a human — the log is the place for that.
+    tracing::warn!(
+        profile = profile_name,
+        status = status.as_u16(),
+        // No `%` sigil: that renders through `format_args!` unescaped, and this
+        // value is provider-controlled, so a newline in it would forge a whole
+        // record (`log_safety`). A plain field gets `record_str`'s escaping.
+        body = loggable_error_body(&raw, &profile.api_key_env),
+        "the fallback provider returned an error"
+    );
+
+    let body = ProviderError::read(status, &raw).to_anthropic();
+    log.emit(body.len() as u64);
+
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+}
+
+/// How much of a provider's error body reaches the log. The real ones are a few
+/// hundred bytes; the cap is here because the body is provider-controlled and
+/// unbounded, and because a provider is free to echo request content into its
+/// error message — Together's context error carries only numbers, but that is an
+/// observation about one provider, not a guarantee. Counted in `char`s so the
+/// clip cannot split a multi-byte boundary.
+const LOGGED_ERROR_BODY_CHARS: usize = 512;
+
+/// The profile's own key is the one credential that ever reaches this provider
+/// (spec §7b builds the outgoing headers from nothing else), and a provider is
+/// free to quote it back in an error. Redacted for the same reason
+/// `err.without_url()` is used above: this line must not be where a credential
+/// lands (Global Constraint 2).
+fn loggable_error_body(raw: &[u8], api_key_env: &str) -> String {
+    let clipped: String = String::from_utf8_lossy(raw)
+        .chars()
+        .take(LOGGED_ERROR_BODY_CHARS)
+        .collect();
+    match std::env::var(api_key_env) {
+        // An empty or one-character value would redact the whole line into
+        // noise, and cannot be a real key.
+        Ok(key) if key.len() > 1 => clipped.replace(&key, "[REDACTED]"),
+        _ => clipped,
+    }
+}
+
 /// Streams the upstream response through untouched. Used for a
-/// `format = "anthropic"` profile, which needs no translation, and for every
-/// non-2xx, whose body is the provider's own error.
+/// `format = "anthropic"` profile's 2xx, which needs no translation.
 fn passthrough_response(
     status: StatusCode,
     upstream: reqwest::Response,
