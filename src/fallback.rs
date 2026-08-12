@@ -205,6 +205,12 @@ pub async fn forward(
             {
                 match prepare(&body, &next, translated) {
                     Ok(next_prepared) => {
+                        // §9's line for the attempt that just failed, carrying the
+                        // model that failed — the same shape the Anthropic route's
+                        // re-routed attempt emits before handing over (`proxy`).
+                        // First, so the three lines an escalating request writes read
+                        // in the order they happened.
+                        log.emit(failure.upstream_bytes);
                         tracing::info!(
                             profile = request.profile_name,
                             // Both are `model_map` *values*, never client text: a
@@ -216,10 +222,6 @@ pub async fn forward(
                             reason = "context_limit",
                             "the fallback model could not fit the prompt; retrying one rung up"
                         );
-                        // §9's line for the attempt that just failed, carrying the
-                        // model that failed — the same shape the Anthropic route's
-                        // re-routed attempt emits before handing over (`proxy`).
-                        log.emit(failure.upstream_bytes);
                         target_model = next;
                         prepared = next_prepared;
                         carried = Some(failure);
