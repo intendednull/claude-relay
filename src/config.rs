@@ -245,18 +245,21 @@ pub struct PolicyConfig {
     /// window doesn't race the upstream reset boundary (spec §4).
     #[serde(default = "default_reset_jitter_secs")]
     pub reset_jitter_secs: [u64; 2],
-    /// Whether a fallback provider's `reasoning_content` is surfaced to the
-    /// client as an Anthropic `thinking` block. Defaults to on: the operator is
-    /// billed for those tokens either way, and dropping them is the older
-    /// behavior, not the safer one.
+    /// Whether a fallback provider's reasoning (`translate::openai::
+    /// reasoning_text`) is surfaced to the client as an Anthropic `thinking`
+    /// block. Defaults to on: the operator is billed for those tokens either
+    /// way, and dropping them is the older behavior, not the safer one.
     ///
     /// The reason it is a switch at all: Anthropic's own `thinking` blocks carry
-    /// a signature the relay cannot produce, so a synthesized block is unsigned.
-    /// On the fallback path that round-trips harmlessly — translating history to
-    /// OpenAI drops `thinking` blocks — but the Anthropic route forwards the
-    /// client's body verbatim, so a session that failed over and later recovers
-    /// hands Anthropic an unsigned block. `false` restores the drop, for an
-    /// operator who would rather not find out.
+    /// a signature the relay cannot produce, so a synthesized block is unsigned
+    /// — and Claude Code was observed normalizing it into its transcript with
+    /// `"signature": ""`, so omitting the field does not keep the unsigned block
+    /// out of the history that goes back up. On the fallback path that
+    /// round-trips harmlessly — translating history to OpenAI drops `thinking`
+    /// blocks — but the Anthropic route forwards the client's body verbatim, so
+    /// a session that failed over and later recovers hands Anthropic a block
+    /// with an empty signature. `false` restores the drop, for an operator who
+    /// would rather not find out.
     #[serde(default = "default_surface_fallback_reasoning")]
     pub surface_fallback_reasoning: bool,
 }
