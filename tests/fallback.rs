@@ -3761,7 +3761,41 @@ async fn a_request_attributable_failure_fires_nothing() {
         1,
         "only the 401 belongs to the route: {lines:?}"
     );
-    assert_eq!(fields(&lines[0])[2], "fallback: http 401");
+    // Which one fired, not only how many: a 400 that notified would take the
+    // edge with it and suppress the 401, leaving the count above satisfied.
+    assert_eq!(
+        fields(&lines[0])[2],
+        "fallback: http 401",
+        "a request-attributable failure fired, and took the edge with it"
+    );
+
+    let _ = std::fs::remove_file(&log);
+}
+
+/// A 2xx the relay cannot use is the route failing to deliver, so it fires — and
+/// it must not re-arm on the way past, however much a 200 looks like proof that
+/// the path works. The provider answered; the client got nothing usable. Two
+/// requests, because a failure that re-armed itself would notify twice.
+#[tokio::test]
+async fn a_two_hundred_the_relay_cannot_translate_fires_and_does_not_re_arm() {
+    const SCRIPT: &[(StatusCode, &str)] = &[(StatusCode::OK, ANTHROPIC_SHAPED_BODY)];
+    let log = hook_log_path("fallback-error-untranslatable-response");
+    let relay = start_scripted(SCRIPT, &log).await;
+
+    for _ in 0..2 {
+        assert_eq!(one_request(relay).await, StatusCode::BAD_GATEWAY);
+    }
+
+    let lines = fallback_error_lines(&log, 1).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(
+        fields(&lines[0]),
+        vec![
+            "fallback_error",
+            "",
+            "fallback: fallback_response_untranslatable"
+        ]
+    );
 
     let _ = std::fs::remove_file(&log);
 }
