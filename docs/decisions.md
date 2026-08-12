@@ -1355,6 +1355,19 @@ per-operator manual setup a relay user has to know to perform, and it clamps to
 `min(assumed_window, configured)`, so it does nothing at all unless the operator
 *also* selects a `[1m]` model ID. It is complementary, not wrong — an operator who
 sets both gets pre-emptive compaction and a readable error when it is not enough.
+Both knobs, and the fact that `CLAUDE_CODE_MAX_CONTEXT_TOKENS` does nothing on the
+failover path, are now in the README rather than left as folklore.
+
+**This is not the whole answer, and should not be recorded as one.** Handing the
+client wording it can act on only helps where the client's own recovery can
+succeed. Shrinking `max_tokens` fixes the case where the output reservation is what
+overflowed; compaction fixes the case where the transcript can be summarised. When
+the transcript *alone* exceeds the target's window, neither can — Anthropic
+documents `Error during compaction: Conversation too long` as a real terminal state
+whose only recovery is `/clear`. Escalating one rung up the model ladder (Task 9A)
+is what covers that, and it keys on the same `context_limit` seam this task put in
+`src/provider_error.rs`, which is why the seam is public to the crate rather than
+private to the error path.
 
 **Coverage is one provider, stated rather than implied.** Only Together's wording
 is measured; the other markers are guesses at wording no provider here has been

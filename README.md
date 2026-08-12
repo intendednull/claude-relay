@@ -259,6 +259,34 @@ profile has to be `active_profile`), or the relay answers
 env-var and model-configuration docs; this project has not driven them through a
 live session (see Status).
 
+### Client-side knobs for the context-window mismatch
+
+An open model's context window is usually smaller than the `claude-*` model
+Claude Code thinks it is talking to, so a long session can overflow the target
+without Claude Code seeing it coming. The relay's half of this is the error
+wording above, which lets Claude Code's own compact-and-retry fire. Your half is
+optional, complementary, and worth knowing about — these are the client's knobs,
+not the relay's, and all three were read out of the shipped 2.1.220 binary rather
+than only its docs:
+
+- **`CLAUDE_CODE_AUTO_COMPACT_WINDOW`** (or the `/autocompact <tokens>` command,
+  which saves the `autoCompactWindow` setting; the env var takes precedence over
+  it) makes Claude Code compact *before* it overflows. Set it to the **mapped
+  model's** window. Two limits: it is clamped to `[100k, the window Claude Code
+  assumes for the model]`, so a target below 100k cannot be matched and it does
+  nothing at all unless the assumed window is at least your target — which in
+  practice means selecting a `[1m]` model ID. Pair it with
+  **`CLAUDE_CODE_MAX_OUTPUT_TOKENS`** below the target's output cap, since Claude
+  Code otherwise reserves `max_tokens: 64000`. A `--autocompact` CLI flag does
+  **not** exist in 2.1.220 even though the docs describe one.
+- **`CLAUDE_CODE_MAX_CONTEXT_TOKENS`** fixes the wrong context-usage percentage,
+  but only on a **directly selected** open model: it applies only when the model ID
+  does not start with `claude-`. So it works for `deepseek-ai/…` or
+  `moonshotai/…` picked by name, and **does nothing on the failover path**, where
+  the ID is a `claude-*` alias. On a `claude-*` ID it is honoured only together
+  with `DISABLE_COMPACT`, which turns compaction off entirely and so is not a fix.
+  It is also one global number, not per-model.
+
 ## Capturing error responses
 
 ```
