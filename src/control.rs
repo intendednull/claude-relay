@@ -178,36 +178,52 @@ fn host_str_is_loopback(host: &str) -> bool {
 /// to set them) — unlike `Host`, no DNS trick lets a page forge these into
 /// claiming same-origin. A request carrying neither header at all (`curl`,
 /// `relay ctl`, this project's own tests) is not a browser request and is
-/// unaffected: this only ever *rejects* on a present, untrustworthy value,
-/// never requires either header to exist.
+/// unaffected: `header_is_trustworthy` treats *absent* as fine and everything
+/// else it cannot positively validate — duplicated, not valid UTF-8, or
+/// present-but-rejected-by-`valid` — as a rejection, never a silent skip.
 fn has_trustworthy_origin(headers: &HeaderMap) -> bool {
-    if let Some(site) = headers
-        .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok())
-        && !matches!(site, "same-origin" | "none")
-    {
+    header_is_trustworthy(headers, "sec-fetch-site", |site| {
+        matches!(site, "same-origin" | "none")
+    }) && header_is_trustworthy(headers, header::ORIGIN.as_str(), is_loopback_origin)
+}
+
+/// Same discipline `is_loopback_host` already applies to `Host`, generalized
+/// to a header that's optional rather than required: absent is fine (this
+/// might not be a browser request at all), but present-and-duplicated,
+/// present-and-not-valid-UTF-8, or present-and-failing `valid` are all
+/// rejections. A rejection indistinguishable from "not present" — the
+/// `and_then(...).ok()` shape this replaces — defeats the point of checking
+/// at all: a non-ASCII byte or a second header value would previously fall
+/// through `and_then` as `None` and the request would pass.
+fn header_is_trustworthy(headers: &HeaderMap, name: &str, valid: impl Fn(&str) -> bool) -> bool {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return true;
+    };
+    if values.next().is_some() {
         return false;
     }
-    if let Some(origin) = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        && !is_loopback_origin(origin)
-    {
+    let Ok(value) = first.to_str() else {
         return false;
-    }
-    true
+    };
+    valid(value)
 }
 
 /// An `Origin` header is `scheme "://" host [":" port]` — no path, no
 /// userinfo — so the host half reuses `host_str_is_loopback` once the scheme
-/// is stripped. An opaque origin (`"null"`, from a sandboxed frame or a
-/// `data:` context) has no host to check and is rejected: it cannot be shown
-/// to be loopback, and this module fails closed on everything it cannot
-/// positively classify.
+/// is checked and stripped. An opaque origin (`"null"`, from a sandboxed
+/// frame or a `data:` context) has no scheme or host to check and is
+/// rejected outright, the same as any other scheme this doesn't recognize as
+/// carrying a trustworthy host at all (`evil://localhost`'s host half being
+/// loopback proves nothing about what `evil://` actually means).
 fn is_loopback_origin(origin: &str) -> bool {
-    origin
-        .split_once("://")
-        .is_some_and(|(_scheme, host)| host_str_is_loopback(host))
+    let Some((scheme, host)) = origin.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    host_str_is_loopback(host)
 }
 
 #[derive(Serialize)]
@@ -430,6 +446,7 @@ mod tests {
             "http://127.0.0.1:8484",
             "http://localhost:8484",
             "http://[::1]:8484",
+            "https://127.0.0.1",
         ] {
             assert!(is_loopback_origin(origin), "{origin} should be loopback");
         }
@@ -438,9 +455,46 @@ mod tests {
             "https://evil.example:8484",
             "null",
             "",
+            // Y8: the scheme must be http(s) — a loopback host half proves
+            // nothing about what a non-http(s) scheme actually means.
+            "evil://localhost",
+            "evil://127.0.0.1",
         ] {
             assert!(!is_loopback_origin(origin), "{origin} must not be loopback");
         }
+    }
+
+    /// Y8: a header this module cannot positively validate — not valid UTF-8,
+    /// or duplicated — must be a rejection, not a silently-skipped check. The
+    /// `and_then(...).ok()` shape this replaced let both fall through as "not
+    /// present" and pass.
+    #[test]
+    fn origin_and_sec_fetch_site_fail_closed_on_what_they_cannot_validate() {
+        // A non-ASCII byte: `to_str()` fails.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_bytes(b"http://\xff").expect("valid header bytes"),
+        );
+        assert!(!has_trustworthy_origin(&headers));
+
+        // Duplicate Origin, loopback first: taking "the first" would pass this.
+        let mut headers = HeaderMap::new();
+        headers.append(header::ORIGIN, "http://127.0.0.1".parse().unwrap());
+        headers.append(header::ORIGIN, "http://evil.example".parse().unwrap());
+        assert!(!has_trustworthy_origin(&headers));
+
+        // Duplicate Sec-Fetch-Site, same-origin first.
+        let mut headers = HeaderMap::new();
+        headers.append("sec-fetch-site", "same-origin".parse().unwrap());
+        headers.append("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(!has_trustworthy_origin(&headers));
+
+        // Sanity: a single, valid header of each kind still passes.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "http://127.0.0.1".parse().unwrap());
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(has_trustworthy_origin(&headers));
     }
 
     #[test]

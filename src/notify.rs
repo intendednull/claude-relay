@@ -14,12 +14,17 @@ use crate::route_state::{RouteState, RouteTransition, rfc3339};
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// How long the worker blocks waiting on a queued transition before checking
-/// whether a `profile_switched` is pending (below). Short enough that a
-/// switch notification is never meaningfully delayed by an idle relay, long
-/// enough not to spin: `mpsc::Receiver::recv_timeout` wakes immediately on an
-/// actual send regardless of this value, so this only bounds how promptly an
-/// *idle* period is noticed.
-const SWITCH_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+/// whether a `profile_switched` is pending (below). `mpsc::Receiver::
+/// recv_timeout` wakes immediately on an actual send regardless of this
+/// value, so this only bounds how promptly an *idle* period is noticed — a
+/// switch notification has no real latency requirement, so this is picked to
+/// keep a relay sitting idle with `notify.command` set from waking up and
+/// re-checking an empty slot 20 times a second for the life of the process.
+/// Kept as a poll rather than replaced with a wake-token push onto `events`
+/// (considered: it would remove the wakeups entirely) because the poll is a
+/// one-constant change with no architectural risk this late in the task,
+/// where a token scheme is a bigger surface to get subtly wrong.
+const SWITCH_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A transition worth announcing (spec §4), plus `ProfileSwitched` for
 /// `POST /control/profile` (spec §8b) — not a route transition at all, which
@@ -150,7 +155,19 @@ impl Notifier {
                         };
                         event
                     }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    // The FIFO drains every buffered transition before
+                    // reporting `Disconnected` (`mpsc`'s own guarantee), so a
+                    // transition sent just before the last `Notifier` drops
+                    // is never lost. A pending switch sits in `worker_switch`
+                    // instead, outside that guarantee, so it needs the same
+                    // one-more-look here — without this, disconnecting
+                    // while a switch is still in the slot loses it silently.
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        match worker_switch.lock().expect("poisoned").take() {
+                            Some(event) => event,
+                            None => break,
+                        }
+                    }
                 };
                 // A panic here would otherwise end the thread, and every later
                 // event would vanish into a channel nobody reads.
@@ -583,5 +600,143 @@ mod tests {
         );
 
         let _ = fs::remove_file(&log);
+    }
+
+    /// Y3: the property R3 actually specified is that a flood *still in
+    /// progress* cannot delay or drop a transition — the test above stops
+    /// the flood before queuing the transition, which only pins coalescing.
+    /// This starts several threads flooding switches continuously and queues
+    /// the transition while they are still going, which is the shape a
+    /// live attacker (or a buggy `relay ctl` loop) actually produces.
+    ///
+    /// Acceptance check for this test, not asserted here but load-bearing:
+    /// inverting the worker's drain order (checking the coalescing slot
+    /// *before* the FIFO, instead of after) must make this fail. Confirmed
+    /// by mutation (see the fix-round report) rather than by a second
+    /// assertion in this file, since the inversion lives in production code
+    /// this test cannot reach into.
+    #[test]
+    fn a_live_flood_of_switches_does_not_delay_a_transition_queued_mid_flood() {
+        let log = temp_path("live-flood");
+        let hook_delay = Duration::from_millis(150);
+        let notifier = Notifier::spawn(&NotifyConfig {
+            command: Some(format!(
+                r#"sleep {}; printf '%s\n' "$RELAY_EVENT" >> {}"#,
+                hook_delay.as_secs_f64(),
+                log.display()
+            )),
+            timeout_secs: 5,
+        });
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut floods = Vec::new();
+        for worker in 0..4u64 {
+            let notifier = notifier.clone();
+            let stop = stop.clone();
+            floods.push(thread::spawn(move || {
+                let mut i = worker;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    notifier.notify_event(NotifyEvent::ProfileSwitched {
+                        name: if i % 2 == 0 { "a" } else { "b" }.to_string(),
+                    });
+                    i += 1;
+                    thread::sleep(Duration::from_micros(100));
+                }
+            }));
+        }
+
+        // Let the flood get going before the transition is queued — the
+        // point is that it is still running when that happens, not that it
+        // ran first and finished.
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        notifier.notify(transition(RouteState::Active, limited(3600)));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .any(|line| line == "failover_engaged")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failover_engaged never arrived under a live flood"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let elapsed = started.elapsed();
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for flood in floods {
+            let _ = flood.join();
+        }
+
+        assert!(
+            elapsed < hook_delay * 4,
+            "a transition queued while a switch flood is still running must not \
+             wait behind more than a couple of hook executions; took {elapsed:?}"
+        );
+
+        let _ = fs::remove_file(&log);
+    }
+
+    /// Y4: the coalescing slot must announce the *latest* switch, not the
+    /// first — a slot that keeps whatever arrived first still passes every
+    /// other test in this file, and makes the hook report a stale profile,
+    /// which is worse than reporting nothing (an operator's hook would
+    /// announce a profile that is not actually active).
+    #[test]
+    fn the_coalescing_slot_announces_the_latest_switch_not_the_first() {
+        let log = temp_path("latest-wins");
+        let notifier = Notifier::spawn(&NotifyConfig {
+            command: Some(format!(
+                r#"printf '%s' "$RELAY_DETAIL" >> {}"#,
+                log.display()
+            )),
+            timeout_secs: 5,
+        });
+
+        for name in ["a", "b", "c"] {
+            notifier.notify_event(NotifyEvent::ProfileSwitched {
+                name: name.to_string(),
+            });
+        }
+
+        let line = wait_for_file(&log, Duration::from_secs(5));
+        assert_eq!(line, "active profile switched to c");
+        let _ = fs::remove_file(&log);
+    }
+
+    /// Y6: a `profile_switched` still sitting in the coalescing slot when
+    /// the last `Notifier` clone drops must still be delivered — the FIFO
+    /// side of this already held (`mpsc` drains buffered messages before
+    /// reporting `Disconnected`), so the slot needs the same guarantee
+    /// rather than silently losing whatever was pending.
+    #[test]
+    fn a_pending_switch_is_still_delivered_when_the_notifier_is_dropped() {
+        for attempt in 0..5 {
+            let log = temp_path(&format!("shutdown-drain-{attempt}"));
+            let notifier = Notifier::spawn(&NotifyConfig {
+                command: Some(format!(
+                    r#"printf '%s' "$RELAY_DETAIL" >> {}"#,
+                    log.display()
+                )),
+                timeout_secs: 5,
+            });
+            notifier.notify_event(NotifyEvent::ProfileSwitched {
+                name: "vanishing".to_string(),
+            });
+            drop(notifier);
+
+            assert_eq!(
+                wait_for_file(&log, Duration::from_secs(5)),
+                "active profile switched to vanishing",
+                "attempt {attempt}"
+            );
+            let _ = fs::remove_file(&log);
+        }
     }
 }

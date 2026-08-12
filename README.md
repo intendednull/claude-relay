@@ -159,7 +159,13 @@ when it does.
   request already passed the other checks.
 - Fires the notifier's `profile_switched` event (below) — but only when the
   switch is a real change; switching to the profile that is already active,
-  or a rejected switch, notifies nothing.
+  or a rejected switch, notifies nothing. **A rapid run of switches
+  coalesces to the most recent one**, so a hook is not guaranteed to see
+  every intermediate switch — `A → B → A` in quick succession may announce
+  only the final `A`, not `B` in between. This is deliberate: it bounds how
+  much a burst of switches (a script bug, or someone hammering the endpoint)
+  can delay the next `failover_engaged`/`recovered`, which are never
+  coalesced or dropped.
 
 ## Notifications
 

@@ -120,8 +120,10 @@ async fn get_json(relay: SocketAddr, path: &str) -> Value {
 async fn post_json(relay: SocketAddr, path: &str, body: Value) -> (StatusCode, Value) {
     // No `reqwest::RequestBuilder::json` here: the `json` feature isn't
     // enabled (`Cargo.toml`'s reqwest dependency is deliberately minimal), so
-    // the body is serialized and the header set by hand — which axum's
-    // `Json` extractor requires to accept the request at all.
+    // the body is serialized and the header set by hand — and
+    // `switch_profile` itself now requires this header explicitly (R1: a
+    // wrong or missing content type is a CORS-preflight-defeating CSRF
+    // vector, not just an inconvenience).
     let response = client()
         .post(format!("http://{relay}{path}"))
         .header("content-type", "application/json")
@@ -863,4 +865,100 @@ async fn a_flood_of_alternating_profile_switches_does_not_delay_failover_engaged
     );
 
     let _ = std::fs::remove_file(&log);
+}
+
+/// Y5: the "obvious" refactor of the coalescing slot's drain
+/// (`if let Some(e) = lock().take() { run(e) }`) holds the `MutexGuard` for
+/// the whole `if let` body, including the hook subprocess — Rust extends an
+/// `if let` scrutinee's temporary across the body, unlike `let-else`, which
+/// is what the real code uses. That refactor would make every
+/// `notify_event` call block on `pending_switch.lock()` for as long as the
+/// currently-running hook takes. This pins the property at the one place a
+/// caller of `notify_event` actually lives: the HTTP handler.
+#[tokio::test]
+async fn post_control_profile_returns_promptly_while_a_switch_hook_is_running() {
+    let log = unique_temp_dir("control-lock-discipline").with_extension("log");
+    let anthropic = common::closed_port().await;
+    let a = serve(upstream_ok(BODY_A)).await;
+    let b = serve(upstream_ok(BODY_B)).await;
+    let mut cfg = config(anthropic, a, b);
+    cfg.notify = NotifyConfig {
+        command: Some(format!(r#"sleep 0.4; printf 'ran' >> {}"#, log.display())),
+        timeout_secs: 5,
+    };
+    let relay = serve_relay_with(cfg, None).await;
+
+    let (status, _) = post_json(relay, "/control/profile", json!({"name": "profile-b"})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Give the worker time to pick the switch up and be mid-`sleep`.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let started = Instant::now();
+    let (status, _) = post_json(relay, "/control/profile", json!({"name": "profile-a"})).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "a POST must not block on a hook that is currently running; took {elapsed:?}"
+    );
+
+    let _ = std::fs::remove_file(&log);
+}
+
+async fn raw_http_status_line(relay: SocketAddr, request: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(relay)
+        .await
+        .expect("connect failed");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write failed");
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut buf))
+        .await
+        .expect("response timed out")
+        .expect("read failed");
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Y7: no test exercised the `Host` fixes that need a raw socket to reach at
+/// all — `reqwest` always sends exactly one `Host`, so "no `Host` header"
+/// and "duplicate `Host`" are unreachable through it. Both are real HTTP/1.1
+/// shapes a client library or a deliberately crafted request can produce.
+#[tokio::test]
+async fn control_rejects_a_request_with_no_host_header() {
+    let relay = two_profile_relay().await;
+    let status_line = raw_http_status_line(
+        relay,
+        "GET /control/profiles HTTP/1.1\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(status_line.contains("404"), "{status_line}");
+}
+
+#[tokio::test]
+async fn control_rejects_duplicate_host_headers_in_either_order() {
+    let relay = two_profile_relay().await;
+    for request in [
+        "GET /control/profiles HTTP/1.1\r\nHost: localhost\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+        "GET /control/profiles HTTP/1.1\r\nHost: evil.example\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    ] {
+        let status_line = raw_http_status_line(relay, request).await;
+        assert!(status_line.contains("404"), "{request:?} -> {status_line}");
+    }
+
+    // Sanity: a single, honest Host still reaches the handler — the above
+    // isn't a blanket deny of anything with more than one header line.
+    let status_line = raw_http_status_line(
+        relay,
+        "GET /control/profiles HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(status_line.contains("200"), "{status_line}");
 }

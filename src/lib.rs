@@ -18,20 +18,34 @@ use axum::routing::{any, get};
 
 use crate::state::AppState;
 
-pub fn build_router(state: AppState) -> Router {
-    let router = Router::new()
+/// Every route the relay serves, `/control/*` included — deliberately
+/// separate from `build_router` so that adding a route means editing *this*
+/// function, which is inside the gated region by construction (`build_router`
+/// applies `install_gate` to whatever this returns). There is no gate to get
+/// wrong here: the wrong place to add a route is chaining onto
+/// `build_router`'s *result*, after the gate has already been applied — see
+/// its doc comment.
+fn app_routes() -> Router<AppState> {
+    Router::new()
         .route("/healthz", get(healthz))
         .route("/status", get(status::status))
         .route("/v1/messages", any(proxy::forward))
         .route("/v1/messages/count_tokens", any(proxy::forward))
         .route("/v1/{*rest}", any(proxy::forward))
-        .merge(control::routes());
-    // Applied last, over the whole router by request path — not scoped to
-    // `control::routes()`'s own sub-router — so a `/control/*` route
-    // registered anywhere, including one added here later, inherits the
-    // gate automatically instead of depending on being registered through
-    // `control::routes()` specifically (`control.rs`'s module doc).
-    control::install_gate(router, &state.config).with_state(state)
+        .merge(control::routes())
+}
+
+/// `install_gate` must be the *last* operation performed on the router
+/// before `.with_state` — it is a `tower` layer, and a layer only wraps
+/// routes that existed in the chain before it was applied. A route added by
+/// calling `.route(...)` on *this function's return value* would not pass
+/// through it and would reach its handler ungated, on any bind, with any
+/// `Host` — that is not a hypothetical, it was demonstrated live against an
+/// earlier version of this comment that claimed otherwise (`docs/decisions.md`).
+/// Add new routes to `app_routes` instead, which is inside the gated region
+/// by construction; there is nothing to remember there.
+pub fn build_router(state: AppState) -> Router {
+    control::install_gate(app_routes(), &state.config).with_state(state)
 }
 
 async fn healthz() -> &'static str {
