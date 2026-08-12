@@ -19,8 +19,8 @@ use indexmap::IndexMap;
 use serde_json::Value;
 
 use common::{
-    relay_config, serve, serve_relay_with, serve_relay_with_routing_cap, truncated_body,
-    unique_temp_dir,
+    closed_port, relay_config, serve, serve_relay_with, serve_relay_with_routing_cap,
+    truncated_body, unique_temp_dir,
 };
 use relay::config::{Config, ProfileConfig};
 
@@ -868,6 +868,255 @@ async fn a_profile_with_no_key_in_the_environment_fails_without_sending_anything
         .expect("error body must be JSON");
     assert_eq!(body["error"], "fallback_key_missing");
     assert_eq!(relay.fallback.count(), 0);
+}
+
+/// The rest of the route's relay-generated failure surface, one test per code.
+///
+/// These are the responses the relay writes itself, so each one has to carry
+/// `x-relay-route: fallback` as well as the right status and code: "no marker"
+/// is the claim that a response came from Anthropic (`docs/decisions.md`), and
+/// a failed fallback attempt did not. `fallback_error` centralizes the marker,
+/// so what these tests watch is the funnel into it — every branch that can
+/// answer without reaching that helper.
+///
+/// All of them route by name (§7d) rather than by failover, so the limit
+/// machinery is not a variable in a test about a failure path.
+///
+/// A body past `RESPONSE_CAP` (4 MiB), which is the one thing this route
+/// buffers whole. The completion is well-formed and would translate fine — the
+/// cap is the only reason it is refused.
+fn oversized_upstream(recorder: Recorder) -> Router {
+    Router::new().route(
+        "/v1/chat/completions",
+        any(move |request: Request| {
+            let recorder = recorder.clone();
+            async move {
+                record(&recorder, request).await;
+                let filler = "x".repeat(5 * 1024 * 1024);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        concat!(
+                            r#"{{"id":"chatcmpl-big","object":"chat.completion","#,
+                            r#""model":"target/Big-Model","choices":[{{"index":0,"#,
+                            r#""message":{{"role":"assistant","content":"{}"}},"#,
+                            r#""finish_reason":"stop"}}]}}"#
+                        ),
+                        filler
+                    )))
+                    .expect("failed to build mock response")
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn a_fallback_response_past_the_buffer_cap_is_a_marked_502() {
+    let relay = start(
+        "notify-only",
+        false,
+        oversized_upstream,
+        "openai",
+        OPENAI_KEY_ENV,
+    )
+    .await;
+
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(session_start(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("error body must be JSON");
+    assert_eq!(body["error"], "fallback_response_unreadable");
+    assert_eq!(
+        relay.fallback.count(),
+        1,
+        "the request did reach the profile; it is the answer that was unusable"
+    );
+}
+
+/// Valid JSON and not a chat completion — what an `openai` profile whose
+/// `base_url` actually speaks Anthropic answers with. Being valid JSON is the
+/// point: it proves the check is about the response's shape, not about the
+/// bytes parsing at all.
+const ANTHROPIC_SHAPED_BODY: &str =
+    r#"{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}]}"#;
+
+#[tokio::test]
+async fn a_two_hundred_that_is_not_a_chat_completion_is_a_marked_502() {
+    let relay = start(
+        "notify-only",
+        false,
+        |recorder| {
+            Router::new().route(
+                "/v1/chat/completions",
+                any(move |request: Request| {
+                    let recorder = recorder.clone();
+                    async move {
+                        record(&recorder, request).await;
+                        json(StatusCode::OK, ANTHROPIC_SHAPED_BODY)
+                    }
+                }),
+            )
+        },
+        "openai",
+        OPENAI_KEY_ENV,
+    )
+    .await;
+
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(session_start(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("error body must be JSON");
+    assert_eq!(body["error"], "fallback_response_untranslatable");
+    assert_eq!(
+        relay.fallback.count(),
+        1,
+        "the upstream answered; its answer is what could not be translated"
+    );
+}
+
+/// A request the translator refuses. `role: "function"` is not a role the
+/// Anthropic Messages API has, so nothing can be built from it — and the
+/// request must die here rather than reach the profile in some guessed shape.
+#[tokio::test]
+async fn a_request_the_translator_refuses_is_a_marked_502_that_sends_nothing() {
+    let relay = start_openai("notify-only", false).await;
+
+    let body = format!(
+        r#"{{"model":"{OPEN_MODEL}","max_tokens":64,"messages":[{{"role":"function","content":"x"}}]}}"#
+    );
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(body)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("error body must be JSON");
+    assert_eq!(body["error"], "fallback_request_untranslatable");
+    assert_eq!(
+        relay.fallback.count(),
+        0,
+        "a request that could not be translated must not be sent in some other shape"
+    );
+    assert_eq!(relay.anthropic.count(), 0, "nor sent to Anthropic instead");
+}
+
+/// The fallback route's own `upstream_unreachable`, which is a different site
+/// from the Anthropic route's namesake (`tests/proxy.rs`) and answers 502 where
+/// that one answers 502 too — but this one has to carry the marker.
+#[tokio::test]
+async fn a_profile_nothing_is_listening_on_is_a_marked_502() {
+    set_profile_keys();
+    let anthropic = Recorder::default();
+    let anthropic_addr = serve(anthropic_upstream(anthropic.clone(), false)).await;
+    let unreachable = closed_port().await;
+    let relay = serve_relay_with(
+        config(
+            anthropic_addr,
+            "notify-only",
+            profile(unreachable, "openai", OPENAI_KEY_ENV),
+        ),
+        None,
+    )
+    .await;
+
+    let response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(session_start(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("error body must be JSON");
+    assert_eq!(body["error"], "upstream_unreachable");
+    assert_eq!(
+        status(relay).await["fallback_requests_served"],
+        0,
+        "a request that never arrived was not served"
+    );
+    assert_eq!(anthropic.count(), 0);
+}
+
+/// The streaming twin of `a_translated_response_keeps_the_upstreams_status`.
+/// A synthesized SSE response still carries the provider's own 2xx: a 206 must
+/// not silently become a 200. The event names are asserted alongside it so this
+/// is a status assertion about the *translated stream* path rather than about
+/// some error path that happened to answer 206.
+#[tokio::test]
+async fn a_translated_stream_keeps_the_upstreams_2xx_status() {
+    let relay = start(
+        "notify-only",
+        false,
+        |recorder| {
+            Router::new().route(
+                "/v1/chat/completions",
+                any(move |request: Request| {
+                    let recorder = recorder.clone();
+                    async move {
+                        record(&recorder, request).await;
+                        Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(OPENAI_CHUNKS.concat()))
+                            .expect("failed to build mock response")
+                    }
+                }),
+            )
+        },
+        "openai",
+        OPENAI_KEY_ENV,
+    )
+    .await;
+
+    let body = format!(
+        r#"{{"model":"{OPEN_MODEL}","max_tokens":64,"stream":true,"messages":[{{"role":"user","content":"hi"}}]}}"#
+    );
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(body)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+
+    let bytes = response.bytes().await.expect("failed to read body");
+    let names: Vec<String> = events(&bytes).into_iter().map(|(name, _)| name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ],
+        "the 206 above must be the status of a translated stream, not of a failure"
+    );
 }
 
 /// A profile configured but no `active_profile` — a valid config, and the only
