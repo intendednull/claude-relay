@@ -596,6 +596,29 @@ mod tests {
         assert!(error.client_message().contains("Request too large"));
     }
 
+    /// The unrecognised-shape path with a **measured** body rather than a plausible
+    /// one: `api.together.xyz` is Cloudflare-fronted, and an unusual client
+    /// signature gets this page instead of anything the provider wrote (observed
+    /// 2026-08-12 from a urllib User-Agent, before the same probe with a normal one
+    /// reached the provider). Non-JSON, and no `message` field anywhere — so it is a
+    /// confirmed real instance of the case the snippet fallback exists for, and the
+    /// reason a 403 from an intermediary is indistinguishable here from a 403 the
+    /// provider sent.
+    ///
+    /// It also must never walk §7e's ladder: an intermediary blocking the relay is
+    /// not a prompt that did not fit, and a second, larger request would be blocked
+    /// identically.
+    #[test]
+    fn a_cloudflare_block_page_reaches_the_client_as_a_permission_error() {
+        let error = read(403, "error code: 1010");
+        assert_eq!(error.kind, "permission_error");
+        assert_eq!(error.client_message(), "error code: 1010");
+        assert!(
+            error.context_limit.is_none(),
+            "an intermediary's block page must not be read as a context limit"
+        );
+    }
+
     /// The failure this exists to prevent: a malformed request reshaped into a
     /// too-long claim, which the client answers by shrinking and retrying.
     #[test]
