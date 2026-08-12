@@ -11,6 +11,7 @@ use super::openai::{
     ToolCall,
 };
 use super::{BLOCK_JOIN, parse_failure};
+use crate::log_safety::safe_identifier;
 
 #[derive(Debug)]
 pub struct TranslatedRequest {
@@ -231,24 +232,6 @@ fn dropped_block_note(block: &Block) -> String {
         "[relay: a {block_type:?} content block was dropped here; \
          the fallback provider has no equivalent]"
     )
-}
-
-/// Block types and tool names are client-controlled and unbounded, and these
-/// reach a log line and — for a block type — text the model reads, so they are
-/// clipped to something an identifier could plausibly be before either sees
-/// them.
-fn safe_identifier(name: &str) -> String {
-    const MAX_TYPE_NAME: usize = 64;
-    let clipped: String = name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        .take(MAX_TYPE_NAME)
-        .collect();
-    if clipped.is_empty() {
-        "unnamed".to_string()
-    } else {
-        clipped
-    }
 }
 
 /// Dropping these is spec §7c's instruction rather than a surprise, and a

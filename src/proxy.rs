@@ -16,6 +16,7 @@ use serde_json::json;
 use crate::capture::Capture;
 use crate::config::Config;
 use crate::fallback::{self, FallbackRequest};
+use crate::log_safety::safe_identifier;
 use crate::route_state::RouteState;
 use crate::route_updates::{RequestOutcome, RouteUpdates};
 use crate::router::{self, RouteDecision};
@@ -115,7 +116,17 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
         // error through").
         Err(_) if count_tokens => None,
         Err(err) => {
-            tracing::warn!(model = %model, error = %err, "no route for the requested model");
+            // `safe_identifier`, not `%model`: the `%` sigil renders through
+            // `format_args!` unescaped, and this value is straight out of the
+            // request body — a newline in it forges a whole log record, which
+            // is the one place spec §9's audit trail can be written to by a
+            // client. `error = %err` is safe: its message interpolates
+            // `{model:?}`. (F2, `docs/decisions.md`.)
+            tracing::warn!(
+                model = safe_identifier(&model),
+                error = %err,
+                "no route for the requested model"
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "no_route_for_model" })),

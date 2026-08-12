@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use indexmap::IndexMap;
 
 use crate::config::ProfileConfig;
+use crate::log_safety::safe_identifier;
 
 /// Where a request's `model` field routes (spec §7d), decided before
 /// Milestone 2's limit-state machine is ever consulted: a `claude-*` model
@@ -46,7 +47,15 @@ pub fn route(
     }
     match active_profile {
         Some(name) => Ok(RouteDecision::Profile(name.to_string())),
-        None => bail!("no profile serves model {model:?}, and no active profile is configured"),
+        // `safe_identifier`, not `{model:?}`: this message's only destination is
+        // `proxy::forward`'s log line, where the raw name would land beside the
+        // clipped `model` field it already carries — escaped, so it cannot forge
+        // a record, but unbounded, which is the other half of what clipping is
+        // for (F2, `docs/decisions.md`).
+        None => bail!(
+            "no profile serves model {:?}, and no active profile is configured",
+            safe_identifier(model)
+        ),
     }
 }
 
