@@ -302,12 +302,22 @@ So the relay emits `{"type":"error","error":{"type":…,"message":…}}`, and:
   rather than an invented name.
 - **For a context-limit error, the message leads with Anthropic's wording and the pair**
   — `prompt is too long: 170071 tokens > 131072` — with the provider's own sentence after
-  it, which is the only thing that reported the real limit. The numbers are parsed out of
-  the provider's message and never invented: with no usable pair the phrase goes *last*
-  instead, so no digit the provider sent can be misread as one. This is the recovery that
+  it, which is the only thing that reported the real limit. This is the recovery that
   matters, because Claude Code sends `max_tokens: 64000` — on a 131k model most of the
   overflow is the output reservation, not the transcript, so shrinking `max_tokens` alone
   fixes it with no compaction.
+- **The pair is read from the provider's message, and the parser refuses rather than
+  guesses.** "Never invented" is not a strong enough claim to make about numbers taken
+  out of arbitrary text: digits that came from the provider can still be the *wrong*
+  digits. So the parse is anchored to the wording that matched — the last token count
+  before it and the first number after it — and it yields nothing unless the leading
+  number is a count of tokens and exceeds the trailing one. That is what makes a request
+  id or an ISO timestamp an intermediary prepended irrelevant; unanchored, a
+  `2026-08-12T…` prefix in front of Together's own sentence reports a context limit of
+  8 tokens, which drives the client's `max_tokens` toward zero without converging. When
+  no pair survives those checks the phrase goes *last* in the message instead, so no
+  digit the provider sent sits where the extraction regex could read it as the pair. A
+  wrong pair is worse than no pair.
 - **Not every 4xx is a context-limit error.** Detection needs both a plausible status
   (400 or 413) and matching wording; reshaping a malformed request into a too-long claim
   would send the client shrinking and retrying forever. Only Together's wording is

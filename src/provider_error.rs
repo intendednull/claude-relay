@@ -10,6 +10,8 @@
 //! module, to emit the phrase Claude Code's recovery keys on, and Task 9A's
 //! escalation, which fires on the same condition.
 
+use std::ops::Range;
+
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
@@ -145,27 +147,79 @@ pub(crate) fn context_limit(status: StatusCode, message: &str) -> Option<Context
     if !matches!(status.as_u16(), 400 | 413) {
         return None;
     }
+    // Everything downstream reads the lowercased copy, never `message` itself:
+    // `to_lowercase` is not length-preserving (`İ` becomes two chars), so a byte
+    // offset found here would be the wrong offset — or not a char boundary — in
+    // the original. Digits and the markers are ASCII, so the copy answers every
+    // question this function asks.
     let lowered = message.to_lowercase();
-    CONTEXT_LIMIT_MARKERS
+    // First marker in list order that occurs, so the measured wording wins over
+    // the guesses when a message somehow carries both.
+    let marker = CONTEXT_LIMIT_MARKERS
         .iter()
-        .any(|marker| lowered.contains(marker))
-        .then(|| ContextLimit {
-            counts: token_counts(message),
-        })
+        .find_map(|marker| lowered.find(marker).map(|at| at..at + marker.len()))?;
+    Some(ContextLimit {
+        counts: token_counts(&lowered, marker),
+    })
 }
 
-/// The first two integers in the message, accepted only when the first exceeds
-/// the second — this failure means input over limit, and a pair that does not
-/// say that is not the pair. A run too large for `u64` yields no pair rather
-/// than a wrapped one.
-fn token_counts(message: &str) -> Option<(u64, u64)> {
-    let mut runs = message
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|run| !run.is_empty())
-        .map(str::parse::<u64>);
-    let tokens = runs.next()?.ok()?;
-    let limit = runs.next()?.ok()?;
+/// The two numbers the matched marker's own sentence is about: the last digit run
+/// before it, and the first after it.
+///
+/// Anchored to the marker rather than scanning from the start of the message,
+/// because anything an intermediary prepends otherwise *becomes* the pair. A
+/// LiteLLM sidecar, corporate proxy or CDN wrapper adding a request id or an ISO
+/// timestamp in front of Together's own sentence is enough to turn
+/// `(170071, 131072)` into `(2026, 8)` — and telling the client its context limit
+/// is 8 tokens drives `max_tokens` toward zero without ever converging, which is
+/// the loop this whole task exists to prevent. A wrong pair is worse than no pair
+/// (`docs/decisions.md`).
+fn token_counts(lowered: &str, marker: Range<usize>) -> Option<(u64, u64)> {
+    let before = &lowered[..marker.start];
+    let (tokens, tokens_end) = last_digit_run(before)?;
+    // The leading number has to be a count of *tokens*. The measured wording says
+    // "(170071 tokens) is longer than the model's context length", and requiring
+    // the word between the number and the marker is what stops a numeric model
+    // name — "Qwen3-480B has a maximum context length of …" — from being read as
+    // the input size. Unmeasured wording that omits it gets no pair, which is the
+    // safe direction to fail in.
+    if !before[tokens_end..].contains("token") {
+        return None;
+    }
+    let limit = first_digit_run(&lowered[marker.end..])?;
+    // This failure means input over limit; a pair that does not say that is not
+    // the pair, however well-placed it looked.
     (tokens > limit).then_some((tokens, limit))
+}
+
+/// The last ASCII digit run in `text`, and the byte offset just past it.
+///
+/// Byte-indexed on purpose: every byte of a digit run is ASCII, so both ends of
+/// the slice are char boundaries whatever else the message carries — where a
+/// `char`-based scan would have to trust that it never lands mid-sequence.
+fn last_digit_run(text: &str) -> Option<(u64, usize)> {
+    let bytes = text.as_bytes();
+    let end = bytes.iter().rposition(u8::is_ascii_digit)? + 1;
+    let start = bytes[..end]
+        .iter()
+        .rposition(|byte| !byte.is_ascii_digit())
+        .map_or(0, |at| at + 1);
+    digits(&bytes[start..end]).map(|value| (value, end))
+}
+
+fn first_digit_run(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(u8::is_ascii_digit)?;
+    let end = bytes[start..]
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .map_or(bytes.len(), |at| start + at);
+    digits(&bytes[start..end])
+}
+
+/// `None` for a run too large for `u64`, rather than a wrapped number.
+fn digits(run: &[u8]) -> Option<u64> {
+    std::str::from_utf8(run).ok()?.parse().ok()
 }
 
 #[cfg(test)]
@@ -227,16 +281,22 @@ mod tests {
         );
     }
 
+    /// The pair for a message, through the real seam rather than the parser
+    /// directly — the marker range the parser anchors to is the seam's to find.
+    fn counts(message: &str) -> Option<(u64, u64)> {
+        context_limit(StatusCode::BAD_REQUEST, message)?.counts
+    }
+
     /// A reversed pair is not this failure's pair: reporting it would tell the
     /// client its prompt was smaller than the limit it just exceeded.
     #[test]
     fn a_pair_that_does_not_say_input_over_limit_is_not_used() {
         assert_eq!(
-            token_counts("(131072 tokens) exceeded by (170071 tokens)"),
+            counts("The context window says (131072 tokens) exceeded by (170071 tokens)"),
             None
         );
         assert_eq!(
-            token_counts(
+            counts(
                 "The input (170071 tokens) is longer than the model's context length (131072 tokens)."
             ),
             Some((170071, 131072))
@@ -245,7 +305,92 @@ mod tests {
 
     #[test]
     fn an_integer_too_large_for_u64_yields_no_pair() {
-        assert_eq!(token_counts("99999999999999999999999 tokens > 10"), None);
+        assert_eq!(
+            counts(
+                "The input (99999999999999999999999 tokens) is longer than the model's context length (10 tokens)."
+            ),
+            None
+        );
+    }
+
+    /// The blocker this parser was rewritten for. Scanning the message from the
+    /// start took the first two digit runs anywhere in it, so anything an
+    /// intermediary prepends became the pair — and the timestamp case reported a
+    /// context limit of *8 tokens*, which drives `max_tokens` toward zero and never
+    /// converges. Anchoring to the matched marker is what makes a prefix
+    /// irrelevant. These are the reviewer's seven cases.
+    #[test]
+    fn a_prefix_an_intermediary_adds_cannot_become_the_token_pair() {
+        for (label, message) in [
+            (
+                "measured Together",
+                "The input (170071 tokens) is longer than the model's context length (131072 tokens).",
+            ),
+            (
+                "numeric request id",
+                "request 1234567890: The input (170071 tokens) is longer than the model's context length (131072 tokens).",
+            ),
+            (
+                "ISO timestamp",
+                "2026-08-12T12:00:00Z The input (170071 tokens) is longer than the model's context length (131072 tokens).",
+            ),
+            (
+                "trailing doc link",
+                "The input (170071 tokens) is longer than the model's context length (131072 tokens). See https://docs.example/errors#400",
+            ),
+        ] {
+            assert_eq!(
+                counts(message),
+                Some((170071, 131072)),
+                "{label} must still yield the provider's own pair"
+            );
+        }
+
+        // The other three degrade to no pair, which is the blessed outcome: the
+        // client retries blind rather than wrongly.
+        for (label, message) in [
+            (
+                "OpenAI wording, limit before input",
+                "This model's maximum context length is 131072 tokens. However, your messages resulted in 170071 tokens.",
+            ),
+            (
+                "numeric model name",
+                "Model Qwen3-480B has a maximum context length of 131072 tokens; the input was 170071 tokens.",
+            ),
+            (
+                "no digits at all",
+                "The input is longer than the model's context length.",
+            ),
+        ] {
+            assert_eq!(counts(message), None, "{label} must yield no pair");
+        }
+    }
+
+    /// The `token` requirement, which is what stops a numeric model name from
+    /// standing in for the input size when the wording puts the limit first.
+    #[test]
+    fn the_leading_number_has_to_be_a_count_of_tokens() {
+        assert_eq!(
+            counts("model-99999 has a maximum context length of 8192 tokens"),
+            None,
+            "a model name's digits are not an input size"
+        );
+        assert_eq!(
+            counts("sent 99999 tokens, past the maximum context length of 8192"),
+            Some((99999, 8192))
+        );
+    }
+
+    /// `to_lowercase` is not length-preserving, so a marker offset found in the
+    /// lowercased copy is the wrong offset in the original — and possibly not a
+    /// char boundary. Everything downstream reads the copy; this is the case that
+    /// would panic if it did not.
+    #[test]
+    fn a_message_whose_lowercasing_changes_its_length_does_not_panic() {
+        let message =
+            "İİİ sent 170071 tokens, longer than the model's context length (131072 tokens).";
+        assert!(message.to_lowercase().len() > message.len());
+        assert_eq!(counts(message), Some((170071, 131072)));
     }
 
     /// The failure this exists to prevent: a malformed request reshaped into a

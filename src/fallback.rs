@@ -398,15 +398,24 @@ async fn provider_error_response(
             Vec::new()
         }
     };
-    // The envelope necessarily reshapes what the provider sent, so the raw bytes
-    // have to stay findable by a human — the log is the place for that.
+    // Redacted once, here, before anything reads it. This body has *two* sinks —
+    // the log line below and the message that goes into the client's envelope —
+    // and redacting at each of them is how one of them ends up forgotten. Doing it
+    // to the bytes both share is the only version that cannot diverge. It also has
+    // to happen before the log's clip: redacting a clipped body leaves a key that
+    // straddles the boundary partially present, so the literal match misses and
+    // the truncated key is logged in cleartext.
+    let raw = redact_profile_key(raw, &profile.api_key_env);
+
+    // The envelope necessarily reshapes what the provider sent, so the bytes have
+    // to stay findable by a human — the log is the place for that.
     tracing::warn!(
         profile = profile_name,
         status = status.as_u16(),
         // No `%` sigil: that renders through `format_args!` unescaped, and this
         // value is provider-controlled, so a newline in it would forge a whole
         // record (`log_safety`). A plain field gets `record_str`'s escaping.
-        body = loggable_error_body(&raw, &profile.api_key_env),
+        body = clipped_for_log(&raw),
         "the fallback provider returned an error"
     );
 
@@ -427,22 +436,48 @@ async fn provider_error_response(
 /// clip cannot split a multi-byte boundary.
 const LOGGED_ERROR_BODY_CHARS: usize = 512;
 
-/// The profile's own key is the one credential that ever reaches this provider
-/// (spec §7b builds the outgoing headers from nothing else), and a provider is
-/// free to quote it back in an error. Redacted for the same reason
-/// `err.without_url()` is used above: this line must not be where a credential
-/// lands (Global Constraint 2).
-fn loggable_error_body(raw: &[u8], api_key_env: &str) -> String {
-    let clipped: String = String::from_utf8_lossy(raw)
+fn clipped_for_log(body: &[u8]) -> String {
+    String::from_utf8_lossy(body)
         .chars()
         .take(LOGGED_ERROR_BODY_CHARS)
-        .collect();
+        .collect()
+}
+
+/// The profile's own key is the one credential that ever reaches this provider
+/// (spec §7b builds the outgoing headers from nothing else), and a provider is
+/// free to quote it back in an error — an authentication failure is exactly the
+/// error most likely to. Redacted for the same reason `err.without_url()` is used
+/// above: neither the log nor the client's session transcript may be where a
+/// credential lands (Global Constraint 2).
+///
+/// Uncapped, and applied to the whole body: the client-visible message is not
+/// clipped, so a cap here would only decide how much of the key survives.
+fn redact_profile_key(body: Vec<u8>, api_key_env: &str) -> Vec<u8> {
     match std::env::var(api_key_env) {
-        // An empty or one-character value would redact the whole line into
-        // noise, and cannot be a real key.
-        Ok(key) if key.len() > 1 => clipped.replace(&key, "[REDACTED]"),
-        _ => clipped,
+        // A one-character value would redact every occurrence of that character
+        // and cannot be a real key.
+        Ok(key) if key.len() > 1 => replace_bytes(&body, key.as_bytes(), b"[REDACTED]"),
+        _ => body,
     }
+}
+
+/// `str::replace` over bytes, because an error body need not be valid UTF-8 while
+/// the key always is. The replacement only ever lands inside a JSON string value,
+/// and `[REDACTED]` carries nothing JSON treats specially, so a redacted body still
+/// parses as whatever it was.
+fn replace_bytes(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while let Some(at) = rest
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        out.extend_from_slice(&rest[..at]);
+        out.extend_from_slice(with);
+        rest = &rest[at + needle.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
 }
 
 /// Streams the upstream response through untouched. Used for a

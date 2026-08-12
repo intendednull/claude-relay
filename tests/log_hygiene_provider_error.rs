@@ -29,18 +29,42 @@ const HEAD: &str = "PROVIDER-SAID-THIS";
 /// Past `LOGGED_ERROR_BODY_CHARS`, so it must be clipped away.
 const TAIL: &str = "PAST-THE-CAP";
 
+/// How many chars of the straddling key copy sit inside the log's clip window.
+/// Enough that a clip-then-redact ordering leaves a recognisable fragment.
+const STRADDLE_INSIDE: usize = 20;
+
 /// A provider error that is not JSON at all — the realistic shape for a gateway
 /// sitting in front of the provider — carrying a real newline, a synthetic
-/// `proxied request` record behind it, the profile's own key, and enough padding
-/// to run past the cap.
+/// `proxied request` record behind it, the profile's own key twice, and enough
+/// padding to run past the cap.
+///
+/// The **second** key copy is positioned to straddle the log's 512-char clip
+/// boundary, with `STRADDLE_INSIDE` of its chars inside the window. That is the
+/// case a clip-then-redact ordering misses: the literal key is only partly present
+/// in the clipped string, the match fails, and the fragment is logged in cleartext.
+/// The first copy is redacted under either ordering and so proves nothing on its
+/// own.
 fn hostile_body() -> String {
-    format!(
+    let head = format!(
         "{HEAD} key={PROFILE_KEY}\n  2026-08-12T12:00:00.000000Z  INFO relay::proxy: \
          proxied request route=\"anthropic\" profile=\"-\" model_in=\"FORGED-BY-PROVIDER\" \
          model_out=\"FORGED-BY-PROVIDER\" method=POST path=\"/v1/messages\" status=200 \
-         latency_ms=1 response_bytes=1\n{padding}{TAIL}",
-        padding = "x".repeat(600)
-    )
+         latency_ms=1 response_bytes=1\n"
+    );
+    // 512 is `LOGGED_ERROR_BODY_CHARS`. The straddling copy is positioned against
+    // the *unredacted* body, because that is what a clip-then-redact ordering
+    // clips — only its first `STRADDLE_INSIDE` chars land inside that window.
+    let straddle_at = 512 - STRADDLE_INSIDE;
+    assert!(
+        head.chars().count() < straddle_at,
+        "the padding calculation assumes the header fits inside the clip window"
+    );
+    let padding = "x".repeat(straddle_at - head.chars().count());
+    // Correct redaction *shortens* the body — each key becomes `[REDACTED]` — which
+    // drags everything after it leftward, so `TAIL` needs enough slack to stay past
+    // the cap under both orderings rather than sliding inside it under the right one.
+    let tail_padding = "y".repeat(200);
+    format!("{head}{padding}{PROFILE_KEY} {tail_padding}{TAIL}")
 }
 
 #[tokio::test]
@@ -148,6 +172,15 @@ async fn a_provider_error_body_is_logged_capped_escaped_and_credential_free() {
             "captured logs leaked {secret:?}:\n{logs}"
         );
     }
+    // And no *fragment* of it either. This is the assertion that distinguishes
+    // redact-then-clip from clip-then-redact: the body carries a second key copy
+    // straddling the clip boundary, so a clipped-first body still holds its first
+    // `STRADDLE_INSIDE` chars in cleartext.
+    let fragment: String = PROFILE_KEY.chars().take(STRADDLE_INSIDE).collect();
+    assert!(
+        !logs.contains(&fragment),
+        "a key straddling the clip boundary leaked {fragment:?}:\n{logs}"
+    );
     assert!(
         logs.contains("[REDACTED]"),
         "the key must be redacted rather than merely clipped away:\n{logs}"

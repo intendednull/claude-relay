@@ -2552,3 +2552,51 @@ async fn an_unreadable_error_body_keeps_the_providers_status() {
         "the fallback provider returned an error with no message"
     );
 }
+
+/// Blocker 3 of fix round 1: the provider's error body has two sinks, and the
+/// client's is the one that lands in a session transcript. An authentication
+/// failure is exactly the error most likely to quote the offending key back, so
+/// the redaction has to cover the envelope and not only the log.
+#[tokio::test]
+async fn a_key_the_provider_quotes_back_never_reaches_the_client() {
+    // The profile's own key, echoed the way a provider reporting a bad credential
+    // plausibly would. `set_profile_keys` has already put `OPENAI_KEY` in the
+    // environment, so this is the real configured value, not a stand-in.
+    const ECHOED: &str = concat!(
+        r#"{"error":{"message":"Invalid API key provided: "#,
+        "together-key-for-the-openai-profile",
+        r#". Check your key at https://api.together.ai/settings/api-keys.","#,
+        r#""type":"invalid_request_error","code":"invalid_api_key"}}"#
+    );
+    // The literal above has to *be* the configured key for this test to mean
+    // anything; `concat!` cannot interpolate a const, so it is asserted instead.
+    assert!(
+        ECHOED.contains(OPENAI_KEY),
+        "the fixture must carry the configured key verbatim"
+    );
+
+    let relay = start_erroring(StatusCode::UNAUTHORIZED, ECHOED, None).await;
+    let (status, headers, body) = provider_error(relay).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers["x-relay-route"], "fallback");
+    assert_eq!(body["error"]["type"], "authentication_error");
+
+    let whole = body.to_string();
+    assert!(
+        !whole.contains(OPENAI_KEY),
+        "the profile's key reached the client: {whole}"
+    );
+    // Redacted, not merely dropped: the rest of the provider's sentence has to
+    // survive or the client is told nothing useful about why it failed.
+    let message = body["error"]["message"].as_str().expect("a message string");
+    assert!(
+        message.contains("[REDACTED]"),
+        "the key must be redacted in place: {message}"
+    );
+    assert!(
+        message.starts_with("Invalid API key provided:")
+            && message.contains("api.together.ai/settings/api-keys"),
+        "the provider's own sentence must survive around the redaction: {message}"
+    );
+}
