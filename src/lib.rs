@@ -4,6 +4,7 @@ pub mod config;
 pub(crate) mod control;
 pub mod detect;
 pub mod fallback;
+pub mod log_file;
 pub(crate) mod log_safety;
 pub mod notify;
 pub mod proxy;

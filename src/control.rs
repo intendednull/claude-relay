@@ -117,12 +117,30 @@ pub(crate) fn install_gate(router: Router<AppState>, config: &Config) -> Router<
         let bind_is_loopback = bind_is_loopback;
         async move {
             let is_control = request.uri().path().starts_with(CONTROL_PATH_PREFIX);
-            if !has_trustworthy_origin(request.headers()) {
+            if let Some(refused_by) = untrustworthy_origin_header(request.headers()) {
+                let status = if is_control {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::FORBIDDEN
+                };
+                // Otherwise this gate — the likeliest thing here to refuse a
+                // legitimate client nobody has tested — returns a bare 403 from
+                // the user's own proxy with no explanation anywhere.
+                //
+                // The refusing header's *name* and the status, never a value:
+                // an `Origin` is attacker-controlled, `tracing`'s `%` renders
+                // unescaped, and a client-controlled field has already forged a
+                // whole record in this codebase (`log_safety::safe_identifier`).
+                tracing::warn!(
+                    refused_by,
+                    status = status.as_u16(),
+                    "cross-origin request refused"
+                );
                 return if is_control {
-                    StatusCode::NOT_FOUND.into_response()
+                    status.into_response()
                 } else {
                     (
-                        StatusCode::FORBIDDEN,
+                        status,
                         Json(json!({ "error": "cross_origin_request_refused" })),
                     )
                         .into_response()
@@ -165,10 +183,21 @@ fn is_loopback_host(headers: &HeaderMap) -> bool {
 /// unaffected: `header_is_trustworthy` treats *absent* as fine and everything
 /// else it cannot positively validate — duplicated, not valid UTF-8, or
 /// present-but-rejected-by-`valid` — as a rejection, never a silent skip.
-fn has_trustworthy_origin(headers: &HeaderMap) -> bool {
-    header_is_trustworthy(headers, "sec-fetch-site", |site| {
+///
+/// Returns the *name* of the header that refused (`None` when both are
+/// trustworthy) rather than a bool, so the refusal's WARN can say which check
+/// fired without going anywhere near either value.
+fn untrustworthy_origin_header(headers: &HeaderMap) -> Option<&'static str> {
+    const SEC_FETCH_SITE: &str = "sec-fetch-site";
+    if !header_is_trustworthy(headers, SEC_FETCH_SITE, |site| {
         matches!(site, "same-origin" | "none")
-    }) && header_is_trustworthy(headers, header::ORIGIN.as_str(), is_loopback_origin)
+    }) {
+        return Some(SEC_FETCH_SITE);
+    }
+    if !header_is_trustworthy(headers, header::ORIGIN.as_str(), is_loopback_origin) {
+        return Some("origin");
+    }
+    None
 }
 
 /// Same discipline `is_loopback_host` already applies to `Host`, generalized
@@ -461,25 +490,28 @@ mod tests {
             header::ORIGIN,
             axum::http::HeaderValue::from_bytes(b"http://\xff").expect("valid header bytes"),
         );
-        assert!(!has_trustworthy_origin(&headers));
+        assert_eq!(untrustworthy_origin_header(&headers), Some("origin"));
 
         // Duplicate Origin, loopback first: taking "the first" would pass this.
         let mut headers = HeaderMap::new();
         headers.append(header::ORIGIN, "http://127.0.0.1".parse().unwrap());
         headers.append(header::ORIGIN, "http://evil.example".parse().unwrap());
-        assert!(!has_trustworthy_origin(&headers));
+        assert_eq!(untrustworthy_origin_header(&headers), Some("origin"));
 
         // Duplicate Sec-Fetch-Site, same-origin first.
         let mut headers = HeaderMap::new();
         headers.append("sec-fetch-site", "same-origin".parse().unwrap());
         headers.append("sec-fetch-site", "cross-site".parse().unwrap());
-        assert!(!has_trustworthy_origin(&headers));
+        assert_eq!(
+            untrustworthy_origin_header(&headers),
+            Some("sec-fetch-site")
+        );
 
         // Sanity: a single, valid header of each kind still passes.
         let mut headers = HeaderMap::new();
         headers.insert(header::ORIGIN, "http://127.0.0.1".parse().unwrap());
         headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
-        assert!(has_trustworthy_origin(&headers));
+        assert_eq!(untrustworthy_origin_header(&headers), None);
     }
 
     #[test]

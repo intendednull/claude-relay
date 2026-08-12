@@ -422,6 +422,11 @@ values, but that level turns on logging inside `hyper`/`reqwest` too, which
 is not written to that rule. It was verified harmless at the currently
 pinned versions — not a property to keep betting on across upgrades.
 
+`--log-file <PATH>` appends the same lines to a file (mode 600) as well as
+stderr, for a relay started detached; `RUST_LOG` filters both alike. It is
+capped at 10 MB, at which point it rotates to `<PATH>.1` — exactly one old file
+is kept, so the pair is bounded at ~20 MB.
+
 ## Development
 
 ```
