@@ -1,8 +1,9 @@
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use axum::http::uri::Authority;
 use indexmap::IndexMap;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -137,18 +138,69 @@ fn require_encrypted_transport(url: &reqwest::Url) -> Result<()> {
         return Ok(());
     }
     // `validated_base_url` already refused a URL with no host.
-    let host = url.host_str().unwrap_or_default();
-    let loopback = match host.trim_start_matches('[').trim_end_matches(']').parse() {
-        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
-        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
-        Err(_) => host == "localhost" || host.ends_with(".localhost"),
-    };
-    if !loopback {
+    if !host_str_is_loopback(url.host_str().unwrap_or_default()) {
         bail!(
             "`profiles.*.base_url` must be https for a non-loopback host — a profile's API key must not travel in cleartext"
         );
     }
     Ok(())
+}
+
+/// **The** answer to "is this host loopback", for both questions the relay asks
+/// it: whether a `base_url` may be plaintext `http` (above) and whether a
+/// `Host`/`Origin` may reach `/control` (`control.rs`). The two used to answer
+/// it separately and disagreed in both directions — `::ffff:127.0.0.1` was
+/// loopback to one and not the other, `foo.localhost` the reverse — because a
+/// review fixed the v4-mapped case in one place and it was never propagated
+/// (`docs/decisions.md`, D-2). One function so there is nothing left to
+/// propagate.
+///
+/// Textual, deliberately: no DNS lookup, so a name that merely *resolves* to
+/// loopback is still refused. That is why there is no `.localhost` suffix arm —
+/// RFC 6761 says resolvers should map it to loopback, but "should" is not
+/// "does", and trusting the suffix is the one classification here that would
+/// err *open* (a profile's API key travelling cleartext off-host under a
+/// resolver that ignores the RFC).
+///
+/// Takes `host[:port]`, with or without brackets around an IPv6 literal: a
+/// `Host` header carries a port and a `base_url`'s host does not, and a manual
+/// split on the last `:` mishandles a bracketed IPv6 host with no port, since
+/// the address itself contains colons.
+pub(crate) fn host_str_is_loopback(host: &str) -> bool {
+    // The `Host` header's grammar (RFC 9112) has no userinfo component —
+    // `host = uri-host [":" port]`, full stop — but `Authority::from_str` is
+    // lenient enough to parse `evil.tld@localhost` anyway, discarding
+    // everything before `@` as userinfo and reporting `.host() == "localhost"`.
+    // No compliant client ever sends `@` in a `Host` value, so its presence
+    // here is itself the signal to reject, before that leniency can matter.
+    if host.contains('@') {
+        return false;
+    }
+    let Ok(authority) = host.parse::<Authority>() else {
+        return false;
+    };
+    // `.host()` leaves brackets on (e.g. `"[::1]"`).
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    match host.parse::<IpAddr>() {
+        Ok(ip) => is_loopback_ip(ip),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// A v4-mapped IPv6 literal (`::ffff:127.0.0.1`) is still loopback, which
+/// `Ipv6Addr::is_loopback` alone says no to: without this a genuinely
+/// loopback-only bind written that way gets no control surface at all, and a
+/// local mock reachable only under that spelling cannot be used without https.
+pub(crate) fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
 }
 
 /// Failover policy and the moved-from-`[detect]` horizon/jitter settings
@@ -780,6 +832,47 @@ mod tests {
         }
     }
 
+    /// D-2: the whole point of this function is that `control.rs`'s
+    /// `Host`/`Origin` gate and `require_encrypted_transport` cannot disagree
+    /// again, so the classification is pinned here once, in the module that
+    /// owns it, and `control.rs`'s own tests exercise the same function through
+    /// its callers. The two rows that used to differ are called out.
+    #[test]
+    fn one_loopback_classification_answers_both_callers() {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.1:8484",
+            "127.5.5.5",
+            "[::1]",
+            "[::1]:8484",
+            "localhost",
+            "localhost:8484",
+            "LOCALHOST",
+            // Previously loopback to `control.rs` and not to `config.rs`.
+            "[::ffff:127.0.0.1]",
+            "[::ffff:127.0.0.1]:8484",
+        ] {
+            assert!(host_str_is_loopback(host), "{host} should be loopback");
+        }
+        for host in [
+            "evil.example",
+            "evil.example:8484",
+            "10.0.0.5",
+            "0.0.0.0:8484",
+            "127.0.0.1.evil.example",
+            // Previously loopback to `config.rs` and not to `control.rs`; the
+            // one arm of the four that erred open.
+            "foo.localhost",
+            "localhost.evil.example",
+            // No compliant `Host` carries userinfo, and `Authority` would
+            // otherwise report this one's host as `localhost`.
+            "evil.tld@localhost",
+            "",
+        ] {
+            assert!(!host_str_is_loopback(host), "{host} must not be loopback");
+        }
+    }
+
     // --- [profiles.*] ---
 
     fn profile(format: &str) -> ProfileConfig {
@@ -853,6 +946,10 @@ mod tests {
             "http://127.0.0.1:8080",
             "http://[::1]:8080",
             "http://localhost:8080",
+            // D-2: genuinely loopback, and refused here until this question
+            // got one answer instead of two. A local mock reachable only under
+            // that spelling cannot serve https.
+            "http://[::ffff:127.0.0.1]:8080",
         ] {
             profile_with_base_url(allowed)
                 .validate()
@@ -864,6 +961,12 @@ mod tests {
             // lookup happens at startup, so this is the only honest answer.
             "http://127.0.0.1.example.com",
             "http://10.0.0.5:8080",
+            // D-2, the other direction: accepted here until this question got
+            // one answer. RFC 6761 says a resolver *should* map it to loopback;
+            // under one that does not, a profile's API key would travel
+            // cleartext off-host, and this was the only arm that erred open.
+            "http://foo.localhost",
+            "http://evil.example.localhost:8080",
         ] {
             let err = profile_with_base_url(refused)
                 .validate()

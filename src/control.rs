@@ -41,10 +41,7 @@
 //! the actual improvement — not "gated regardless of what `build_router`
 //! does henceforth".
 
-use std::net::IpAddr;
-
 use axum::extract::{Request, State};
-use axum::http::uri::Authority;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -54,7 +51,10 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::config::Config;
+// D-2: "is this host loopback" is one function, in `config`, used by both the
+// `base_url` transport check there and this module's `Host`/`Origin` gate. The
+// two used to answer it separately and disagreed.
+use crate::config::{Config, host_str_is_loopback, is_loopback_ip};
 use crate::notify::NotifyEvent;
 use crate::state::AppState;
 
@@ -72,19 +72,6 @@ pub(crate) fn enabled(config: &Config) -> bool {
     config
         .listen_addr()
         .is_ok_and(|addr| is_loopback_ip(addr.ip()))
-}
-
-fn is_loopback_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        // A v4-mapped IPv6 literal (`::ffff:127.0.0.1`) is still loopback:
-        // without this, a genuinely loopback-only bind written that way would
-        // get no control surface at all (fail closed, so a usability wart
-        // rather than a hole, but still wrong).
-        IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
-    }
 }
 
 /// `/control/*`'s two routes. Registering them buys nothing on its own —
@@ -168,34 +155,6 @@ fn is_loopback_host(headers: &HeaderMap) -> bool {
         return false;
     };
     host_str_is_loopback(host)
-}
-
-/// `Authority` parses `host[:port]`, including a bracketed IPv6 literal with
-/// or without a port — a manual split on the last `:` mishandles a bracketed
-/// IPv6 host with no port, since the address itself contains colons.
-fn host_str_is_loopback(host: &str) -> bool {
-    // The `Host` header's grammar (RFC 9112) has no userinfo component —
-    // `host = uri-host [":" port]`, full stop — but `Authority::from_str` is
-    // lenient enough to parse `evil.tld@localhost` anyway, discarding
-    // everything before `@` as userinfo and reporting `.host() == "localhost"`.
-    // No compliant client ever sends `@` in a `Host` value, so its presence
-    // here is itself the signal to reject, before that leniency can matter.
-    if host.contains('@') {
-        return false;
-    }
-    let Ok(authority) = host.parse::<Authority>() else {
-        return false;
-    };
-    // `.host()` leaves brackets on (e.g. `"[::1]"`); trimmed the same way
-    // `config.rs`'s `require_encrypted_transport` does.
-    let host = authority
-        .host()
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    match host.parse::<IpAddr>() {
-        Ok(ip) => is_loopback_ip(ip),
-        Err(_) => host.eq_ignore_ascii_case("localhost"),
-    }
 }
 
 /// `Sec-Fetch-Site`/`Origin` are attached by every current browser and
