@@ -69,7 +69,8 @@ impl ProfileConfig {
     }
 
     /// An unrecognized `format`, a `base_url` that can't route a request
-    /// (see `base_url`) or would carry the profile's key in cleartext (see
+    /// (see `base_url`), carries userinfo (see `reject_userinfo`) or would
+    /// carry the profile's key in cleartext (see
     /// `require_encrypted_transport`), a `serves` entry that is an empty
     /// string (which would `starts_with`-match every non-`claude-*` model,
     /// silently shadowing every profile declared after it), and an empty
@@ -84,7 +85,9 @@ impl ProfileConfig {
                 self.format
             );
         }
-        require_encrypted_transport(&self.base_url()?)?;
+        let base_url = self.base_url()?;
+        reject_userinfo(&base_url)?;
+        require_encrypted_transport(&base_url)?;
         if self.serves.iter().any(String::is_empty) {
             bail!(
                 "`profiles.*.serves` entries must not be empty — an empty prefix matches every model name"
@@ -97,6 +100,27 @@ impl ProfileConfig {
         }
         Ok(())
     }
+}
+
+/// A credential written here does not authenticate anything and never reaches
+/// the wire: reqwest strips userinfo out of the URI at request-build time and
+/// only synthesizes a `Basic` header when `Authorization` is unset, which
+/// `fallback::outgoing_headers` always sets. It was probed on the wire, and it
+/// does not surface through a `reqwest::Error` either. So this closes no
+/// disclosure — it removes a field that silently swallows a secret and leaves
+/// it in the config file, where the only thing standing between it and a log
+/// line is every future log line remembering not to print `base_url`.
+///
+/// Refusing it cannot break a working deployment, precisely because the feature
+/// provably never worked.
+fn reject_userinfo(url: &reqwest::Url) -> Result<()> {
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!(
+            "`profiles.*.base_url` must not carry userinfo — a credential there is silently \
+             discarded; put the key in the env var named by `api_key_env`"
+        );
+    }
+    Ok(())
 }
 
 /// A profile's `base_url` is where its own API key travels, so plaintext
@@ -880,6 +904,41 @@ mod tests {
                 "error leaked a credential from base_url: {rendered}"
             );
             assert!(rendered.contains("profiles.*.base_url"));
+        }
+    }
+
+    /// Not a disclosure fix: the userinfo never reaches the wire (reqwest
+    /// strips it, and `outgoing_headers` always sets `Authorization`, so no
+    /// `Basic` header is ever synthesized). What it removes is a config field
+    /// that accepts a secret, silently discards it, and leaves it in the file
+    /// for a future log line to find.
+    #[test]
+    fn a_profiles_base_url_must_not_carry_userinfo() {
+        let secret = "sk-together-DO-NOT-ECHO-THIS";
+        for base_url in [
+            format!("https://user:{secret}@api.together.ai"),
+            format!("https://{secret}@api.together.ai"),
+            format!("http://user:{secret}@127.0.0.1:8080"),
+        ] {
+            let err = profile_with_base_url(&base_url)
+                .validate()
+                .expect_err("userinfo in a base_url must not pass startup validation");
+            let rendered = format!("{err:?}");
+            assert!(
+                rendered.contains("userinfo") && rendered.contains("api_key_env"),
+                "the error must say what to do instead: {rendered}"
+            );
+            assert!(
+                !rendered.contains(secret),
+                "the error echoed the discarded credential: {rendered}"
+            );
+        }
+        // The same hosts without userinfo stay valid, so this rejects the
+        // userinfo and not the URL.
+        for base_url in ["https://api.together.ai", "http://127.0.0.1:8080"] {
+            profile_with_base_url(base_url)
+                .validate()
+                .unwrap_or_else(|err| panic!("{base_url} should be accepted: {err}"));
         }
     }
 

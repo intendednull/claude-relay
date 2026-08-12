@@ -1,7 +1,7 @@
 //! The `/control/*` half of Global Constraint 2: this surface must never
 //! read, let alone return or log, a profile's API key *value* — only its
 //! `api_key_env` name, which is not a secret — and it must not leak a second
-//! credential-bearing field, `base_url`'s userinfo, either. A separate binary
+//! credential-bearing field, a secret embedded in `base_url`, either. A separate binary
 //! from `log_hygiene.rs`/`log_hygiene_fallback.rs` for the same reason those
 //! two are already split: the tracing subscriber is process-global.
 
@@ -19,13 +19,14 @@ const KEYED_SECRET: &str = "tgp-DO-NOT-LEAK-THIS-CONTROL-SECRET";
 /// Deliberately never set: proves `/control/*` does not need the value to
 /// exist at all, which it would if any handler read it.
 const UNSET_ENV: &str = "RELAY_TEST_LOG_HYGIENE_CONTROL_KEY_NEVER_SET";
-/// Embedded in a profile's `base_url` userinfo — a second, independent place
-/// a real credential travels (`docs/decisions.md`), distinct from
-/// `api_key_env`'s value above. `ProfileConfig::validate` checks `base_url`'s
-/// scheme and host but never inspects userinfo, so `http://user:<secret>@host`
-/// is a legal configured value, not a fixture that could never occur — and
-/// `ProfileView` (`src/control.rs`) must keep `base_url` out of its response
-/// entirely, not merely redact it.
+/// Embedded in a profile's `base_url` — the other credential-bearing field on
+/// a profile, distinct from `api_key_env`'s value above. It sits in the *path*
+/// rather than the userinfo: userinfo is refused at startup as of fix wave A
+/// (`ProfileConfig::validate`), which leaves a path or query as the way a
+/// configured, validation-passing `base_url` can still carry a secret — a
+/// provider whose endpoint embeds a token is an ordinary shape. `ProfileView`
+/// (`src/control.rs`) must therefore keep `base_url` out of its response
+/// entirely, not merely redact a userinfo component.
 const URL_SECRET: &str = "sk-DO-NOT-LEAK-THIS-URL-SECRET";
 
 fn profile(base_url: String, api_key_env: &str) -> ProfileConfig {
@@ -86,7 +87,7 @@ async fn control_never_requires_or_leaks_a_profiles_api_key_value() {
     let mut profiles = IndexMap::new();
     profiles.insert(
         "keyed".to_string(),
-        profile(format!("http://user:{URL_SECRET}@{a}"), KEYED_ENV),
+        profile(format!("http://{a}/{URL_SECRET}"), KEYED_ENV),
     );
     profiles.insert(
         "unkeyed".to_string(),
@@ -109,7 +110,7 @@ async fn control_never_requires_or_leaks_a_profiles_api_key_value() {
     );
     assert!(
         !listing.contains(URL_SECRET),
-        "GET /control/profiles leaked base_url's userinfo: {listing}"
+        "GET /control/profiles leaked a secret from base_url: {listing}"
     );
 
     // Switching to (and listing while active) the profile whose key does not

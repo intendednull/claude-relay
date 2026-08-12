@@ -259,9 +259,10 @@ struct ProfileView<'a> {
     model_map: &'a IndexMap<String, String>,
     /// The env var's *name*, never its value — this response must never
     /// carry a credential (Global Constraint 2). `base_url` is deliberately
-    /// not a field here at all: a configured `base_url` can carry a
-    /// credential in its own userinfo (`docs/decisions.md`), a second,
-    /// independent way this response must not leak one.
+    /// not a field here at all: a configured `base_url` can carry a secret of
+    /// its own in its path or query (userinfo is refused at startup — see
+    /// `config::reject_userinfo`), a second, independent way this response
+    /// must not leak one.
     api_key_env: &'a str,
     active: bool,
 }
