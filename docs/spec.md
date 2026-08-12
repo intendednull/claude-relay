@@ -381,24 +381,46 @@ unchanged) is **retried against the next larger model before anything reaches th
   `escalation_order` does not name has no ladder position and does not climb. Neither does
   a request routed here by name (§7d): the client picked that model itself, and swapping it
   for another would be wrong behaviour rather than a recovery.
-- **Bounded, because every hop is a whole upstream request the operator pays for.** The
-  ladder is walked at most once and only upward, never revisiting a rung; a rung whose
-  target this request has already been sent to is skipped, which matters because two slots
-  may point at one model. On the last rung the client gets §7d's translated error,
-  unchanged — escalation failing is not a reason to lose the recovery it already had.
-- **Turning it on cannot make a response worse than leaving it off.** A hop that
-  produces no response at all (its connection fails) is answered with the error the rung
-  below produced, not with the relay's own `upstream_unreachable`: the client would
-  otherwise trade an actionable Anthropic error for a relay-internal code, purely because
-  the relay tried to help. A hop that *does* respond is reported as itself — the freshest
-  truth wins where there is one, and it is already Anthropic-shaped and status-preserving.
+- **Bounded, because every hop is a whole upstream request the operator pays for.** Each
+  rung is visited at most once and only upward, never revisiting one; a rung whose target
+  this request has already been sent to is skipped, which matters because two slots may
+  point at one model. **The bound per request is therefore one upstream request per rung at
+  or above the starting slot — three under the default order, not two.** On the last rung
+  the client gets §7d's translated error, reporting the model that finally refused —
+  escalation failing is not a reason to lose the recovery it already had.
+- **Only positive evidence of an *input* overflow may spend money.** Detection firing is
+  not that evidence: the same markers match a body saying the *output reservation* did not
+  fit (measured, a 35k transcript with a 160k `max_tokens`), and that case is already fixed
+  for free by the client shrinking `max_tokens` on §7d's error, so escalating it pre-empts
+  the free fix and buys a billed inference. The condition is a parsed token pair, which
+  §7d's anchored parser yields only for a count that precedes the matched wording and
+  exceeds the number after it. The cost, taken knowingly and in the safe direction of §7d's
+  own asymmetry: a genuine overflow worded limit-first, or with thousands separators, gets
+  the translated error and no hop.
+- **A hop's answer replaces the rung below's only if it is at least as final.** Two
+  cases where it is not, and the rung below's answer goes out instead: a hop that produces
+  no response at all (its connection fails), where the alternative is trading an actionable
+  Anthropic error for the relay's own `upstream_unreachable`; and a hop whose status the
+  client would simply retry (408, 409, 429, any 5xx), where — measured — the client retried
+  with backoff and **every retry re-walked the whole ladder**, turning a one-shot failure
+  into unbounded request amplification that nothing in the relay can bound, because the
+  loop is the client's.
+
+  A hop that fails **terminally** does report itself, even when that is less useful than
+  the rung below's error: a rung pointing at a retired `model_map` target surfaces its 404,
+  because it cannot amplify and masking it would hide the misconfiguration. So the
+  invariant is *not* "escalation can never make the answer worse" — it is that escalation
+  never leaves the client with something it can only retry, and never with a relay-internal
+  code in place of the provider's.
 - **Never mid-response.** The decision is made where a provider's status has arrived and
   no byte of a response exists, so a context limit that arrives *inside* a 200 stream is
   never escalated — it terminates the stream as §6 already requires.
 - **Every hop logs at INFO**, naming the model that could not fit, the model being tried,
   and that a context limit is the reason, so a bill for the largest model configured is
-  explainable after the fact. Model names only, never request content. Each attempt also
-  keeps its own §9 line, as a detect-time re-route already does.
+  explainable after the fact. Model names only, never request content. Each attempt that
+  received a response also keeps its own §9 line, as a detect-time re-route already does —
+  a hop that received none has no status, so it has neither a line nor a
+  `fallback_requests_served` increment.
 - **`policy.escalate_on_context_limit = false`** restores the older behaviour, where the
   translated error goes straight to the client.
 

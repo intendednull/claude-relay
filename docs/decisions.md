@@ -1466,14 +1466,47 @@ detect-time re-route already did; and `fallback_requests_served` counts attempts
 client requests, since an escalated request really did cost two calls and that counter
 is where an operator investigating a bill looks.
 
-**One thing escalation could have made worse, and does not.** A retry introduces a
-failure mode the request did not have: the hop's connection can fail. Answering that
-with the relay's own `upstream_unreachable` would hand the client a
-relay-internal shape in place of an actionable Anthropic error it had already earned —
-worse than not escalating at all, and only because the relay tried to help. So the rung
-below's failure is carried while a hop is in flight and answered with when the hop
-produces no response at all. A hop that *does* respond is reported as itself, including
-a 500 from the larger model: the freshest truth wins where there is one, it is already
-Anthropic-shaped and status-preserving, and reporting a stale error over a fresh one
-would mislead in the other direction. The invariant worth stating is that turning the
-feature on cannot leave the client with a worse answer than leaving it off.
+**What a hop is allowed to do to the answer the client ends up with.** A retry
+introduces failure modes the request did not have, and two of them are worse for the
+client than not escalating at all:
+
+- **The hop's connection fails.** Answering with the relay's own `upstream_unreachable`
+  would hand back a relay-internal shape in place of an actionable Anthropic error the
+  client had already earned, purely because the relay tried to help.
+- **The hop answers with a status the client retries** (408, 409, 429, any 5xx).
+  Measured: with the rung above answering 429, the client received a 429 in place of a
+  terminal 400, retried with backoff, and **every retry re-walked the whole ladder** — a
+  one-shot failure became unbounded request amplification, and nothing in the relay can
+  bound it, because the loop belongs to the client.
+
+So the rung below's failure is carried while a hop is in flight, and it is what goes out
+in both cases. A hop that fails **terminally** reports itself instead, even when that is
+less useful: a rung pointing at a retired `model_map` target surfaces its 404 rather than
+"prompt is too long", because a terminal answer cannot amplify and masking it would hide
+a misconfigured rung while the operator paid for the hop.
+
+**The invariant is therefore narrower than the one first written here, and the first one
+was false.** It is not "escalation can never leave the client with a worse answer" — one
+mistyped model name in `model_map` is a counterexample. It is that escalation never
+leaves the client with something it can only retry, and never with a relay-internal code
+in place of the provider's own error.
+
+**Only positive evidence of an *input* overflow may spend money — detection firing is
+not that evidence.** Measured, a vLLM-shaped body reads "maximum context length is
+131072 tokens. However, you requested 195000 tokens (35000 in the messages, 160000 in
+the completion)": the markers match, but the transcript is 35k and fits the small model
+comfortably. Only the output *reservation* does not — and that case is already fixed for
+free by the client shrinking `max_tokens` on the translated error, as this entry's own
+runner-up argues. Escalating it pre-empts the free fix and buys a billed inference on a
+larger model, which then *succeeds* and reserves 160k output tokens at that model's
+price. So the condition is a parsed token pair, which the anchored parser yields only
+for a count that precedes the matched wording and exceeds the number after it.
+
+The cost is taken knowingly, in the safe direction of the same asymmetry that decided
+detection: a genuine overflow worded limit-first ("your messages resulted in 170071
+tokens"), or written with thousands separators, gets the translated error and no hop —
+which is what happened before this feature existed. A false negative costs that; a false
+positive costs money. One residual is recorded rather than closed: a reservation wording
+that happens to put a total count *before* the marker still looks like an input overflow.
+Narrowing that needs a matcher for reservation wording, which would be a guess at wording
+no capture here contains.
