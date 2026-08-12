@@ -615,6 +615,16 @@ mod tests {
     /// by mutation (see the fix-round report) rather than by a second
     /// assertion in this file, since the inversion lives in production code
     /// this test cannot reach into.
+    ///
+    /// Constructing that mutation carefully matters: the "obvious" way to
+    /// invert the check (`if let Some(event) = lock().take() { run(event);
+    /// continue; }`) *also* introduces Y5's separate lock-across-the-hook
+    /// bug via `if let`'s temporary lifetime extension, which blocks every
+    /// flood thread for the hook's whole duration and let the worker win an
+    /// unrelated re-lock race once released — that confound made an early
+    /// draft of this mutation pass by accident. The real acceptance-check
+    /// mutation binds the lock's result to a plain `let` first (as the real
+    /// code does), so only the ordering changes.
     #[test]
     fn a_live_flood_of_switches_does_not_delay_a_transition_queued_mid_flood() {
         let log = temp_path("live-flood");
@@ -645,10 +655,17 @@ mod tests {
             }));
         }
 
-        // Let the flood get going before the transition is queued — the
-        // point is that it is still running when that happens, not that it
-        // ran first and finished.
-        thread::sleep(Duration::from_millis(300));
+        // Longer than `SWITCH_CHECK_INTERVAL`, not just "let the flood get
+        // going": if the worker's very first slot-check loses the race
+        // against the flood's first write (a real possibility at thread
+        // startup, before any flood thread has run even once), it commits to
+        // one `recv_timeout` wait before ever re-checking the slot. Sending
+        // the transition inside that window would let it through by
+        // accident, independent of whatever priority the worker actually
+        // gives the slot — this margin ensures the worker has already found
+        // the slot populated (and settled into steady state) at least once
+        // before the transition is ever queued.
+        thread::sleep(SWITCH_CHECK_INTERVAL * 2);
         let started = Instant::now();
         notifier.notify(transition(RouteState::Active, limited(3600)));
 
