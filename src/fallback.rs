@@ -21,7 +21,7 @@ use futures_core::Stream;
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 
-use crate::config::ProfileConfig;
+use crate::config::{PolicyConfig, ProfileConfig};
 use crate::provider_error::ProviderError;
 use crate::proxy::{CountingStream, ERROR_BODY_CAP, RequestLog, elapsed_ms, forwardable};
 use crate::state::AppState;
@@ -59,25 +59,25 @@ pub async fn forward(
     request: FallbackRequest<'_>,
 ) -> Response {
     let profile = request.profile;
-    let target_model = if request.remap {
-        remap_model(request.model, &profile.model_map)
+    // The slot exists only where the remap happened. A request routed here by
+    // name (§7d) keeps the name the client chose, so there is no alias slot to
+    // climb from and it gets no ladder: silently swapping a hand-picked
+    // `/model moonshotai/…` for a different model would be wrong behavior, and
+    // that case keeps 9B's error translation and nothing more (spec §7e).
+    let (mut target_model, slot) = if request.remap {
+        resolve_model(request.model, &profile.model_map)
     } else {
-        request.model.to_string()
+        (request.model.to_string(), None)
     };
+    let mut ladder = Ladder::new(
+        &state.config.policy,
+        &profile.model_map,
+        slot,
+        target_model.clone(),
+    );
 
     let translated = profile.format == "openai";
-    let prepared = if translated {
-        translate::request_to_openai(&body, &target_model).map(|request| Prepared {
-            body: request.body,
-            stream: request.stream,
-        })
-    } else {
-        passthrough_body(&body, &target_model).map(|body| Prepared {
-            body,
-            stream: false,
-        })
-    };
-    let prepared = match prepared {
+    let mut prepared = match prepare(&body, &target_model, translated) {
         Ok(prepared) => prepared,
         Err(err) => {
             tracing::warn!(
@@ -105,116 +105,278 @@ pub async fn forward(
     };
 
     let target = endpoint(profile, &path, translated);
-    let upstream = state
-        .http
-        .request(method.clone(), target)
-        .headers(headers)
-        .body(prepared.body)
-        .send()
-        .await;
-
-    let upstream = match upstream {
-        Ok(upstream) => upstream,
-        Err(err) => {
-            tracing::warn!(
-                profile = request.profile_name,
-                method = %method,
-                path = %path,
-                latency_ms = elapsed_ms(start),
-                // `without_url` keeps a credential embedded in `base_url` out
-                // of the log, exactly as on the Anthropic route.
-                error = %err.without_url(),
-                "fallback upstream request failed"
-            );
-            return fallback_error(StatusCode::BAD_GATEWAY, "upstream_unreachable");
-        }
-    };
-
-    state
-        .fallback_requests_served
-        .fetch_add(1, Ordering::Relaxed);
-
-    let status = upstream.status();
-    let log = RequestLog {
-        route: "fallback",
-        profile: Some(request.profile_name.to_string()),
-        model_in: Some(request.model.to_string()),
-        model_out: Some(target_model),
-        method,
-        path,
-        status,
-        latency_ms: elapsed_ms(start),
-    };
-
-    // A fallback response says nothing about Anthropic's route state, so
-    // neither `route_updates` nor `--capture-errors` (whose fixtures exist to
-    // derive Anthropic detection rules from) hears about it. A 429 from the
-    // fallback provider must not put the Anthropic route into `Limited`, and a
-    // 200 from it must not recover the route out of it.
-    if !status.is_success() {
-        return provider_error_response(profile, request.profile_name, status, upstream, log).await;
-    }
-
-    if !translated {
-        return passthrough_response(status, upstream, log);
-    }
 
     // Read once here rather than per-chunk: a config reload mid-stream must not
     // change the shape of a message already in flight.
     let surface_reasoning = state.config.policy.surface_fallback_reasoning;
 
-    if prepared.stream {
-        let body = Body::from_stream(CountingStream::new(
-            Box::pin(NeverFails(Box::pin(translate::sse_stream(
-                upstream.bytes_stream(),
-                surface_reasoning,
-            )))),
-            log,
-        ));
-        let mut response = Response::new(body);
-        // The upstream's own 2xx, not a flat 200: a provider that answers 206
-        // or 202 is saying something the client should see.
+    // One iteration per upstream attempt. A second iteration happens only where
+    // the escalation branch below asks for one, and only ever up the ladder —
+    // `Ladder::next_target` consumes the rung it returns.
+    loop {
+        let Prepared {
+            body: outgoing,
+            stream,
+        } = prepared;
+        let upstream = state
+            .http
+            .request(method.clone(), target.clone())
+            .headers(headers.clone())
+            .body(outgoing)
+            .send()
+            .await;
+
+        let upstream = match upstream {
+            Ok(upstream) => upstream,
+            Err(err) => {
+                tracing::warn!(
+                    profile = request.profile_name,
+                    method = %method,
+                    path = %path,
+                    latency_ms = elapsed_ms(start),
+                    // `without_url` keeps a credential embedded in `base_url` out
+                    // of the log, exactly as on the Anthropic route.
+                    error = %err.without_url(),
+                    "fallback upstream request failed"
+                );
+                return fallback_error(StatusCode::BAD_GATEWAY, "upstream_unreachable");
+            }
+        };
+
+        // Counted per upstream attempt, like §9's log line: an escalated request
+        // really did cost the operator two calls to the provider, and a counter
+        // that reported one would hide the half that surprises them on the bill.
+        state
+            .fallback_requests_served
+            .fetch_add(1, Ordering::Relaxed);
+
+        let status = upstream.status();
+        let log = RequestLog {
+            route: "fallback",
+            profile: Some(request.profile_name.to_string()),
+            model_in: Some(request.model.to_string()),
+            model_out: Some(target_model.clone()),
+            method: method.clone(),
+            path: path.clone(),
+            status,
+            latency_ms: elapsed_ms(start),
+        };
+
+        // A fallback response says nothing about Anthropic's route state, so
+        // neither `route_updates` nor `--capture-errors` (whose fixtures exist to
+        // derive Anthropic detection rules from) hears about it. A 429 from the
+        // fallback provider must not put the Anthropic route into `Limited`, and a
+        // 200 from it must not recover the route out of it.
+        if !status.is_success() {
+            let failure =
+                read_provider_error(profile, request.profile_name, status, upstream).await;
+
+            // Spec §7e. This is the only point on this route where escalation is
+            // decidable, and that is what makes the mid-stream prohibition
+            // structural rather than a rule to remember: an HTTP status arrives
+            // before its body, so at this line not one byte has been written
+            // toward the client. Every path that sends one is below and returns,
+            // and none of them can be re-entered from here — so a context-limit
+            // error that arrives *inside* a 200 stream is never escalated, the
+            // same rule `a_fallback_stream_that_dies_mid_response_is_never_retried`
+            // already holds for a mid-stream death.
+            //
+            // Only that detection fired matters, never `ContextLimit::counts`: a
+            // prompt that did not fit needs a bigger model whether or not the
+            // provider's wording let the pair be parsed.
+            if failure.error.context_limit.is_some()
+                && let Some(next) = ladder.next_target()
+            {
+                match prepare(&body, &next, translated) {
+                    Ok(next_prepared) => {
+                        tracing::info!(
+                            profile = request.profile_name,
+                            // Both are `model_map` *values*, never client text: a
+                            // target with no slot behind it has no rung and cannot
+                            // reach here. Plain fields regardless, so neither can
+                            // forge a record. No request content, ever.
+                            from_model = target_model.as_str(),
+                            to_model = next.as_str(),
+                            reason = "context_limit",
+                            "the fallback model could not fit the prompt; retrying one rung up"
+                        );
+                        // §9's line for the attempt that just failed, carrying the
+                        // model that failed — the same shape the Anthropic route's
+                        // re-routed attempt emits before handing over (`proxy`).
+                        log.emit(failure.upstream_bytes);
+                        target_model = next;
+                        prepared = next_prepared;
+                        continue;
+                    }
+                    Err(err) => {
+                        // Not a 502: the client already has a usable answer — 9B's
+                        // translated context-limit error, which is the recovery it
+                        // would have had without this feature. Losing that to
+                        // report a relay-side failure would be a downgrade.
+                        tracing::warn!(
+                            profile = request.profile_name,
+                            error = %err,
+                            "could not prepare the escalated request; answering with the provider's error"
+                        );
+                    }
+                }
+            }
+            return failure.into_response(log);
+        }
+
+        if !translated {
+            return passthrough_response(status, upstream, log);
+        }
+
+        if stream {
+            let body = Body::from_stream(CountingStream::new(
+                Box::pin(NeverFails(Box::pin(translate::sse_stream(
+                    upstream.bytes_stream(),
+                    surface_reasoning,
+                )))),
+                log,
+            ));
+            let mut response = Response::new(body);
+            // The upstream's own 2xx, not a flat 200: a provider that answers 206
+            // or 202 is saying something the client should see.
+            *response.status_mut() = status;
+            *response.headers_mut() = translated_headers("text/event-stream");
+            response
+                .headers_mut()
+                .insert("cache-control", HeaderValue::from_static("no-cache"));
+            return response;
+        }
+
+        let raw = match read_capped(upstream, RESPONSE_CAP).await {
+            Ok(raw) => raw,
+            Err(reason) => {
+                tracing::warn!(
+                    profile = request.profile_name,
+                    reason,
+                    "fallback response unusable"
+                );
+                return fallback_error(StatusCode::BAD_GATEWAY, "fallback_response_unreadable");
+            }
+        };
+        let anthropic = match translate::response_to_anthropic(&raw, surface_reasoning) {
+            Ok(anthropic) => anthropic,
+            Err(err) => {
+                tracing::warn!(
+                    profile = request.profile_name,
+                    error = %err,
+                    "fallback response untranslatable"
+                );
+                return fallback_error(StatusCode::BAD_GATEWAY, "fallback_response_untranslatable");
+            }
+        };
+        log.emit(anthropic.len() as u64);
+
+        let mut response = Response::new(Body::from(anthropic));
         *response.status_mut() = status;
-        *response.headers_mut() = translated_headers("text/event-stream");
-        response
-            .headers_mut()
-            .insert("cache-control", HeaderValue::from_static("no-cache"));
+        *response.headers_mut() = translated_headers("application/json");
         return response;
     }
-
-    let raw = match read_capped(upstream, RESPONSE_CAP).await {
-        Ok(raw) => raw,
-        Err(reason) => {
-            tracing::warn!(
-                profile = request.profile_name,
-                reason,
-                "fallback response unusable"
-            );
-            return fallback_error(StatusCode::BAD_GATEWAY, "fallback_response_unreadable");
-        }
-    };
-    let anthropic = match translate::response_to_anthropic(&raw, surface_reasoning) {
-        Ok(anthropic) => anthropic,
-        Err(err) => {
-            tracing::warn!(
-                profile = request.profile_name,
-                error = %err,
-                "fallback response untranslatable"
-            );
-            return fallback_error(StatusCode::BAD_GATEWAY, "fallback_response_untranslatable");
-        }
-    };
-    log.emit(anthropic.len() as u64);
-
-    let mut response = Response::new(Body::from(anthropic));
-    *response.status_mut() = status;
-    *response.headers_mut() = translated_headers("application/json");
-    response
 }
 
 struct Prepared {
     body: Vec<u8>,
     stream: bool,
+}
+
+/// The outgoing body for one target model: a whole wire-format translation for an
+/// `openai` profile, the client's own body with the model substituted for an
+/// `anthropic` one.
+///
+/// Called once per upstream attempt rather than once per request, because the
+/// target model is *in* the body — an escalated retry re-emits it through the
+/// same path that produced the first one, instead of patching a model name inside
+/// JSON that has already been serialized.
+fn prepare(body: &[u8], target_model: &str, translated: bool) -> anyhow::Result<Prepared> {
+    if translated {
+        let request = translate::request_to_openai(body, target_model)?;
+        Ok(Prepared {
+            body: request.body,
+            stream: request.stream,
+        })
+    } else {
+        Ok(Prepared {
+            body: passthrough_body(body, target_model)?,
+            stream: false,
+        })
+    }
+}
+
+/// The rungs a request may still climb to when its target model says the prompt
+/// did not fit (spec §7e), resolved lazily against the profile's own `model_map`.
+///
+/// A cursor rather than a list plus an index: `next_target` consumes what it
+/// returns, so "walk the ladder at most once" is structural — there is no
+/// position a bug could reset and no way to revisit a rung. That bound is the
+/// load-bearing part of this feature, not boilerplate: every hop is a whole extra
+/// upstream request the operator pays for, and the top rung is the most expensive
+/// model configured.
+struct Ladder<'a> {
+    /// Slots strictly above the rung this request started on. Empty means
+    /// nowhere to climb, which is how *every* no-ladder case is expressed: the
+    /// config gate off, a name-routed request, a target that came from `"*"` or
+    /// from no entry at all, a slot `escalation_order` does not name, and the top
+    /// rung itself.
+    rungs: &'a [String],
+    model_map: &'a IndexMap<String, String>,
+    /// Every target this request has already been sent to. The live map points
+    /// **both** `claude-fable` and `claude-opus` at `moonshotai/Kimi-K3`, so
+    /// without this a walk re-sends the identical request to the identical model
+    /// and buys a guaranteed identical failure at the top rung's price.
+    tried: Vec<String>,
+}
+
+impl<'a> Ladder<'a> {
+    /// `slot` is which `model_map` key the request's target came from, and
+    /// `first_target` that target — `None` for every request with no ladder
+    /// position at all (see the `rungs` field).
+    fn new(
+        policy: &'a PolicyConfig,
+        model_map: &'a IndexMap<String, String>,
+        slot: Option<&str>,
+        first_target: String,
+    ) -> Self {
+        Self {
+            rungs: Self::above(policy, slot),
+            model_map,
+            tried: vec![first_target],
+        }
+    }
+
+    fn above(policy: &'a PolicyConfig, slot: Option<&str>) -> &'a [String] {
+        if !policy.escalate_on_context_limit {
+            return &[];
+        }
+        let Some(slot) = slot else {
+            return &[];
+        };
+        match policy.escalation_order.iter().position(|rung| rung == slot) {
+            Some(at) => &policy.escalation_order[at + 1..],
+            None => &[],
+        }
+    }
+
+    /// The next target worth sending to, or `None` when the ladder is out of
+    /// rungs. Skips a slot the profile does not define, and a slot whose target
+    /// this request has already been sent to.
+    fn next_target(&mut self) -> Option<String> {
+        while let [slot, rest @ ..] = self.rungs {
+            self.rungs = rest;
+            let Some(target) = self.model_map.get(slot) else {
+                continue;
+            };
+            if self.tried.iter().any(|seen| seen == target) {
+                continue;
+            }
+            self.tried.push(target.clone());
+            return Some(target.clone());
+        }
+        None
+    }
 }
 
 /// Spec §7a. The longest matching prefix wins; equal-length matches go to the
@@ -223,6 +385,23 @@ struct Prepared {
 /// claims is sent on unchanged — the provider's own "unknown model" is a
 /// better answer than one this proxy invents.
 pub fn remap_model(model: &str, model_map: &IndexMap<String, String>) -> String {
+    resolve_model(model, model_map).0
+}
+
+/// `remap_model`, plus *which* `model_map` key decided the answer — `None` when
+/// it came from `"*"` or from no entry at all.
+///
+/// The escalation ladder needs the key rather than the target, because the key is
+/// the request's rung and two keys are free to point at the same model (spec §7e).
+/// `None` is the honest answer for the other two cases, and the ladder treats it
+/// as nowhere to climb: `"*"` is consulted only when no prefix matched, so its
+/// target is chosen to be a safe answer for *anything* rather than a size tier —
+/// on the live map it is the largest model configured, so reading it as the bottom
+/// rung would send an overflowing request *down* to a smaller window.
+fn resolve_model<'a>(
+    model: &str,
+    model_map: &'a IndexMap<String, String>,
+) -> (String, Option<&'a str>) {
     let mut best: Option<(&String, &String)> = None;
     for (prefix, target) in model_map {
         if prefix == "*" || !model.starts_with(prefix.as_str()) {
@@ -232,13 +411,16 @@ pub fn remap_model(model: &str, model_map: &IndexMap<String, String>) -> String 
             best = Some((prefix, target));
         }
     }
-    if let Some((_, target)) = best {
-        return target.clone();
+    if let Some((prefix, target)) = best {
+        return (target.clone(), Some(prefix.as_str()));
     }
-    model_map
-        .get("*")
-        .cloned()
-        .unwrap_or_else(|| model.to_string())
+    (
+        model_map
+            .get("*")
+            .cloned()
+            .unwrap_or_else(|| model.to_string()),
+        None,
+    )
 }
 
 /// Spec §7b: `cache_control` is Anthropic's prompt-caching directive. A
@@ -363,27 +545,22 @@ fn translated_headers(content_type: &'static str) -> HeaderMap {
     headers
 }
 
-/// Spec §7d: a provider's error reaches the client in Anthropic's envelope,
-/// with the provider's own status and message preserved. It used to pass through
-/// verbatim; the shapes were unknown when that rule was written and are captured
-/// now, and for a context-limit error the passthrough cost the user the whole
-/// session — Claude Code's compact-and-retry keys on Anthropic's wording, which
-/// no provider here uses (`docs/decisions.md`).
-async fn provider_error_response(
+/// One provider error, read exactly once (spec §7d): the body capped, the
+/// profile's key redacted on the bytes both sinks share, those bytes logged, and
+/// the result parsed.
+///
+/// Split from the response it becomes so that escalation can decide on the
+/// *parsed* error while no envelope exists yet (spec §7e). One call per upstream
+/// attempt, which is what keeps an escalating request's two failures at one log
+/// line each — neither doubled, neither lost — and the redaction running exactly
+/// once over each attempt's own bytes.
+async fn read_provider_error(
     profile: &ProfileConfig,
     profile_name: &str,
     status: StatusCode,
     upstream: reqwest::Response,
-    log: RequestLog,
-) -> Response {
-    let mut headers = translated_headers("application/json");
-    // An allowlist of one, not `forwardable`'s denylist: this body is the
-    // relay's, so the provider's `content-length` and `content-encoding`
-    // describe bytes that are no longer being sent. `retry-after` is the only
-    // header on an error the client acts on, so it is the only one kept.
-    if let Some(retry_after) = upstream.headers().get("retry-after").cloned() {
-        headers.insert("retry-after", retry_after);
-    }
+) -> ProviderFailure {
+    let retry_after = upstream.headers().get("retry-after").cloned();
 
     // `ERROR_BODY_CAP`, not `RESPONSE_CAP`: the repo already has a cap argued for
     // exactly this hazard — the Anthropic route's error accumulator, whose 1 MiB is
@@ -410,6 +587,10 @@ async fn provider_error_response(
             Vec::new()
         }
     };
+    // What the provider sent, taken before the redaction changes the length:
+    // §9's per-attempt line reports it for an attempt escalation replaces, which
+    // is what the Anthropic route's re-routed attempt reports too (`proxy`).
+    let upstream_bytes = raw.len() as u64;
     // Redacted once, here, before anything reads it. This body has *two* sinks —
     // the log line below and the message that goes into the client's envelope —
     // and redacting at each of them is how one of them ends up forgotten. Doing it
@@ -431,13 +612,53 @@ async fn provider_error_response(
         "the fallback provider returned an error"
     );
 
-    let body = ProviderError::read(status, &raw).to_anthropic();
-    log.emit(body.len() as u64);
+    ProviderFailure {
+        status,
+        error: ProviderError::read(status, &raw),
+        retry_after,
+        upstream_bytes,
+    }
+}
 
-    let mut response = Response::new(Body::from(body));
-    *response.status_mut() = status;
-    *response.headers_mut() = headers;
-    response
+/// A provider error, read and logged, not yet answered.
+struct ProviderFailure {
+    /// The provider's own, preserved on the way out and the one the error was
+    /// parsed with — held here rather than passed on again so the two cannot
+    /// diverge.
+    status: StatusCode,
+    error: ProviderError,
+    retry_after: Option<HeaderValue>,
+    upstream_bytes: u64,
+}
+
+impl ProviderFailure {
+    /// Spec §7d: a provider's error reaches the client in Anthropic's envelope,
+    /// with the provider's own status and message preserved. It used to pass
+    /// through verbatim; the shapes were unknown when that rule was written and
+    /// are captured now, and for a context-limit error the passthrough cost the
+    /// user the whole session — Claude Code's compact-and-retry keys on
+    /// Anthropic's wording, which no provider here uses (`docs/decisions.md`).
+    ///
+    /// Reached on the last rung of an escalation too, unchanged: escalation
+    /// failing is not a reason for the client to lose the recovery it already had.
+    fn into_response(self, log: RequestLog) -> Response {
+        let mut headers = translated_headers("application/json");
+        // An allowlist of one, not `forwardable`'s denylist: this body is the
+        // relay's, so the provider's `content-length` and `content-encoding`
+        // describe bytes that are no longer being sent. `retry-after` is the only
+        // header on an error the client acts on, so it is the only one kept.
+        if let Some(retry_after) = self.retry_after {
+            headers.insert("retry-after", retry_after);
+        }
+
+        let body = self.error.to_anthropic();
+        log.emit(body.len() as u64);
+
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = self.status;
+        *response.headers_mut() = headers;
+        response
+    }
 }
 
 /// How much of a provider's error body reaches the log. The real ones are a few
@@ -614,6 +835,142 @@ mod tests {
             remap_model("claude-haiku-4-5", &IndexMap::new()),
             "claude-haiku-4-5"
         );
+    }
+
+    // --- the escalation ladder (spec §7e) ---
+
+    /// The live map's three windows: 131k, 262k, 1M.
+    const SMALL: &str = "openai/gpt-oss-20b";
+    const MEDIUM: &str = "moonshotai/Kimi-K2.7-Code";
+    const LARGE: &str = "moonshotai/Kimi-K3";
+
+    fn ladder_map() -> IndexMap<String, String> {
+        model_map(&[
+            ("claude-haiku", SMALL),
+            ("claude-sonnet", MEDIUM),
+            ("claude-opus", LARGE),
+            ("*", LARGE),
+        ])
+    }
+
+    fn order(slots: &[&str]) -> PolicyConfig {
+        PolicyConfig {
+            escalation_order: slots.iter().map(|slot| (*slot).to_string()).collect(),
+            ..PolicyConfig::default()
+        }
+    }
+
+    /// The whole walk, from the bottom rung: every slot above the one the request
+    /// landed on, in order, and then nothing — twice, because "at most once" is
+    /// the requirement that costs money when it is missed.
+    #[test]
+    fn the_ladder_climbs_the_slots_above_the_one_the_request_landed_on() {
+        let map = ladder_map();
+        let policy = PolicyConfig::default();
+        let (target, slot) = resolve_model("claude-haiku-4-5", &map);
+        assert_eq!((target.as_str(), slot), (SMALL, Some("claude-haiku")));
+
+        let mut ladder = Ladder::new(&policy, &map, slot, target);
+        assert_eq!(ladder.next_target().as_deref(), Some(MEDIUM));
+        assert_eq!(ladder.next_target().as_deref(), Some(LARGE));
+        assert_eq!(ladder.next_target(), None, "the top rung is the end");
+        assert_eq!(ladder.next_target(), None, "and it stays the end");
+    }
+
+    /// The requirement most likely to be missed, and the one that costs real
+    /// money: the live map points **both** `claude-fable` and `claude-opus` at
+    /// Kimi-K3, so a naive walk re-sends the identical request to the identical
+    /// model at the top rung's price.
+    #[test]
+    fn a_target_this_request_already_failed_on_is_never_sent_to_again() {
+        let map = model_map(&[
+            ("claude-haiku", SMALL),
+            ("claude-sonnet", MEDIUM),
+            ("claude-opus", LARGE),
+            ("claude-fable", LARGE),
+        ]);
+        let policy = order(&[
+            "claude-haiku",
+            "claude-sonnet",
+            "claude-opus",
+            "claude-fable",
+        ]);
+        let (target, slot) = resolve_model("claude-sonnet-4-6", &map);
+        assert_eq!(target, MEDIUM);
+
+        let mut ladder = Ladder::new(&policy, &map, slot, target);
+        assert_eq!(ladder.next_target().as_deref(), Some(LARGE));
+        assert_eq!(
+            ladder.next_target(),
+            None,
+            "`claude-fable` resolves to the model that just failed"
+        );
+    }
+
+    /// A profile that maps two of the three slots is a valid profile, so the gap
+    /// is stepped over rather than treated as the end of the ladder.
+    #[test]
+    fn a_slot_the_profile_does_not_define_is_skipped_not_stopped_at() {
+        let map = model_map(&[("claude-haiku", SMALL), ("claude-opus", LARGE)]);
+        let policy = PolicyConfig::default();
+        let (target, slot) = resolve_model("claude-haiku-4-5", &map);
+
+        let mut ladder = Ladder::new(&policy, &map, slot, target);
+        assert_eq!(ladder.next_target().as_deref(), Some(LARGE));
+        assert_eq!(ladder.next_target(), None);
+    }
+
+    /// Every way a request has nowhere to climb. Each of these would otherwise be
+    /// a hop the operator pays for and did not ask for.
+    #[test]
+    fn nothing_climbs_without_a_rung_to_climb_from() {
+        let map = ladder_map();
+        let default = PolicyConfig::default();
+
+        // `"*"`: consulted only because no prefix matched, so it is a safe default
+        // for anything rather than a size tier — and on this map it is the largest
+        // model, so reading it as the bottom rung would hop *down*.
+        let (target, slot) = resolve_model("claude-3-5-sonnet-20241022", &map);
+        assert_eq!((target.as_str(), slot), (LARGE, None), "the catch-all");
+        assert_eq!(
+            Ladder::new(&default, &map, slot, target).next_target(),
+            None
+        );
+
+        // A name no entry claims and no catch-all to catch it: sent on unchanged
+        // (§7a), so there is no slot behind the model name at all.
+        let sparse = model_map(&[("claude-opus", LARGE)]);
+        let (target, slot) = resolve_model("claude-haiku-4-5", &sparse);
+        assert_eq!((target.as_str(), slot), ("claude-haiku-4-5", None));
+        assert_eq!(
+            Ladder::new(&default, &sparse, slot, target).next_target(),
+            None
+        );
+
+        // The top rung.
+        let (target, slot) = resolve_model("claude-opus-4-6", &map);
+        assert_eq!(slot, Some("claude-opus"));
+        assert_eq!(
+            Ladder::new(&default, &map, slot, target).next_target(),
+            None
+        );
+
+        // A slot the order does not name — `claude-fable` under the default order.
+        let with_fable = model_map(&[("claude-fable", SMALL), ("claude-opus", LARGE)]);
+        let (target, slot) = resolve_model("claude-fable-5", &with_fable);
+        assert_eq!((target.as_str(), slot), (SMALL, Some("claude-fable")));
+        assert_eq!(
+            Ladder::new(&default, &with_fable, slot, target).next_target(),
+            None
+        );
+
+        // The config gate.
+        let off = PolicyConfig {
+            escalate_on_context_limit: false,
+            ..PolicyConfig::default()
+        };
+        let (target, slot) = resolve_model("claude-haiku-4-5", &map);
+        assert_eq!(Ladder::new(&off, &map, slot, target).next_target(), None);
     }
 
     #[test]

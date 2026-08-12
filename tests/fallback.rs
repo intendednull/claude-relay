@@ -2688,3 +2688,474 @@ async fn an_error_body_between_the_two_caps_is_refused_but_keeps_the_status() {
         "a body past the cap is not read at all"
     );
 }
+
+// --- the escalation ladder (spec §7e) -----------------------------------------
+//
+// Claude Code decides a session's context window client-side, from the
+// `claude-*` name it selected, so it overshoots a smaller fallback model
+// believing it has room. 9B gives it the wording its own recovery keys on; this
+// is the case where that recovery cannot help, because the transcript alone does
+// not fit — and a larger model is already configured one slot up.
+//
+// Every hop is a whole extra upstream request the operator pays for, so most of
+// what these tests hold is that the ladder is *not* walked.
+
+/// The live map's three windows: 131k, 262k, 1M.
+const SMALL: &str = "openai/gpt-oss-20b";
+const MEDIUM: &str = "moonshotai/Kimi-K2.7-Code";
+const LARGE: &str = "moonshotai/Kimi-K3";
+
+const HAIKU: &str = "claude-haiku-4-5";
+const SONNET: &str = "claude-sonnet-4-6";
+const FABLE: &str = "claude-fable-5";
+
+/// The live map's shape, duplicate included: `claude-fable` and `claude-opus`
+/// both point at the largest model configured, which is the trap a naive walk
+/// falls into — an identical request re-sent to an identical model at K3 prices.
+const LIVE_LADDER: [(&str, &str); 5] = [
+    ("claude-haiku", SMALL),
+    ("claude-sonnet", MEDIUM),
+    ("claude-opus", LARGE),
+    ("claude-fable", LARGE),
+    ("*", LARGE),
+];
+
+/// The default order does not name `claude-fable`, so the live map's fourth slot
+/// needs this to be a rung at all — which is also what makes the duplicate
+/// reachable and therefore testable.
+const LIVE_ORDER: [&str; 4] = [
+    "claude-haiku",
+    "claude-sonnet",
+    "claude-opus",
+    "claude-fable",
+];
+
+/// A context-limit body with no readable pair. Detection fires (the wording is
+/// there), the parse refuses (no numbers), and escalation must not care: a prompt
+/// that did not fit needs a bigger model whether or not it could be sized.
+const CONTEXT_LIMIT_NO_PAIR: &str = r#"{"error":{"message":"The input is longer than the model's context length.","type":"invalid_request_error","param":null,"code":null}}"#;
+
+/// A real 400 that is *not* a context limit
+/// (`tests/fixtures/together/H_error_missing_messages.json`).
+const MISSING_MESSAGES: &str = r#"{"id":"ovq42ih-6Ng1vN-a29afb89ca1ab9f4","error":{"message":"Input required","type":"invalid_request_error","param":null,"code":null}}"#;
+
+/// A fallback profile whose answer depends on the model asked for: `error` for
+/// every model in `overflows`, an ordinary completion for anything else. That is
+/// the real failure's shape — the model whose window the transcript does not fit
+/// rejects it, and a larger one answers.
+fn laddered_upstream(
+    recorder: Recorder,
+    overflows: &'static [&'static str],
+    error: &'static str,
+) -> Router {
+    Router::new().route(
+        "/v1/chat/completions",
+        any(move |request: Request| {
+            let recorder = recorder.clone();
+            async move {
+                let body = record(&recorder, request).await;
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                if overflows.contains(&model.as_str()) {
+                    // A status, and only then a body — which is why escalation is
+                    // possible here at all. Together answers a streaming request
+                    // that overflows exactly this way.
+                    return json(StatusCode::BAD_REQUEST, error);
+                }
+                if body["stream"] != Value::Bool(true) {
+                    return json(StatusCode::OK, OPENAI_COMPLETION);
+                }
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(OPENAI_CHUNKS.concat()))
+                    .expect("failed to build mock response")
+            }
+        }),
+    )
+}
+
+fn laddered_profile(base: SocketAddr, model_map: &[(&str, &str)]) -> ProfileConfig {
+    ProfileConfig {
+        model_map: model_map
+            .iter()
+            .map(|(slot, target)| ((*slot).to_string(), (*target).to_string()))
+            .collect(),
+        ..profile(base, "openai", OPENAI_KEY_ENV)
+    }
+}
+
+/// A relay already `LIMITED`, in `all` mode, so a `claude-*` request fails over
+/// and is *remapped* (§7a) — which is the only way a request has a ladder
+/// position at all.
+async fn start_laddered(
+    model_map: &[(&str, &str)],
+    overflows: &'static [&'static str],
+    error: &'static str,
+    tune: impl FnOnce(&mut Config),
+) -> Relay {
+    set_profile_keys();
+    let anthropic = Recorder::default();
+    let fallback = Recorder::default();
+    let anthropic_addr = serve(anthropic_upstream(anthropic.clone(), false)).await;
+    let fallback_addr = serve(laddered_upstream(fallback.clone(), overflows, error)).await;
+    let mut config = config(
+        anthropic_addr,
+        "all",
+        laddered_profile(fallback_addr, model_map),
+    );
+    tune(&mut config);
+    let addr = serve_relay_with(config, None).await;
+    drive_to_limited(addr).await;
+    Relay {
+        addr,
+        anthropic,
+        fallback,
+    }
+}
+
+fn order(slots: &[&str]) -> Vec<String> {
+    slots.iter().map(|slot| (*slot).to_string()).collect()
+}
+
+/// Every model the fallback profile was asked for, in the order it was asked —
+/// so a test can assert the whole walk rather than only its length.
+fn models_seen(recorder: &Recorder) -> Vec<String> {
+    recorder
+        .0
+        .lock()
+        .expect("recorder poisoned")
+        .iter()
+        .map(|recorded| {
+            recorded.json()["model"]
+                .as_str()
+                .expect("every outgoing body names a model")
+                .to_string()
+        })
+        .collect()
+}
+
+async fn ask(relay: &Relay, model: &str) -> (StatusCode, Value) {
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(session_start(model))
+        .send()
+        .await
+        .expect("request failed");
+    let code = response.status();
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("the body must be JSON");
+    (code, body)
+}
+
+/// The 170k reproduction, with somewhere to go: the request lands on the haiku
+/// slot's 131k model, overflows, and is retried on the sonnet slot's 262k one,
+/// which answers. The client never sees an error at all.
+#[tokio::test]
+async fn a_context_limit_climbs_one_rung_and_succeeds_there() {
+    let relay = start_laddered(&LIVE_LADDER, &[SMALL], TOGETHER_CONTEXT_LIMIT, |_| {}).await;
+
+    let (code, body) = ask(&relay, HAIKU).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(models_seen(&relay.fallback), [SMALL, MEDIUM]);
+    assert_eq!(body["content"][0]["text"], "from the openai profile");
+    // Both attempts are counted, because the operator paid for both.
+    assert_eq!(status(relay.addr).await["fallback_requests_served"], 2);
+}
+
+/// Detection is all escalation needs. The pair is 9B's business — a prompt that
+/// did not fit needs a bigger model whether or not the wording let it be sized.
+#[tokio::test]
+async fn a_context_limit_with_no_readable_pair_still_climbs() {
+    let relay = start_laddered(&LIVE_LADDER, &[SMALL], CONTEXT_LIMIT_NO_PAIR, |_| {}).await;
+
+    let (code, body) = ask(&relay, HAIKU).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(models_seen(&relay.fallback), [SMALL, MEDIUM]);
+}
+
+/// The walk starts above the rung the request landed on, not at the bottom of the
+/// ladder. A ladder walked from the bottom would answer a 262k overflow by trying
+/// the 131k model — a hop *down*, guaranteed to fail, paid for.
+#[tokio::test]
+async fn the_walk_starts_above_the_rung_the_request_landed_on() {
+    let relay = start_laddered(&LIVE_LADDER, &[MEDIUM], TOGETHER_CONTEXT_LIMIT, |_| {}).await;
+
+    let (code, body) = ask(&relay, SONNET).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(
+        models_seen(&relay.fallback),
+        [MEDIUM, LARGE],
+        "the smaller model below this request's own rung must never be tried"
+    );
+}
+
+/// A malformed request must not walk the ladder. Answering it with a second,
+/// larger, equally-malformed request costs money and cannot succeed.
+#[tokio::test]
+async fn an_ordinary_400_never_walks_the_ladder() {
+    let relay = start_laddered(&LIVE_LADDER, &[SMALL], MISSING_MESSAGES, |_| {}).await;
+
+    let (code, body) = ask(&relay, HAIKU).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["message"], "Input required");
+    assert_eq!(
+        models_seen(&relay.fallback),
+        [SMALL],
+        "an ordinary 400 bought a second upstream request"
+    );
+    assert_eq!(status(relay.addr).await["fallback_requests_served"], 1);
+}
+
+/// The whole walk, and its end. Every rung overflows, so the request climbs
+/// haiku → sonnet → opus and then stops: the fourth rung (`claude-fable`)
+/// resolves to the model that just failed, and re-sending an identical request to
+/// an identical model buys a guaranteed identical failure at the top rung's
+/// price. The client gets 9B's envelope, unchanged — escalation failing is not a
+/// reason to lose the recovery it already had.
+#[tokio::test]
+async fn the_top_of_the_ladder_answers_with_the_translated_error() {
+    let relay = start_laddered(
+        &LIVE_LADDER,
+        &[SMALL, MEDIUM, LARGE],
+        TOGETHER_CONTEXT_LIMIT,
+        |config| config.policy.escalation_order = order(&LIVE_ORDER),
+    )
+    .await;
+
+    let (code, body) = ask(&relay, HAIKU).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        models_seen(&relay.fallback),
+        [SMALL, MEDIUM, LARGE],
+        "the ladder is walked once, upward, and never revisits a target"
+    );
+
+    // 9B's envelope, intact: the phrase, the pair, and the provider's sentence.
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    let message = body["error"]["message"].as_str().expect("a message string");
+    assert_eq!(token_pair(message), Some((170071, 131072)), "{message:?}");
+    assert!(
+        message.contains("The input (170071 tokens) is longer than the model's context length"),
+        "{message:?}"
+    );
+}
+
+/// A request that started at the top has nowhere to go.
+#[tokio::test]
+async fn a_request_that_starts_at_the_top_has_nowhere_to_climb() {
+    let relay = start_laddered(&LIVE_LADDER, &[LARGE], TOGETHER_CONTEXT_LIMIT, |config| {
+        config.policy.escalation_order = order(&LIVE_ORDER)
+    })
+    .await;
+
+    let (code, body) = ask(&relay, OPUS).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(models_seen(&relay.fallback), [LARGE]);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("a message string")
+            .starts_with("prompt is too long: 170071 tokens > 131072"),
+        "the last rung still produces the client's recovery: {body}"
+    );
+}
+
+/// `"*"` is not a rung. It is consulted only because no prefix matched, so its
+/// target is a safe default for anything rather than a size tier — and on the live
+/// map it is the *largest* model, so reading it as the bottom rung would send an
+/// overflowing request down to a smaller window. An older alias
+/// (`claude-3-5-sonnet-…`, which no `claude-sonnet` prefix matches) is how a real
+/// request lands there.
+#[tokio::test]
+async fn a_target_the_catch_all_chose_has_no_ladder_position() {
+    // The catch-all deliberately points at the *smallest* model here, so a hop
+    // would look attractive. It still must not happen.
+    let map = [
+        ("claude-sonnet", MEDIUM),
+        ("claude-opus", LARGE),
+        ("*", SMALL),
+    ];
+    let relay = start_laddered(&map, &[SMALL], TOGETHER_CONTEXT_LIMIT, |_| {}).await;
+
+    let (code, _) = ask(&relay, "claude-3-5-sonnet-20241022").await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(models_seen(&relay.fallback), [SMALL]);
+}
+
+/// A slot the order does not name has no position either — `claude-fable` under
+/// the default order, which is what the live config runs with today.
+#[tokio::test]
+async fn a_slot_the_order_does_not_name_has_no_ladder_position() {
+    let map = [("claude-fable", SMALL), ("claude-opus", LARGE)];
+    let relay = start_laddered(&map, &[SMALL], TOGETHER_CONTEXT_LIMIT, |_| {}).await;
+
+    let (code, _) = ask(&relay, FABLE).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(models_seen(&relay.fallback), [SMALL]);
+}
+
+/// Direct model selection has no ladder and must not get one: the client named
+/// the model itself (`/model deepseek-ai/…`), `model_in == model_out`, and
+/// swapping a hand-picked model for a different one would be wrong behavior
+/// rather than a recovery. §7d routing, not failover.
+#[tokio::test]
+async fn a_name_routed_request_is_never_escalated() {
+    let relay = start_laddered(&LIVE_LADDER, &[OPEN_MODEL], TOGETHER_CONTEXT_LIMIT, |_| {}).await;
+
+    let (code, body) = ask(&relay, OPEN_MODEL).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(models_seen(&relay.fallback), [OPEN_MODEL]);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("a message string")
+            .starts_with("prompt is too long"),
+        "it keeps 9B's translation, and only that: {body}"
+    );
+}
+
+/// The gate, off: the translated error goes straight to the client, which is the
+/// behavior before this feature existed.
+#[tokio::test]
+async fn the_config_gate_turns_the_ladder_off() {
+    let relay = start_laddered(&LIVE_LADDER, &[SMALL], TOGETHER_CONTEXT_LIMIT, |config| {
+        config.policy.escalate_on_context_limit = false
+    })
+    .await;
+
+    let (code, body) = ask(&relay, HAIKU).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(models_seen(&relay.fallback), [SMALL]);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("a message string")
+            .starts_with("prompt is too long: 170071 tokens > 131072"),
+        "{body}"
+    );
+}
+
+/// A fallback profile that answers 200, streams a real content delta, and only
+/// *then* reports the context limit — inside the stream, which is the only way
+/// this error can arrive after bytes have already reached the client.
+fn streamed_context_limit_upstream(recorder: Recorder) -> Router {
+    const ERROR_FRAME: &str = concat!(
+        r#"data: {"error":{"message":"The input (170071 tokens) is longer than the model's "#,
+        r#"context length (131072 tokens).","type":"invalid_request_error"}}"#,
+        "\n\n"
+    );
+    Router::new().route(
+        "/v1/chat/completions",
+        any(move |request: Request| {
+            let recorder = recorder.clone();
+            async move {
+                record(&recorder, request).await;
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(format!("{}{ERROR_FRAME}", OPENAI_CHUNKS[0])))
+                    .expect("failed to build mock response")
+            }
+        }),
+    )
+}
+
+/// **If any byte has been sent to the client, do not escalate.** On this route
+/// that is structural rather than a rule to remember — the escalation decision is
+/// made on the non-2xx branch, and an HTTP status arrives before its body, so
+/// nothing has been written at that point. This is the case that would break the
+/// rule if it were not: a 200 whose *stream* carries the context-limit error, so
+/// the client has already rendered a content block by the time it arrives.
+///
+/// The client keeps what it was given, terminated by the provider's own message
+/// as an Anthropic `error` event (the mid-stream contract spec §6 already sets),
+/// and the profile is asked exactly once.
+#[tokio::test]
+async fn a_context_limit_that_arrives_mid_stream_is_never_escalated() {
+    set_profile_keys();
+    let fallback = Recorder::default();
+    let anthropic_addr = serve(anthropic_upstream(Recorder::default(), false)).await;
+    let fallback_addr = serve(streamed_context_limit_upstream(fallback.clone())).await;
+    let relay = serve_relay_with(
+        config(
+            anthropic_addr,
+            "all",
+            laddered_profile(fallback_addr, &LIVE_LADDER),
+        ),
+        None,
+    )
+    .await;
+    drive_to_limited(relay).await;
+
+    let response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(format!(
+            r#"{{"model":"{HAIKU}","max_tokens":64,"stream":true,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        ))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let bytes = response.bytes().await.expect("failed to read body");
+    let events = events(&bytes);
+
+    // Bytes really did reach the client before the error: a content block, not
+    // just a header.
+    assert!(
+        events.iter().any(
+            |(name, data)| name == "content_block_delta" && data["delta"]["text"] == "streamed"
+        ),
+        "the stream must have delivered content before the error: {events:?}"
+    );
+    let (name, data) = events.last().expect("at least one event");
+    assert_eq!(name, "error");
+    assert!(
+        data["error"]["message"]
+            .as_str()
+            .expect("a message string")
+            .contains("longer than the model's context length"),
+        "the provider's own message is what the client gets: {data}"
+    );
+    assert_eq!(
+        models_seen(&fallback),
+        [SMALL],
+        "a context limit that arrived mid-stream was escalated"
+    );
+}
+
+/// The other half of the same rule, from the request side. A *streaming* request
+/// that overflows gets its 400 before any byte is sent — Together answers one
+/// exactly that way — so it escalates like any other, and the retry is re-emitted
+/// through the translator rather than patched, which means it is still a stream.
+/// A retry that lost the flag would deliver a whole JSON body where the client is
+/// parsing SSE.
+#[tokio::test]
+async fn an_escalated_streaming_request_is_still_streaming_on_the_retry() {
+    let relay = start_laddered(&LIVE_LADDER, &[SMALL], TOGETHER_CONTEXT_LIMIT, |_| {}).await;
+
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(format!(
+            r#"{{"model":"{HAIKU}","max_tokens":64,"stream":true,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        ))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let bytes = response.bytes().await.expect("failed to read body");
+    let names: Vec<String> = events(&bytes).into_iter().map(|(name, _)| name).collect();
+    assert_eq!(names.first().map(String::as_str), Some("message_start"));
+    assert_eq!(names.last().map(String::as_str), Some("message_stop"));
+
+    assert_eq!(models_seen(&relay.fallback), [SMALL, MEDIUM]);
+    let sent = relay.fallback.0.lock().expect("recorder poisoned");
+    for recorded in sent.iter() {
+        assert_eq!(
+            recorded.json()["stream"],
+            Value::Bool(true),
+            "an attempt lost the client's streaming flag"
+        );
+    }
+}
