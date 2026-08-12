@@ -289,8 +289,20 @@ mod tests {
 
     /// A reversed pair is not this failure's pair: reporting it would tell the
     /// client its prompt was smaller than the limit it just exceeded.
+    ///
+    /// The first case is the one that reaches the `tokens > limit` guard —
+    /// well-placed numbers on both sides of the marker, in the wrong relation.
+    /// Anchoring alone rejects the other two earlier, for want of any digit before
+    /// the marker at all, so without this case the guard has no test. (It did not,
+    /// briefly: anchoring made the old cases stop depending on it, which a re-run
+    /// of the round-0 mutation caught.)
     #[test]
     fn a_pair_that_does_not_say_input_over_limit_is_not_used() {
+        assert_eq!(
+            counts("sent 8192 tokens, past the maximum context length of 131072"),
+            None,
+            "an input smaller than the limit is not this failure"
+        );
         assert_eq!(
             counts("The context window says (131072 tokens) exceeded by (170071 tokens)"),
             None
