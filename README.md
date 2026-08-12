@@ -483,15 +483,15 @@ Two things Milestone 3's real-traffic testing against Together AI surfaced
 
 ## Notifications
 
-Set `notify.command` to be told when the route state changes, or a profile is
-switched, instead of polling `/status`. The command runs through `sh -c` and
-gets the event in its environment:
+Set `notify.command` to be told when the route state changes, a profile is
+switched, or the fallback stops working, instead of polling `/status`. The
+command runs through `sh -c` and gets the event in its environment:
 
 | Variable | Value |
 |---|---|
-| `RELAY_EVENT` | `failover_engaged` when the route becomes `LIMITED`, `recovered` when it returns to `ACTIVE`, `profile_switched` on a real `POST /control/profile` switch |
+| `RELAY_EVENT` | `failover_engaged` when the route becomes `LIMITED`, `recovered` when it returns to `ACTIVE`, `profile_switched` on a real `POST /control/profile` switch, `fallback_error` when the fallback route stops delivering answers |
 | `RELAY_RESET_AT` | RFC3339 end of the window on `failover_engaged`, the same value `/status` reports as `limited_until`; empty otherwise |
-| `RELAY_DETAIL` | A one-line human-readable summary — for `profile_switched`, this is the only place the switched-to profile's name appears; there is no separate `RELAY_PROFILE` variable |
+| `RELAY_DETAIL` | A one-line human-readable summary — for `profile_switched`, this is the only place the switched-to profile's name appears; there is no separate `RELAY_PROFILE` variable. For `fallback_error` it names the profile and the cause: `together: http 401`, `together: upstream_unreachable` |
 
 ```toml
 [notify]
@@ -511,6 +511,16 @@ nothing to say, so a hook can run under `set -u`.
   `LIMITED` does not extend the window, so it is not a state change and does
   not notify. Nor does the window merely elapsing (`LIMITED` → `PROBING`),
   which means nothing until a request actually succeeds.
+- **`fallback_error` fires once per outage, not once per failed request.** The
+  failures it is for — a rejected key, an unreachable provider, an exhausted
+  balance — fail *every* request, so it fires on entering that state and not
+  again until a fallback request succeeds. Only a 2xx re-arms it, and there is
+  no "still broken" reminder timer. A restart re-arms it too.
+  A failure belonging to one request does not fire it at all: a body the
+  translator refuses, or a provider 400/404/413/422 (a context limit is one of
+  these, and the client acts on it — often getting a 200 from the next rung up
+  the ladder). Anything else the provider answers with — 401, 402, 403, 429, any
+  5xx — is the route's, and so is a 2xx the relay could not read or translate.
 - It inherits the relay's environment, which a desktop notifier needs
   (`DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`), and writes to the relay's own
   stdout/stderr.

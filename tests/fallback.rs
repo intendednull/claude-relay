@@ -6,6 +6,7 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
@@ -3474,4 +3475,439 @@ async fn an_escalated_streaming_request_is_still_streaming_on_the_retry() {
             "an attempt lost the client's streaming flag"
         );
     }
+}
+
+// --- spec §4's `fallback_error` notifier event ---
+//
+// The event exists for the failure that takes out *every* request: a dead
+// provider key, an unreachable endpoint, an exhausted balance. So the two things
+// most of these tests hold are that it fires **once per outage** rather than once
+// per request, and that a failure belonging to one request does not fire it at
+// all — a false "your fallback is down" costs more trust than a missed
+// notification.
+//
+// Every one of them wires a real hook and reads the lines it wrote, because the
+// env vars are the contract an operator writes against and nothing below the
+// subprocess boundary can prove they arrived.
+
+/// Together's shape for a dead key — the incident this event exists for. Its
+/// message is deliberately full of text that must never reach `RELAY_DETAIL`: a
+/// provider error body is user- and attacker-influenced, and the notification
+/// goes to an operator's hook.
+const UNAUTHORIZED: &str = concat!(
+    r#"{"error":{"message":"Invalid API key provided: tgp-DEAD-KEY-DO-NOT-NOTIFY. You can find "#,
+    r#"your API key at https://api.together.xyz/settings/api-keys","#,
+    r#""type":"invalid_request_error","code":"invalid_api_key"}}"#
+);
+
+/// A hook that appends spec §4's three env vars, one line per event — the same
+/// shape `tests/notify.rs` writes, so a line here is read the same way.
+fn logging_hook(log: &Path) -> String {
+    format!(
+        r#"printf '%s|%s|%s\n' "$RELAY_EVENT" "$RELAY_RESET_AT" "$RELAY_DETAIL" >> {}"#,
+        log.display()
+    )
+}
+
+fn hook_log_path(label: &str) -> PathBuf {
+    unique_temp_dir(label).with_extension("log")
+}
+
+/// Only this event's lines. A relay driven to `LIMITED` fires `failover_engaged`
+/// through the same hook, and every count below is about `fallback_error` alone.
+fn fallback_error_lines_now(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with("fallback_error|"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Waits for at least `count` of them, then reads again past a settle window: a
+/// waiter that returns the instant it has enough cannot catch a spurious extra
+/// line arriving just after, which is the failure every "exactly once" assertion
+/// here is about.
+async fn fallback_error_lines(log: &Path, count: usize) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if fallback_error_lines_now(log).len() >= count {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {count} fallback_error line(s), got {:?}",
+            std::fs::read_to_string(log).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fallback_error_lines_now(log)
+}
+
+/// A fallback profile that answers a fixed script, one entry per request, the
+/// last entry repeating once the script runs out. A failing *streak* is a
+/// sequence, not a single answer, so the sequence is what has to be drivable.
+fn scripted_upstream(recorder: Recorder, script: &'static [(StatusCode, &'static str)]) -> Router {
+    let at = Arc::new(AtomicUsize::new(0));
+    Router::new().route(
+        "/v1/chat/completions",
+        any(move |request: Request| {
+            let recorder = recorder.clone();
+            let at = at.clone();
+            async move {
+                record(&recorder, request).await;
+                let step = at.fetch_add(1, Ordering::SeqCst).min(script.len() - 1);
+                let (status, body) = script[step];
+                json(status, body)
+            }
+        }),
+    )
+}
+
+/// A relay with a notifier hook, whose fallback profile answers `script`.
+/// Name-routed (§7d) like the other provider-error tests, so Anthropic is never
+/// contacted and only the fallback's own answer can be what is observed.
+async fn start_scripted(script: &'static [(StatusCode, &'static str)], log: &Path) -> SocketAddr {
+    start_notified(|recorder| scripted_upstream(recorder, script), log).await
+}
+
+async fn start_notified(
+    fallback_router: impl FnOnce(Recorder) -> Router,
+    log: &Path,
+) -> SocketAddr {
+    set_profile_keys();
+    let anthropic_addr = serve(anthropic_upstream(Recorder::default(), false)).await;
+    let fallback_addr = serve(fallback_router(Recorder::default())).await;
+    let mut config = config(
+        anthropic_addr,
+        "notify-only",
+        profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+    );
+    config.notify = relay::config::NotifyConfig {
+        command: Some(logging_hook(log)),
+        timeout_secs: 5,
+    };
+    serve_relay_with(config, None).await
+}
+
+/// One name-routed request at the fallback profile, whatever it answers.
+async fn one_request(relay: SocketAddr) -> StatusCode {
+    client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(session_start(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed")
+        .status()
+}
+
+fn fields(line: &str) -> Vec<&str> {
+    line.split('|').collect()
+}
+
+/// The motivating case, end to end: the provider rejects the relay's credentials
+/// and the operator is told, in the relay's own vocabulary. `RELAY_RESET_AT` is
+/// set-but-empty, so a hook under `set -u` survives an event with no window.
+///
+/// And not one word of the provider's message, which is where the shape of this
+/// event was decided: that body is user- and attacker-influenced, so the detail
+/// is built from a status code and the operator's own profile name or from
+/// nothing at all.
+#[tokio::test]
+async fn a_provider_401_fires_one_fallback_error_naming_the_profile_and_the_status() {
+    const SCRIPT: &[(StatusCode, &str)] = &[(StatusCode::UNAUTHORIZED, UNAUTHORIZED)];
+    let log = hook_log_path("fallback-error-401");
+    let relay = start_scripted(SCRIPT, &log).await;
+
+    assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
+
+    let lines = fallback_error_lines(&log, 1).await;
+    assert_eq!(lines.len(), 1, "one outage, one notification: {lines:?}");
+    assert_eq!(
+        fields(&lines[0]),
+        vec!["fallback_error", "", "fallback: http 401"]
+    );
+    for leaked in ["DEAD-KEY", "api.together.xyz", "invalid_api_key", "Invalid"] {
+        assert!(
+            !lines[0].contains(leaked),
+            "the provider's own text reached the notifier: {:?}",
+            lines[0]
+        );
+    }
+
+    let _ = std::fs::remove_file(&log);
+}
+
+/// The reason the event is edge-triggered at all. A dead key fails every request,
+/// so a notification per failure is one hook run per request — unusable in itself,
+/// and it would delay a real route transition behind a queue of them.
+#[tokio::test]
+async fn a_second_and_third_failure_of_the_same_outage_fire_nothing() {
+    const SCRIPT: &[(StatusCode, &str)] = &[(StatusCode::UNAUTHORIZED, UNAUTHORIZED)];
+    let log = hook_log_path("fallback-error-streak");
+    let relay = start_scripted(SCRIPT, &log).await;
+
+    for _ in 0..3 {
+        assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
+    }
+
+    let lines = fallback_error_lines(&log, 1).await;
+    assert_eq!(
+        lines.len(),
+        1,
+        "three failures of one outage must notify once: {lines:?}"
+    );
+
+    let _ = std::fs::remove_file(&log);
+}
+
+/// **Only a 2xx re-arms**, and it does: the outage that follows one is a new
+/// outage. A 2xx is the sole unambiguous proof that the whole path works —
+/// credentials, network, translation, provider — which is why it and nothing else
+/// clears the flag.
+#[tokio::test]
+async fn a_success_re_arms_the_event_and_the_next_failure_fires_again() {
+    const SCRIPT: &[(StatusCode, &str)] = &[
+        (StatusCode::UNAUTHORIZED, UNAUTHORIZED),
+        (StatusCode::OK, OPENAI_COMPLETION),
+        (StatusCode::UNAUTHORIZED, UNAUTHORIZED),
+    ];
+    let log = hook_log_path("fallback-error-rearm");
+    let relay = start_scripted(SCRIPT, &log).await;
+
+    assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(one_request(relay).await, StatusCode::OK);
+    assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
+
+    let lines = fallback_error_lines(&log, 2).await;
+    assert_eq!(
+        lines.len(),
+        2,
+        "a failure after a success is a new outage: {lines:?}"
+    );
+    for line in &lines {
+        assert_eq!(fields(line)[2], "fallback: http 401");
+    }
+
+    let _ = std::fs::remove_file(&log);
+}
+
+/// **A request-attributable failure does not re-arm**, which is the other half of
+/// "only a 2xx does". Reaching the provider proves less than it looks like it
+/// does: the credentials are still dead, the operator's outage has not ended, and
+/// a second notification for it would be noise.
+#[tokio::test]
+async fn a_request_attributable_failure_between_two_route_failures_does_not_re_arm() {
+    const SCRIPT: &[(StatusCode, &str)] = &[
+        (StatusCode::UNAUTHORIZED, UNAUTHORIZED),
+        (StatusCode::BAD_REQUEST, MISSING_MESSAGES),
+        (StatusCode::UNAUTHORIZED, UNAUTHORIZED),
+    ];
+    let log = hook_log_path("fallback-error-no-rearm");
+    let relay = start_scripted(SCRIPT, &log).await;
+
+    assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(one_request(relay).await, StatusCode::BAD_REQUEST);
+    assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
+
+    let lines = fallback_error_lines(&log, 1).await;
+    assert_eq!(
+        lines.len(),
+        1,
+        "a 400 in the middle of an outage re-armed the event: {lines:?}"
+    );
+
+    let _ = std::fs::remove_file(&log);
+}
+
+/// Neither of the two request-attributable failures notifies: a plain 400 is the
+/// provider telling *this* request it was wrong, and
+/// `fallback_request_untranslatable` is this request's own body being
+/// untranslatable. Nothing about the route is broken in either, and the next
+/// request may be fine.
+///
+/// The 401 at the end is a positive control, not an afterthought: without it a
+/// broken hook would make the absence above vacuous.
+#[tokio::test]
+async fn a_request_attributable_failure_fires_nothing() {
+    const SCRIPT: &[(StatusCode, &str)] = &[
+        (StatusCode::BAD_REQUEST, MISSING_MESSAGES),
+        (StatusCode::UNAUTHORIZED, UNAUTHORIZED),
+    ];
+    let log = hook_log_path("fallback-error-request-attributable");
+    let relay = start_scripted(SCRIPT, &log).await;
+
+    assert_eq!(one_request(relay).await, StatusCode::BAD_REQUEST);
+
+    // `role: "function"` is not a role the Anthropic Messages API has, so the
+    // request dies in translation without reaching the profile at all.
+    let untranslatable = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(format!(
+            r#"{{"model":"{OPEN_MODEL}","max_tokens":64,"messages":[{{"role":"function","content":"x"}}]}}"#
+        ))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(untranslatable.status(), StatusCode::BAD_GATEWAY);
+
+    // Now something that *is* the route's fault, so the hook is proven live.
+    assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
+
+    let lines = fallback_error_lines(&log, 1).await;
+    assert_eq!(
+        lines.len(),
+        1,
+        "only the 401 belongs to the route: {lines:?}"
+    );
+    assert_eq!(fields(&lines[0])[2], "fallback: http 401");
+
+    let _ = std::fs::remove_file(&log);
+}
+
+/// A failure with no status at all still names its cause, from the relay's own
+/// `&'static str` vocabulary. This is the other shape `RELAY_DETAIL` can take,
+/// and the one an operator sees when the provider's endpoint has gone away
+/// rather than answered.
+#[tokio::test]
+async fn a_provider_nothing_is_listening_on_fires_upstream_unreachable() {
+    set_profile_keys();
+    let log = hook_log_path("fallback-error-unreachable");
+    let anthropic_addr = serve(anthropic_upstream(Recorder::default(), false)).await;
+    let unreachable = closed_port().await;
+    let mut config = config(
+        anthropic_addr,
+        "notify-only",
+        profile(unreachable, "openai", OPENAI_KEY_ENV),
+    );
+    config.notify = relay::config::NotifyConfig {
+        command: Some(logging_hook(&log)),
+        timeout_secs: 5,
+    };
+    let relay = serve_relay_with(config, None).await;
+
+    assert_eq!(one_request(relay).await, StatusCode::BAD_GATEWAY);
+
+    let lines = fallback_error_lines(&log, 1).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(
+        fields(&lines[0]),
+        vec!["fallback_error", "", "fallback: upstream_unreachable"]
+    );
+
+    let _ = std::fs::remove_file(&log);
+}
+
+/// A fallback profile that holds every request until `concurrent` of them have
+/// arrived, then fails all of them at once. A barrier rather than a sleep: the
+/// property under test is what several failures *in flight together* do, so they
+/// have to be genuinely concurrent rather than probably concurrent.
+fn barrier_unauthorized_upstream(concurrent: usize) -> Router {
+    let barrier = Arc::new(tokio::sync::Barrier::new(concurrent));
+    Router::new().route(
+        "/v1/chat/completions",
+        any(move || {
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                json(StatusCode::UNAUTHORIZED, UNAUTHORIZED)
+            }
+        }),
+    )
+}
+
+/// The reason the edge-trigger is a `compare_exchange` and not a load followed by
+/// a store: a dead key fails every in-flight request at once, and a
+/// load-then-store lets all of them see "not failing yet" and all of them fire.
+#[tokio::test]
+async fn concurrent_failures_fire_exactly_one_fallback_error() {
+    const CONCURRENT: usize = 8;
+    let log = hook_log_path("fallback-error-concurrent");
+    let relay = start_notified(|_| barrier_unauthorized_upstream(CONCURRENT), &log).await;
+
+    let mut requests = Vec::new();
+    for _ in 0..CONCURRENT {
+        requests.push(tokio::spawn(async move { one_request(relay).await }));
+    }
+    for request in requests {
+        assert_eq!(
+            request.await.expect("request panicked"),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    let lines = fallback_error_lines(&log, 1).await;
+    assert_eq!(
+        lines.len(),
+        1,
+        "{CONCURRENT} concurrent failures notified more than once: {lines:?}"
+    );
+
+    let _ = std::fs::remove_file(&log);
+}
+
+/// `SMALL` overflows, `MEDIUM` answers, and `LARGE` answers 401 — the escalation
+/// shape plus a rung that fails the route, so one relay can hold both halves of
+/// the test below.
+fn escalating_then_unauthorized(recorder: Recorder) -> Router {
+    Router::new().route(
+        "/v1/chat/completions",
+        any(move |request: Request| {
+            let recorder = recorder.clone();
+            async move {
+                let body = record(&recorder, request).await;
+                match body["model"].as_str().unwrap_or_default() {
+                    SMALL => json(StatusCode::BAD_REQUEST, TOGETHER_CONTEXT_LIMIT),
+                    LARGE => json(StatusCode::UNAUTHORIZED, UNAUTHORIZED),
+                    _ => json(StatusCode::OK, OPENAI_COMPLETION),
+                }
+            }
+        }),
+    )
+}
+
+/// **The live drill, as a test.** Escalation (§7e) turns one client request into
+/// as many as three upstream requests, and this is the sequence measured on
+/// 2026-08-12: `gpt-oss-20b` 400 → `Kimi-K2.7-Code` 200, one client request, one
+/// success. The 400 is a superseded attempt, so notifying an outage for it would
+/// report one that did not happen — which is why the event is decided from the
+/// outcome the route hands the client rather than from each attempt.
+///
+/// The `claude-opus` request afterwards is the positive control: it lands on the
+/// rung that answers 401, so the single line proves the hook was live all along
+/// and that the escalated request contributed nothing to it.
+#[tokio::test]
+async fn a_context_limit_that_escalates_to_a_success_fires_nothing() {
+    let log = hook_log_path("fallback-error-escalated");
+    let hook = logging_hook(&log);
+    let relay = start_laddered_with(&LIVE_LADDER, escalating_then_unauthorized, |config| {
+        config.policy.escalation_order = order(&LIVE_ORDER);
+        config.notify = relay::config::NotifyConfig {
+            command: Some(hook),
+            timeout_secs: 5,
+        };
+    })
+    .await;
+
+    let (code, body) = ask(&relay, HAIKU).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(
+        models_seen(&relay.fallback),
+        [SMALL, MEDIUM],
+        "the escalation this test is about did not happen"
+    );
+
+    let (code, _) = ask(&relay, OPUS).await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED);
+
+    let lines = fallback_error_lines(&log, 1).await;
+    assert_eq!(
+        lines.len(),
+        1,
+        "a superseded attempt notified an outage that did not happen: {lines:?}"
+    );
+    assert_eq!(fields(&lines[0])[2], "fallback: http 401");
+
+    let _ = std::fs::remove_file(&log);
 }

@@ -22,6 +22,7 @@ use indexmap::IndexMap;
 use serde_json::{Value, json};
 
 use crate::config::{PolicyConfig, ProfileConfig};
+use crate::notify::{FallbackCause, NotifyEvent};
 use crate::provider_error::ProviderError;
 use crate::proxy::{CountingStream, ERROR_BODY_CAP, RequestLog, elapsed_ms, forwardable};
 use crate::state::AppState;
@@ -58,6 +59,69 @@ pub async fn forward(
     body: Bytes,
     request: FallbackRequest<'_>,
 ) -> Response {
+    // Copied out before `request` is consumed. A `&str` copy, so the success path
+    // allocates nothing: the profile name is only formatted into a notification.
+    let profile_name = request.profile_name;
+
+    match deliver(state, start, method, path, body, request).await {
+        // Spec §4: **only a 2xx re-arms.** It is the sole unambiguous proof that
+        // the whole path works — credentials, network, translation, provider — so
+        // a request-attributable 4xx does not clear the flag, however much
+        // reaching the provider looks like proof that the route is fine.
+        //
+        // `Relaxed`, like `fallback_requests_served`: this flag publishes no
+        // other memory, and the mutual exclusion below is a property of the
+        // read-modify-write itself rather than of any ordering.
+        Outcome::Served(response) => {
+            state.fallback_failing.store(false, Ordering::Relaxed);
+            response
+        }
+        Outcome::Rejected(response) => response,
+        Outcome::Broken(response, cause) => {
+            // One notification per failing streak, fired on the *edge*. A
+            // `compare_exchange` rather than a load-then-store because a dead key
+            // fails every in-flight request at once, and the load-then-store
+            // version would let several of them all see `false` and all fire.
+            if state
+                .fallback_failing
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                state.notifier.notify_event(NotifyEvent::FallbackError {
+                    profile: profile_name.to_string(),
+                    cause,
+                });
+            }
+            response
+        }
+    }
+}
+
+/// What the fallback route hands the client, and what that means for spec §4's
+/// `fallback_error`. **The event is decided from this, not from each upstream
+/// attempt:** escalation (§7e) turns one client request into as many as three
+/// upstream requests, and a superseded attempt's failure is not an outage. The
+/// loop below `continue`s past such an attempt without producing an `Outcome` at
+/// all, which is what makes that structural rather than a rule to remember.
+enum Outcome {
+    /// A 2xx. The only thing that re-arms the edge-trigger.
+    Served(Response),
+    /// *This request* was wrong; nothing about the route is broken and the next
+    /// request may be fine. Neither fires nor re-arms.
+    Rejected(Response),
+    /// *The route* is not delivering answers — the thing an operator is worth
+    /// waking for.
+    Broken(Response, FallbackCause),
+}
+
+async fn deliver(
+    state: &AppState,
+    start: Instant,
+    method: Method,
+    path: String,
+    body: Bytes,
+    request: FallbackRequest<'_>,
+) -> Outcome {
     let profile = request.profile;
     // The slot exists only where the remap happened. A request routed here by
     // name (§7d) keeps the name the client chose, so there is no alias slot to
@@ -86,7 +150,7 @@ pub async fn forward(
                 error = %err,
                 "could not prepare the request for the fallback profile"
             );
-            return fallback_error(StatusCode::BAD_GATEWAY, "fallback_request_untranslatable");
+            return request_failure(StatusCode::BAD_GATEWAY, "fallback_request_untranslatable");
         }
     };
 
@@ -100,7 +164,12 @@ pub async fn forward(
                 reason = err.reason(),
                 "the fallback profile's API key is unusable"
             );
-            return fallback_error(StatusCode::BAD_GATEWAY, err.code());
+            // Route-attributable, though the brief's fires/does-not list did not
+            // name it: an unset or unusable `api_key_env` fails every request
+            // identically until an operator changes config or environment, which
+            // is the same class as the 401 this event exists for — and a key
+            // rotation that did not take is its likeliest shape.
+            return route_failure(StatusCode::BAD_GATEWAY, err.code());
         }
     };
 
@@ -152,9 +221,14 @@ pub async fn forward(
                 // nothing the client can use, purely because the relay tried to
                 // help. A response with a status *is* reported as itself, however
                 // unhelpful: the freshest truth wins where there is one.
+                //
+                // Which also settles what this means for §4: the carried answer
+                // is a status the provider really sent, so it classifies as
+                // itself — the client has an answer it can act on, and the hop
+                // that could not be sent is a superseded attempt.
                 return match carried {
-                    Some(previous) => previous.into_response(None),
-                    None => fallback_error(StatusCode::BAD_GATEWAY, "upstream_unreachable"),
+                    Some(previous) => previous.into_outcome(None),
+                    None => route_failure(StatusCode::BAD_GATEWAY, "upstream_unreachable"),
                 };
             }
         };
@@ -266,13 +340,13 @@ pub async fn forward(
                 // The hop happened and was paid for, so it keeps its own §9 line;
                 // the carried answer's line went out when its hop was decided.
                 log.emit(failure.upstream_bytes);
-                return previous.into_response(None);
+                return previous.into_outcome(None);
             }
-            return failure.into_response(Some(log));
+            return failure.into_outcome(Some(log));
         }
 
         if !translated {
-            return passthrough_response(status, upstream, log);
+            return Outcome::Served(passthrough_response(status, upstream, log));
         }
 
         if stream {
@@ -291,7 +365,7 @@ pub async fn forward(
             response
                 .headers_mut()
                 .insert("cache-control", HeaderValue::from_static("no-cache"));
-            return response;
+            return Outcome::Served(response);
         }
 
         let raw = match read_capped(upstream, RESPONSE_CAP).await {
@@ -302,7 +376,7 @@ pub async fn forward(
                     reason,
                     "fallback response unusable"
                 );
-                return fallback_error(StatusCode::BAD_GATEWAY, "fallback_response_unreadable");
+                return route_failure(StatusCode::BAD_GATEWAY, "fallback_response_unreadable");
             }
         };
         let anthropic = match translate::response_to_anthropic(&raw, surface_reasoning) {
@@ -313,7 +387,7 @@ pub async fn forward(
                     error = %err,
                     "fallback response untranslatable"
                 );
-                return fallback_error(StatusCode::BAD_GATEWAY, "fallback_response_untranslatable");
+                return route_failure(StatusCode::BAD_GATEWAY, "fallback_response_untranslatable");
             }
         };
         log.emit(anthropic.len() as u64);
@@ -321,7 +395,7 @@ pub async fn forward(
         let mut response = Response::new(Body::from(anthropic));
         *response.status_mut() = status;
         *response.headers_mut() = translated_headers("application/json");
-        return response;
+        return Outcome::Served(response);
     }
 }
 
@@ -597,6 +671,48 @@ fn fallback_error(status: StatusCode, code: &'static str) -> Response {
     response
 }
 
+/// A relay-generated failure **the route** is answerable for: it fails every
+/// request the same way until something outside this request changes, so it is
+/// worth an operator's `fallback_error` (spec §4).
+///
+/// Named for its attribution, and paired with `request_failure`, deliberately:
+/// the alternative shapes — one central `match code`, or a marker read off the
+/// outgoing response — both need a default for a code they do not recognise, and
+/// **either default is silently wrong** (a new request-attributable code fires a
+/// false outage, or a new route failure notifies nothing). Two named
+/// constructors have no default: a seventh failure site cannot compile without
+/// choosing one, and the choice is legible where the failure is known.
+fn route_failure(status: StatusCode, code: &'static str) -> Outcome {
+    Outcome::Broken(fallback_error(status, code), FallbackCause::Relay(code))
+}
+
+/// A relay-generated failure **this request** is answerable for. Its twin above
+/// carries the reasoning.
+fn request_failure(status: StatusCode, code: &'static str) -> Outcome {
+    Outcome::Rejected(fallback_error(status, code))
+}
+
+/// Which provider statuses mean *the route* is broken rather than *this request*
+/// (spec §4). Classified by attributability, not by status class — 401/402/403
+/// are the motivating case and none of them is a 5xx, so no `is_client_error`
+/// shortcut may stand in for this list.
+///
+/// An allowlist, not "everything but a denylist": a status nobody has captured
+/// from a provider here should cost a missed notification rather than a false
+/// "your fallback is down", which is the more expensive of the two mistakes. 407
+/// and 408 were the near misses considered and left out on that rule.
+fn route_attributable(status: StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        // Credentials, billing, or an intermediary refusing us.
+        401 | 402 | 403
+        // The fallback provider is throttling the relay. Note this changes
+        // nothing about *Anthropic's* route state — see the branch in `deliver`
+        // that reads the status, and the invariant documented there.
+        | 429
+    ) || status.is_server_error()
+}
+
 fn translated_headers(content_type: &'static str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static(content_type));
@@ -704,7 +820,15 @@ impl ProviderFailure {
     /// `log` is `None` in exactly one case — answering on behalf of an attempt
     /// whose §9 line was already emitted when its hop was decided, so emitting a
     /// second one would log that one attempt twice.
-    fn into_response(self, log: Option<RequestLog>) -> Response {
+    ///
+    /// Classifies itself for spec §4 on the way out, from `self.status` — the
+    /// status this error was *parsed* with, which is why it is held here rather
+    /// than passed in again. This is the only place a provider status is
+    /// classified, and it reads nothing from the provider's body: the message is
+    /// user- and attacker-influenced, and `RELAY_DETAIL` goes to an operator's
+    /// hook.
+    fn into_outcome(self, log: Option<RequestLog>) -> Outcome {
+        let status = self.status;
         let mut headers = translated_headers("application/json");
         // An allowlist of one, not `forwardable`'s denylist: this body is the
         // relay's, so the provider's `content-length` and `content-encoding`
@@ -720,9 +844,14 @@ impl ProviderFailure {
         }
 
         let mut response = Response::new(Body::from(body));
-        *response.status_mut() = self.status;
+        *response.status_mut() = status;
         *response.headers_mut() = headers;
-        response
+
+        if route_attributable(status) {
+            Outcome::Broken(response, FallbackCause::Status(status.as_u16()))
+        } else {
+            Outcome::Rejected(response)
+        }
     }
 }
 

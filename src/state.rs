@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -56,6 +56,20 @@ pub struct AppState {
     /// untranslatable body, a missing key, an unreachable endpoint — is not
     /// one the fallback served.
     pub fallback_requests_served: Arc<AtomicU64>,
+    /// Whether the fallback route is currently failing in a way the operator has
+    /// already been told about — spec §4's `fallback_error` is edge-triggered on
+    /// this flag rather than fired per failed request, because the failures it
+    /// exists for (a dead key, an unreachable provider, an exhausted balance)
+    /// fail *every* request and one hook run per request is unusable. Set by the
+    /// first route-attributable failure, cleared only by a 2xx
+    /// (`fallback::forward` owns both, and is the only place either happens).
+    ///
+    /// Global rather than per profile: only one profile is active at a time
+    /// (`policy.active_profile` plus `/control/profile`'s override), so a
+    /// per-profile flag would model a distinction the request path does not
+    /// have. Per-process rather than persisted to the state file: a restart
+    /// re-arms it, which is also when an operator is most likely to be looking.
+    pub fallback_failing: Arc<AtomicBool>,
     /// How much of a request body may be read to decide its route. A field
     /// rather than a constant read in place, so a test can drive the over-cap
     /// path — and the hand-rolled stream reassembly behind it — without an
@@ -119,6 +133,7 @@ impl AppState {
             route_updates,
             notifier,
             fallback_requests_served: Arc::new(AtomicU64::new(0)),
+            fallback_failing: Arc::new(AtomicBool::new(false)),
             routing_body_cap: crate::proxy::ROUTING_BODY_CAP,
             active_profile_override: Arc::new(Mutex::new(None)),
         })

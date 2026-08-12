@@ -27,18 +27,53 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SWITCH_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A transition worth announcing (spec §4), plus `ProfileSwitched` for
-/// `POST /control/profile` (spec §8b) — not a route transition at all, which
-/// is why it arrives through `notify_event` rather than `from_transition`.
+/// `POST /control/profile` (spec §8b) and `FallbackError` for the fallback
+/// route — neither a route transition at all, which is why both arrive through
+/// `notify_event` rather than `from_transition`.
 /// `Limited -> Probing` is not one of these: the window merely elapsed, and
 /// nothing has changed for the user until a request actually succeeds.
 ///
-/// `Copy` dropped to `Clone` for this variant's `name: String` — every other
-/// variant would still be `Copy` alone, but the enum is one type.
+/// `Copy` dropped to `Clone` for `ProfileSwitched`'s `name: String` — the two
+/// route transitions would still be `Copy` alone, but the enum is one type,
+/// which is what made adding a second `String`-carrying variant free.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifyEvent {
-    FailoverEngaged { reset_at: SystemTime },
+    FailoverEngaged {
+        reset_at: SystemTime,
+    },
     Recovered,
-    ProfileSwitched { name: String },
+    ProfileSwitched {
+        name: String,
+    },
+    /// Spec §4: the fallback route is not delivering answers. Edge-triggered by
+    /// `AppState::fallback_failing` — fired on entering that state and not again
+    /// until a fallback request succeeds — because the failures that motivate it
+    /// (a dead key, an unreachable provider, an exhausted balance) fail *every*
+    /// request, and one notification per request is unusable.
+    ///
+    /// A fallback response says nothing about Anthropic's route state, so this
+    /// is not derivable from a `RouteTransition` even in principle
+    /// (`fallback.rs` documents that invariant).
+    FallbackError {
+        profile: String,
+        cause: FallbackCause,
+    },
+}
+
+/// Why the fallback route could not deliver, in vocabulary the relay owns:
+/// a status code, or one of `fallback.rs`'s own `&'static str` failure codes.
+///
+/// **Never provider-supplied text.** `RELAY_DETAIL` reaches an operator's hook,
+/// and a provider error body is attacker- and user-influenced — Task 9B measured
+/// a malformed 400 whose body echoed the user's own chat text back, which is why
+/// `provider_error.rs`'s detection was narrowed. The profile name that goes
+/// alongside is operator-chosen config, which is what makes *it* allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FallbackCause {
+    /// One of the fallback route's own failure codes.
+    Relay(&'static str),
+    /// The provider's own status, and nothing else from its response.
+    Status(u16),
 }
 
 impl NotifyEvent {
@@ -57,6 +92,7 @@ impl NotifyEvent {
             Self::FailoverEngaged { .. } => "failover_engaged",
             Self::Recovered => "recovered",
             Self::ProfileSwitched { .. } => "profile_switched",
+            Self::FallbackError { .. } => "fallback_error",
         }
     }
 }
@@ -69,11 +105,14 @@ impl NotifyEvent {
 ///
 /// `profile_switched` carries its name in `RELAY_DETAIL`: spec §4 and §8b
 /// name exactly these three vars and no fourth for a profile, so this reuses
-/// the contract that exists rather than inventing one.
+/// the contract that exists rather than inventing one. `fallback_error` names
+/// its profile and cause the same way, for the same reason.
 fn env_vars(event: &NotifyEvent) -> [(&'static str, String); 3] {
     let reset_at = match event {
         NotifyEvent::FailoverEngaged { reset_at } => rfc3339(*reset_at).unwrap_or_default(),
-        NotifyEvent::Recovered | NotifyEvent::ProfileSwitched { .. } => String::new(),
+        NotifyEvent::Recovered
+        | NotifyEvent::ProfileSwitched { .. }
+        | NotifyEvent::FallbackError { .. } => String::new(),
     };
     let detail = match event {
         NotifyEvent::FailoverEngaged { .. } if reset_at.is_empty() => {
@@ -84,6 +123,14 @@ fn env_vars(event: &NotifyEvent) -> [(&'static str, String); 3] {
         }
         NotifyEvent::Recovered => "anthropic route recovered".to_string(),
         NotifyEvent::ProfileSwitched { name } => format!("active profile switched to {name}"),
+        // Assembled here rather than at the call site, like every other
+        // variant's, so the whole env contract stays in one function — and so
+        // the "nothing from the provider's body" rule is checkable by reading
+        // `FallbackCause` and this arm, without auditing the route.
+        NotifyEvent::FallbackError { profile, cause } => match cause {
+            FallbackCause::Relay(code) => format!("{profile}: {code}"),
+            FallbackCause::Status(status) => format!("{profile}: http {status}"),
+        },
     };
     [
         ("RELAY_EVENT", event.name().to_string()),
@@ -105,9 +152,11 @@ fn env_vars(event: &NotifyEvent) -> [(&'static str, String); 3] {
 /// `events` and `pending_switch` are deliberately separate, not one queue:
 /// `failover_engaged`/`recovered` must never be dropped or reordered, and
 /// there is no plausible flood of them (route state only transitions on
-/// Anthropic's own responses). `profile_switched` can flood — any loopback
-/// caller can fire `POST /control/profile` as fast as it can send HTTP
-/// requests — so it gets a single coalescing slot instead of a queue: any
+/// Anthropic's own responses). `fallback_error` shares the queue on the same
+/// terms, but *conditionally* — see `notify_event`. `profile_switched` can
+/// flood — any loopback caller can fire `POST /control/profile` as fast as it
+/// can send HTTP requests — so it gets a single coalescing slot instead of a
+/// queue: any
 /// number of switches in a row collapse to "the most recent one", which
 /// bounds how much they can delay a queued transition to at most one hook's
 /// `timeout_secs`, not N hooks run in series (`docs/decisions.md`'s R3
@@ -193,7 +242,8 @@ impl Notifier {
 
     /// Same guarantee as `notify`, for an event that is not itself a route
     /// transition — `profile_switched` (spec §8b), fired directly by the
-    /// `/control/profile` handler rather than derived from `RouteTransition`.
+    /// `/control/profile` handler rather than derived from `RouteTransition`,
+    /// and `fallback_error` (spec §4), fired by the fallback route.
     ///
     /// Routes by variant, not by caller: a `ProfileSwitched` always lands in
     /// the coalescing slot and everything else always lands on the FIFO
@@ -207,7 +257,17 @@ impl Notifier {
                 };
                 *pending_switch.lock().expect("poisoned") = Some(event);
             }
-            NotifyEvent::FailoverEngaged { .. } | NotifyEvent::Recovered => {
+            // **`FallbackError` is only safe on this queue because it is
+            // edge-triggered.** The FIFO's justification in the struct doc above
+            // is "there is no plausible flood of them", and a dead provider key
+            // is exactly a flood: one failure per request, for every request.
+            // What bounds it to one per outage is `AppState::fallback_failing`,
+            // in `fallback::forward` — not anything here. A change that makes
+            // this event fire per failed request has to move it to a coalescing
+            // slot, and nothing else in this file will say so.
+            NotifyEvent::FailoverEngaged { .. }
+            | NotifyEvent::Recovered
+            | NotifyEvent::FallbackError { .. } => {
                 let Some(events) = &self.events else {
                     return;
                 };
@@ -433,15 +493,52 @@ mod tests {
         );
     }
 
+    /// `fallback_error`'s detail is built from a status code and the profile's
+    /// configured name, and from nothing else. A provider's error *message* is
+    /// user- and attacker-influenced, so the only defence that holds is that
+    /// there is no field here to put it in.
+    #[test]
+    fn a_fallback_error_from_a_provider_status_names_the_profile_and_the_status() {
+        let event = NotifyEvent::FallbackError {
+            profile: "together".to_string(),
+            cause: FallbackCause::Status(401),
+        };
+        assert_eq!(value_of(&event, "RELAY_EVENT"), "fallback_error");
+        assert_eq!(value_of(&event, "RELAY_RESET_AT"), "");
+        assert_eq!(value_of(&event, "RELAY_DETAIL"), "together: http 401");
+    }
+
+    /// The other cause shape: a failure that never got a status at all, named
+    /// with the relay's own `&'static str` code.
+    #[test]
+    fn a_fallback_error_from_a_relay_code_names_the_code() {
+        let event = NotifyEvent::FallbackError {
+            profile: "together".to_string(),
+            cause: FallbackCause::Relay("upstream_unreachable"),
+        };
+        assert_eq!(value_of(&event, "RELAY_EVENT"), "fallback_error");
+        assert_eq!(value_of(&event, "RELAY_RESET_AT"), "");
+        assert_eq!(
+            value_of(&event, "RELAY_DETAIL"),
+            "together: upstream_unreachable"
+        );
+    }
+
     // --- running the hook ---
 
     #[test]
     fn no_command_configured_is_a_no_op() {
         let notifier = Notifier::spawn(&NotifyConfig::default());
         // Nothing to observe but the absence of a panic and of a thread: this
-        // is the default every existing config runs under.
+        // is the default every existing config runs under — including the
+        // deployed one, which sets no `notify.command` at all, so this is the
+        // path the fallback route is actually on today.
         notifier.notify(transition(RouteState::Active, limited(3600)));
         notifier.notify(transition(RouteState::Probing, RouteState::Active));
+        notifier.notify_event(NotifyEvent::FallbackError {
+            profile: "together".to_string(),
+            cause: FallbackCause::Status(401),
+        });
     }
 
     #[test]

@@ -1510,3 +1510,83 @@ positive costs money. One residual is recorded rather than closed: a reservation
 that happens to put a total count *before* the marker still looks like an input overflow.
 Narrowing that needs a matcher for reservation wording, which would be a guess at wording
 no capture here contains.
+
+## 2026-08-12 — Task S-1: `fallback_error` fires once per outage, not once per failure
+
+Spec §4 has named three notifier events since Milestone 2 and only two existed. Milestone
+3 then built six failure paths on the fallback route and scheduled none of them to notify,
+so the relay could fail every fallback request while the operator's hook stayed silent —
+which defeats the point of having a notifier on a failover path. It is not a distant
+hazard: the route is `LIMITED` until 2026-08-14, so every request is on the fallback right
+now, and the provider key in use is a throwaway assumed dead after 2026-08-18.
+
+**Edge-triggered on an `AtomicBool` in `AppState`, fired on entering the failing state and
+re-armed only by a 2xx.** A dead key, an unreachable provider or an exhausted balance
+fails *every* request, so the number of failures per outage is unbounded and equal to the
+traffic.
+
+**Rejected: fire per failed request.** A dead key turns that into one hook run per
+request. The notifier's FIFO exists precisely because "there is no plausible flood of
+them" is true of route transitions, and this would make it false. **A coalescing slot does
+not rescue it either**, which is the part worth recording: latest-wins still drains on
+every `SWITCH_CHECK_INTERVAL`, so a persistent outage still runs the hook twice a second
+forever, and collapsing distinct failures to "the most recent one" throws away the only
+interesting bit — that the outage *started*. The event an operator wants is an edge, so
+the edge is what the relay tracks.
+
+**Also available and not taken: a threshold of N consecutive failures.** It buys
+tolerance of a single blip, which is real — one 503 from a provider that then works is not
+an outage worth waking someone for. It was declined because the cost is a *worse* version
+of the same tradeoff: N failures means N requests must fail before the operator hears
+anything, and with Claude Code that is N lost turns, on a route whose whole reason for
+existing is that Anthropic is already unavailable. The blip case costs one spurious
+notification; the threshold case costs sessions. If it is ever wanted, it is a counter
+beside the flag rather than a different shape.
+
+**Only a 2xx re-arms, and a request-attributable 4xx explicitly does not.** Reaching the
+provider proves less than it looks like it does: a 400 means the credentials still might
+be dead. A 2xx is the sole unambiguous proof that the whole path works — credentials,
+network, translation, provider. The consequence taken knowingly is that a 2xx whose
+*stream* dies mid-body re-arms, because the head was a 2xx.
+
+**Classification is by attributability, not by status class.** 401/402/403 are the
+motivating case and none of them is a 5xx, so no `is_client_error`/`is_server_error`
+shortcut can stand in for the list. The provider allowlist is 401, 402, 403, 429 and every
+5xx; 400/404/413/422 do not fire, context-limit errors included — a context limit is
+actionable by the client and, after §7e escalation, is frequently followed by a 200 on the
+next rung (measured 2026-08-12: `gpt-oss-20b` 400 → `Kimi-K2.7-Code` 200, one client
+request, one success). Every other status does not fire; 407 and 408 were the near misses
+considered and left out, because a shape nobody has captured from a provider here should
+cost a missed notification rather than a false "your fallback is down". An unset or
+unusable `api_key_env` fires: it fails every request identically and is the likeliest
+shape of the incident this event exists for.
+
+**Decided from the response the client receives, not from each upstream attempt.** §7e
+makes one client request into as many as three upstream ones, and a superseded attempt's
+failure is not an outage. Implemented by giving the route's inner function a return type
+that is not `Response`: `Outcome::{Served, Rejected, Broken}`, with `fallback::forward` as
+the single place that touches the flag or the notifier. The escalation loop `continue`s
+past a superseded attempt without producing an `Outcome` at all, so "never from an attempt"
+is structural. Two consequences are recorded rather than closed: a hop that cannot be sent
+while a rung below has already answered does not fire (the client gets an actionable 400,
+and a fully dead provider still fires on the first attempt), and neither does a hop that
+answers 429 over a terminal 400 below it.
+
+**Rejected shapes for that decision point.** Six `return notify_event(...)` sites — the
+naive shape — fires on superseded attempts and silently skips the decision at a seventh
+site. A single central `match code`, and a marker read off the outgoing response, both
+need a default for an unrecognised code, and **either default is silently wrong**: one
+makes a new request-attributable code fire a false outage, the other makes a new route
+failure notify nothing. So the two relay-error constructors are named for their attribution
+instead — `route_failure` and `request_failure` — and there is no default at all.
+
+**`RELAY_DETAIL` is built from the relay's own vocabulary only** — a status code, this
+route's `&'static str` failure codes, and the operator-chosen profile name. Never from
+provider text: Task 9B measured a malformed 400 whose body echoed the user's own chat text
+back, and this string goes to an operator's hook. `FallbackCause` has no variant that can
+hold a message, which is the version of that rule that cannot be forgotten.
+
+**The flag is global and per-process.** Global because only one profile is active at a
+time, so a per-profile flag would model a distinction the request path does not have.
+Per-process because a restart is also when an operator is most likely to be looking, and
+because nothing else about a fallback failure is persisted.
