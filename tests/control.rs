@@ -410,9 +410,11 @@ async fn wait_for_lines(path: &Path, count: usize) -> Vec<String> {
 /// `wait_for_lines` returns the instant it sees enough lines, so a count
 /// asserted on its result cannot catch a spurious extra one landing just
 /// after — this settles past that window before the final count is read, the
-/// same reasoning `tests/notify.rs::hook_lines_after_settling` uses.
-async fn lines_after_settling(path: &Path) -> Vec<String> {
-    tokio::time::sleep(Duration::from_millis(300)).await;
+/// same reasoning `tests/notify.rs::hook_lines_after_settling` uses. `settle`
+/// is the caller's, because how long "past that window" is depends on which
+/// queue the event under test travels on.
+async fn lines_after_settling(path: &Path, settle: Duration) -> Vec<String> {
+    tokio::time::sleep(settle).await;
     std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
@@ -452,10 +454,24 @@ async fn post_control_profile_fires_the_profile_switched_notifier_event() {
 /// is rejected before anything changes — must not queue a notifier event
 /// (matches `notify.rs`'s own "only real changes are reported" rule; a hook
 /// firing for a no-op switch would be a lie to whatever it tells the
-/// operator). Proven by a later, real switch: the notifier drains one FIFO
-/// queue serially, so anything wrongly queued by the two no-op attempts below
-/// would already be in the log by the time the real switch's own line
-/// appears, and `lines_after_settling` gives it a further window to show up.
+/// operator).
+///
+/// The order is load-bearing, and it is not the order a FIFO would want.
+/// `profile_switched` is the one event that lands in the notifier's
+/// *coalescing slot* rather than on the FIFO queue (`notify_event`, routed by
+/// variant), and the slot holds one event: a wrongly queued no-op is
+/// observable only while it is the slot's content, so any later real switch
+/// would overwrite it and the evidence with it. The real switch therefore comes
+/// **first** — which also proves the hook and the log path work, so the absence
+/// assertion below is about the no-ops rather than about a hook that never ran
+/// — and the no-op attempts get a full `SWITCH_CHECK_INTERVAL` tick
+/// (`src/notify.rs`: 500ms) plus a wide margin with nothing else queued, which
+/// is the window in which a wrongly queued switch reaches the log.
+///
+/// Flake direction, deliberately: the settle can only be too *short*, never too
+/// long. A line appears in that window only if something notified, so this
+/// cannot go falsely red — it could only go falsely green, which is what the
+/// 3x margin buys down.
 #[tokio::test]
 async fn a_switch_that_changes_nothing_fires_no_notifier_event() {
     let log = unique_temp_dir("control-notify-noop").with_extension("log");
@@ -472,20 +488,26 @@ async fn a_switch_that_changes_nothing_fires_no_notifier_event() {
     };
     let relay = serve_relay_with(cfg, None).await;
 
-    // Already-active: no real change (I2).
-    let (status, _) = post_json(relay, "/control/profile", json!({"name": "profile-a"})).await;
+    // The one real switch, whose notification is the only one that should
+    // exist. `profile-a` is the startup default, so this changes something.
+    let (status, _) = post_json(relay, "/control/profile", json!({"name": "profile-b"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        wait_for_lines(&log, 1).await,
+        vec!["active profile switched to profile-b"]
+    );
+
+    // Already-active: no real change (I2). `profile-b` is now active through
+    // the override rather than through the config default, which is the harder
+    // of the two baselines `set_active_profile` has to get right.
+    let (status, _) = post_json(relay, "/control/profile", json!({"name": "profile-b"})).await;
     assert_eq!(status, StatusCode::OK);
 
     // Unknown name: rejected before anything changes (M8).
     let (status, _) = post_json(relay, "/control/profile", json!({"name": "ghost"})).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // The one real switch, whose notification is the only one that should exist.
-    let (status, _) = post_json(relay, "/control/profile", json!({"name": "profile-b"})).await;
-    assert_eq!(status, StatusCode::OK);
-
-    wait_for_lines(&log, 1).await;
-    let lines = lines_after_settling(&log).await;
+    let lines = lines_after_settling(&log, Duration::from_millis(1500)).await;
     assert_eq!(
         lines,
         vec!["active profile switched to profile-b"],
