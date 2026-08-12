@@ -110,6 +110,11 @@ pub async fn forward(
     // change the shape of a message already in flight.
     let surface_reasoning = state.config.policy.surface_fallback_reasoning;
 
+    // The answer the rung below produced, kept only while a hop is in flight. It
+    // is what makes one thing true of this whole feature: turning it on cannot
+    // leave the client with a worse answer than leaving it off would have.
+    let mut carried: Option<ProviderFailure> = None;
+
     // One iteration per upstream attempt. A second iteration happens only where
     // the escalation branch below asks for one, and only ever up the ladder —
     // `Ladder::next_target` consumes the rung it returns.
@@ -139,7 +144,18 @@ pub async fn forward(
                     error = %err.without_url(),
                     "fallback upstream request failed"
                 );
-                return fallback_error(StatusCode::BAD_GATEWAY, "upstream_unreachable");
+                // A hop that could not even be sent has nothing of its own to
+                // report, and the rung below it produced an answer the client can
+                // act on — 9B's translated context-limit error. Handing over the
+                // relay's own `upstream_unreachable` instead would replace an
+                // actionable Anthropic error with a relay-internal code that says
+                // nothing the client can use, purely because the relay tried to
+                // help. A response with a status *is* reported as itself, however
+                // unhelpful: the freshest truth wins where there is one.
+                return match carried {
+                    Some(previous) => previous.into_response(None),
+                    None => fallback_error(StatusCode::BAD_GATEWAY, "upstream_unreachable"),
+                };
             }
         };
 
@@ -206,6 +222,7 @@ pub async fn forward(
                         log.emit(failure.upstream_bytes);
                         target_model = next;
                         prepared = next_prepared;
+                        carried = Some(failure);
                         continue;
                     }
                     Err(err) => {
@@ -221,7 +238,7 @@ pub async fn forward(
                     }
                 }
             }
-            return failure.into_response(log);
+            return failure.into_response(Some(log));
         }
 
         if !translated {
@@ -641,7 +658,11 @@ impl ProviderFailure {
     ///
     /// Reached on the last rung of an escalation too, unchanged: escalation
     /// failing is not a reason for the client to lose the recovery it already had.
-    fn into_response(self, log: RequestLog) -> Response {
+    ///
+    /// `log` is `None` in exactly one case — answering on behalf of an attempt
+    /// whose §9 line was already emitted when its hop was decided, so emitting a
+    /// second one would log that one attempt twice.
+    fn into_response(self, log: Option<RequestLog>) -> Response {
         let mut headers = translated_headers("application/json");
         // An allowlist of one, not `forwardable`'s denylist: this body is the
         // relay's, so the provider's `content-length` and `content-encoding`
@@ -652,7 +673,9 @@ impl ProviderFailure {
         }
 
         let body = self.error.to_anthropic();
-        log.emit(body.len() as u64);
+        if let Some(log) = log {
+            log.emit(body.len() as u64);
+        }
 
         let mut response = Response::new(Body::from(body));
         *response.status_mut() = self.status;

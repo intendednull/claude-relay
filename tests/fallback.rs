@@ -6,6 +6,7 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -3033,6 +3034,123 @@ async fn the_config_gate_turns_the_ladder_off() {
             .expect("a message string")
             .starts_with("prompt is too long: 170071 tokens > 131072"),
         "{body}"
+    );
+}
+
+/// A raw TCP mock: the first request gets `body` with `status`, and every request
+/// after it has its connection dropped with no response at all.
+///
+/// Not an axum router, because a handler always answers something — and "the hop
+/// could not be sent" is precisely the case with no response to report. Written
+/// against `TcpStream::try_read`/`try_write` rather than the `AsyncReadExt`
+/// extension traits, which this tree's tokio features do not include.
+/// Returns its address and a count of the connections it accepted, so a test can
+/// prove the hop was really attempted rather than passing because it never was.
+async fn one_answer_then_a_dead_connection(
+    status: StatusCode,
+    body: &'static str,
+) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind ephemeral port");
+    let addr = listener.local_addr().expect("failed to read local addr");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        let mut served = 0;
+        while let Ok((socket, _)) = listener.accept().await {
+            // Read what the relay sent before answering (or before hanging up), so
+            // the client is never writing into a socket that is already gone.
+            socket
+                .readable()
+                .await
+                .expect("socket never became readable");
+            let mut scratch = [0u8; 16 * 1024];
+            let _ = socket.try_read(&mut scratch);
+            served += 1;
+            counter.store(served, Ordering::Release);
+            if served > 1 {
+                drop(socket);
+                continue;
+            }
+            let response = format!(
+                "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("Error"),
+                body.len()
+            );
+            let mut rest = response.as_bytes();
+            while !rest.is_empty() {
+                socket
+                    .writable()
+                    .await
+                    .expect("socket never became writable");
+                match socket.try_write(rest) {
+                    Ok(written) => rest = &rest[written..],
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+    (addr, accepted)
+}
+
+/// The invariant that makes this feature safe to leave on: **escalation can never
+/// leave the client worse off than not escalating would have.** The hop here cannot
+/// even be sent — the provider accepts the connection and hangs up — so it has
+/// nothing of its own to report, and the client keeps the rung below's translated
+/// context-limit error rather than the relay's own `upstream_unreachable`, which
+/// says nothing it can act on.
+///
+/// Reachable in production: the retry opens a second connection to the same
+/// provider, and a provider that has just started failing answers the first and
+/// drops the second.
+#[tokio::test]
+async fn a_hop_that_cannot_be_sent_keeps_the_answer_the_rung_below_produced() {
+    set_profile_keys();
+    let anthropic_addr = serve(anthropic_upstream(Recorder::default(), false)).await;
+    let (fallback_addr, accepted) =
+        one_answer_then_a_dead_connection(StatusCode::BAD_REQUEST, TOGETHER_CONTEXT_LIMIT).await;
+    let relay = serve_relay_with(
+        config(
+            anthropic_addr,
+            "all",
+            laddered_profile(fallback_addr, &LIVE_LADDER),
+        ),
+        None,
+    )
+    .await;
+    drive_to_limited(relay).await;
+
+    let response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(session_start(HAIKU))
+        .send()
+        .await
+        .expect("request failed");
+    let code = response.status();
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("the body must be JSON");
+
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["type"], "invalid_request_error",
+        "a relay-internal 502 replaced an answer the client could act on: {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("a message string")
+            .starts_with("prompt is too long: 170071 tokens > 131072"),
+        "{body}"
+    );
+    // And the hop really was attempted, or the assertions above would hold for the
+    // uninteresting reason that nothing ever climbed.
+    assert_eq!(
+        accepted.load(Ordering::Acquire),
+        2,
+        "the escalated attempt was never sent, so this proved nothing"
     );
 }
 
