@@ -110,19 +110,35 @@ request handling.
 Anthropic's state (§7d) — and it is **edge-triggered: once per outage, not once per
 failed request.** The failures it exists for (a rejected key, an unreachable provider,
 an exhausted balance) fail *every* request, so a per-request event would be one hook run
-per request and would delay real transitions behind a queue of them. It fires on
-entering the failing state and not again until a fallback request **succeeds**; only a
-2xx re-arms it, being the sole unambiguous proof that credentials, network, translation
-and provider all work. There is deliberately no re-fire timer, and the flag is
-per-process — a restart re-arms it.
+per request and would delay real transitions behind a queue of them.
+
+It fires on entering the failing state and re-arms only after **five consecutive
+delivered responses**. One success is deliberately not enough: a 429 or a 5xx is
+intermittent by nature — a provider throttling the relay lets some requests through by
+definition — so a single-success re-arm makes the edge-trigger bound nothing at all and
+fires again on the next failure. A request-attributable failure counts for nothing either
+way. There is deliberately no re-fire timer; the flag is per-process, so a restart
+re-arms it; and `POST /control/profile` re-arms it too, because a switch points the route
+at different credentials and the outage the operator was told about is no longer the one
+in front of them.
+
+Two bounds hold independently of each other. The edge-trigger bounds how many *events*
+one outage produces, and the notifier gives `fallback_error` a **coalescing slot of its
+own** — separate from `profile_switched`'s and never the transition queue — which bounds
+how much it can delay a `failover_engaged` or a `recovered` whatever the request rate. A
+notification for it may therefore be collapsed into a later one; a route transition never
+can.
 
 What counts is **attributability, not status class**: the distinction that matters to an
 operator is "my fallback route is broken", not "that one request was wrong".
 
-- **Fires** — the route is not delivering answers: the request could not be sent at all;
-  the profile's API key is unset or unusable; the provider answered 401, 402, 403, 429
-  (which still changes nothing about Anthropic's route state) or any 5xx; the provider
-  answered 2xx with a body the relay could not read or translate.
+- **Fires** — the route is not delivering answers: the request could not be sent at all
+  (*unless* a lower escalation rung had already produced an answer the client can act on
+  — see below); the profile's API key is unset or unusable; the provider answered 401,
+  402, 403 or any 5xx; the provider answered 429, which still changes nothing about
+  Anthropic's route state (*429 and 5xx are also subject to the escalation carve-out
+  below; 401, 402 and 403 are not, being terminal*); the provider answered a
+  **non-streaming** 2xx with a body the relay could not read or translate.
 - **Does not fire** — this request was wrong and the next may be fine: the client's own
   body could not be translated for the profile; the provider answered 400, 404, 413 or
   422, context-limit errors included. A context limit is actionable by the client, and
@@ -130,11 +146,23 @@ operator is "my fallback route is broken", not "that one request was wrong".
 - Any other status does not fire. A false "your fallback is down" costs more than a
   missed notification on a shape nobody has seen.
 
+**A streaming 2xx is committed at its head.** The classification happens where the
+provider's status has arrived and no byte of the response exists yet, which is the same
+line that makes §7e's mid-stream prohibition structural. So a stream that dies mid-body
+neither fires this event nor withholds the re-arm, even though its buffered twin
+(`fallback_response_unreadable`) does fire. That is a known gap in the fire rule, not an
+oversight: closing it means deciding after the response has left the relay's hands, which
+is a second decision point and its own piece of work. The motivating case is unaffected —
+a rejected key answers 401 at the head, before any stream.
+
 The decision is made from the response the **client** receives, not from each upstream
 attempt: §7e turns one client request into as many as three, and a superseded attempt's
-failure is not an outage. `RELAY_DETAIL` names the profile and the cause, built from a
-status code and the relay's own failure codes only — never from provider-supplied text,
-which is user- and attacker-influenced (§7d).
+failure is not an outage. That is the escalation carve-out the Fires list points at — a
+hop that could not be sent, or that answered 429 or a 5xx, is masked whenever a lower rung
+had already produced a terminal answer, because the client receives that answer and acts
+on it. `RELAY_DETAIL` names the profile and the cause, built from a status code and the
+relay's own failure codes only — never from provider-supplied text, which is user- and
+attacker-influenced (§7d).
 
 ## 5. Limit detection
 

@@ -513,14 +513,20 @@ nothing to say, so a hook can run under `set -u`.
   which means nothing until a request actually succeeds.
 - **`fallback_error` fires once per outage, not once per failed request.** The
   failures it is for — a rejected key, an unreachable provider, an exhausted
-  balance — fail *every* request, so it fires on entering that state and not
-  again until a fallback request succeeds. Only a 2xx re-arms it, and there is
-  no "still broken" reminder timer. A restart re-arms it too.
+  balance — fail *every* request, so it fires on entering that state and re-arms
+  only after **five consecutive delivered responses**. One success is not enough
+  on purpose: a throttling provider lets some requests through, so re-arming on
+  one would notify again on the next failure. There is no "still broken"
+  reminder timer. A restart re-arms it, and so does switching profiles.
   A failure belonging to one request does not fire it at all: a body the
   translator refuses, or a provider 400/404/413/422 (a context limit is one of
   these, and the client acts on it — often getting a 200 from the next rung up
-  the ladder). Anything else the provider answers with — 401, 402, 403, 429, any
-  5xx — is the route's, and so is a 2xx the relay could not read or translate.
+  the ladder). Of the rest, these are the route's: 401, 402, 403, 429 and any
+  5xx, plus a **non-streaming** 2xx the relay could not read or translate. Any
+  other status — 407 from a corporate proxy, say — does **not** fire, because a
+  false "your fallback is down" costs more than a missed notification on a shape
+  nobody has seen. A *streaming* 2xx is committed at its head, so a stream that
+  dies mid-body does not fire it either (`docs/spec.md` §4 has the reasoning).
 - It inherits the relay's environment, which a desktop notifier needs
   (`DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`), and writes to the relay's own
   stdout/stderr.

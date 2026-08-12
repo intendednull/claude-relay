@@ -360,6 +360,13 @@ async fn switch_profile(State(state): State<AppState>, request: Request) -> Resp
     // queue a notification — matches `notify.rs`'s existing "only real
     // changes are reported" rule for route transitions.
     if state.set_active_profile(request.name.clone()) {
+        // A switch changes the very thing spec §4's `fallback_error` flag
+        // describes: a different provider, different credentials. Without this,
+        // switching away from a profile whose key just died to a *second* broken
+        // profile is silent — the flag is still set, so the new profile's own
+        // failure never notifies, and the only `RELAY_DETAIL` on the operator's
+        // screen names a profile that is no longer active.
+        state.rearm_fallback_error();
         state.notifier.notify_event(NotifyEvent::ProfileSwitched {
             name: request.name.clone(),
         });

@@ -450,6 +450,95 @@ async fn post_control_profile_fires_the_profile_switched_notifier_event() {
     let _ = std::fs::remove_file(&log);
 }
 
+/// A profile mock that refuses every request the way a dead key does.
+fn upstream_unauthorized() -> Router {
+    Router::new().route(
+        "/v1/messages",
+        any(|| async {
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+                ))
+                .expect("failed to build mock response")
+        }),
+    )
+}
+
+/// F6 of S-1's fix round 1: **a switch re-arms spec §4's `fallback_error`.**
+///
+/// The operator's key dies, they are told once, and they do the obvious thing —
+/// switch to another profile. If that one is also broken, the edge-trigger is
+/// still set from the first outage, so without a re-arm the second profile's own
+/// failure is **silent** and the only `RELAY_DETAIL` on their screen names a
+/// profile that is no longer active. A switch changes the very thing the flag
+/// describes: a different provider, different credentials.
+///
+/// Both mocks answer 401, so the two notifications differ only in having happened;
+/// the count is what carries the property. Each is waited for before the next is
+/// provoked, because `fallback_error` has a coalescing slot and two events sent
+/// before the worker drains it would collapse into one.
+#[tokio::test]
+async fn a_profile_switch_re_arms_the_fallback_error_event() {
+    let log = unique_temp_dir("control-notify-rearm").with_extension("log");
+    let anthropic = common::closed_port().await;
+    let a = serve(upstream_unauthorized()).await;
+    let b = serve(upstream_unauthorized()).await;
+    let mut cfg = config(anthropic, a, b);
+    cfg.notify = NotifyConfig {
+        command: Some(format!(
+            r#"printf '%s\n' "$RELAY_EVENT" >> {}"#,
+            log.display()
+        )),
+        timeout_secs: 5,
+    };
+    let relay = serve_relay_with(cfg, None).await;
+
+    let fallback_errors = |lines: Vec<String>| {
+        lines
+            .into_iter()
+            .filter(|line| line == "fallback_error")
+            .count()
+    };
+
+    // profile-a's own outage, announced once.
+    let refused = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(session(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(fallback_errors(wait_for_lines(&log, 1).await), 1);
+
+    post_json(relay, "/control/profile", json!({"name": "profile-b"})).await;
+
+    // profile-b is broken too, and the operator has to hear about *that*.
+    let refused = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(session(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+    let lines = wait_for_lines(&log, 3).await;
+    assert_eq!(
+        fallback_errors(lines.clone()),
+        2,
+        "the profile switched to is broken too, and its failure went unannounced: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line == "profile_switched"),
+        "the switch itself still announces: {lines:?}"
+    );
+
+    let _ = std::fs::remove_file(&log);
+}
+
 /// A switch that changes nothing — the target is already active, or the name
 /// is rejected before anything changes — must not queue a notifier event
 /// (matches `notify.rs`'s own "only real changes are reported" rule; a hook

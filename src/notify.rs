@@ -14,12 +14,13 @@ use crate::route_state::{RouteState, RouteTransition, rfc3339};
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// How long the worker blocks waiting on a queued transition before checking
-/// whether a `profile_switched` is pending (below). `mpsc::Receiver::
+/// whether either coalescing slot is populated (below). `mpsc::Receiver::
 /// recv_timeout` wakes immediately on an actual send regardless of this
-/// value, so this only bounds how promptly an *idle* period is noticed — a
-/// switch notification has no real latency requirement, so this is picked to
+/// value, so this only bounds how promptly an *idle* period is noticed —
+/// neither a switch nor a fallback-error notification has a real latency
+/// requirement, so this is picked to
 /// keep a relay sitting idle with `notify.command` set from waking up and
-/// re-checking an empty slot 20 times a second for the life of the process.
+/// re-checking empty slots 20 times a second for the life of the process.
 /// Kept as a poll rather than replaced with a wake-token push onto `events`
 /// (considered: it would remove the wakeups entirely) because the poll is a
 /// one-constant change with no architectural risk this late in the task,
@@ -45,11 +46,12 @@ pub enum NotifyEvent {
     ProfileSwitched {
         name: String,
     },
-    /// Spec §4: the fallback route is not delivering answers. Edge-triggered by
-    /// `AppState::fallback_failing` — fired on entering that state and not again
-    /// until a fallback request succeeds — because the failures that motivate it
-    /// (a dead key, an unreachable provider, an exhausted balance) fail *every*
-    /// request, and one notification per request is unusable.
+    /// Spec §4: the fallback route is not delivering answers. Edge-triggered in
+    /// `AppState` — fired on entering that state and not again until
+    /// `RE_ARM_SUCCESSES` consecutive fallback requests have been delivered —
+    /// because the failures that motivate it (a dead key, an unreachable
+    /// provider, an exhausted balance) fail *every* request, and one
+    /// notification per request is unusable.
     ///
     /// A fallback response says nothing about Anthropic's route state, so this
     /// is not derivable from a `RouteTransition` even in principle
@@ -149,30 +151,56 @@ fn env_vars(event: &NotifyEvent) -> [(&'static str, String); 3] {
 /// Handing the event over a channel keeps spawning, waiting and killing over
 /// here, where the only thing a slow hook can delay is the next notification.
 ///
-/// `events` and `pending_switch` are deliberately separate, not one queue:
-/// `failover_engaged`/`recovered` must never be dropped or reordered, and
+/// `events` and the two coalescing slots are deliberately separate, not one
+/// queue. `failover_engaged`/`recovered` must never be dropped or reordered, and
 /// there is no plausible flood of them (route state only transitions on
-/// Anthropic's own responses). `fallback_error` shares the queue on the same
-/// terms, but *conditionally* — see `notify_event`. `profile_switched` can
-/// flood — any loopback caller can fire `POST /control/profile` as fast as it
-/// can send HTTP requests — so it gets a single coalescing slot instead of a
-/// queue: any
-/// number of switches in a row collapse to "the most recent one", which
-/// bounds how much they can delay a queued transition to at most one hook's
-/// `timeout_secs`, not N hooks run in series (`docs/decisions.md`'s R3
-/// entry has the measurements).
+/// Anthropic's own responses), so **the FIFO holds transitions and nothing
+/// else**. Both of the other events can flood — `profile_switched` because any
+/// loopback caller can fire `POST /control/profile` as fast as it can send HTTP
+/// requests, `fallback_error` because a route failing intermittently re-arms and
+/// re-fires (measured: `docs/decisions.md`'s fix-round-1 entry) — so each gets a
+/// single coalescing slot instead: any number in a row collapse to "the most
+/// recent one", which bounds how much they can delay a queued transition to at
+/// most one hook's `timeout_secs` each, not N hooks run in series
+/// (`docs/decisions.md`'s R3 entry has the original measurements).
 ///
 /// `Clone`: `AppState` hands one end to `RouteUpdates` and keeps another for
 /// `/control/profile` to fire `profile_switched` directly — both point at the
-/// same channel and the same slot, so either can send without the other's
+/// same channel and the same slots, so either can send without the other's
 /// cooperation.
 #[derive(Clone)]
 pub struct Notifier {
     /// `None` when no command is configured: no thread, no work, no error.
     events: Option<Sender<NotifyEvent>>,
-    /// `None` alongside `events`. Always `Some(ProfileSwitched { .. })` or
-    /// `None` when `events` is `Some` — nothing else is ever stored here.
-    pending_switch: Option<Arc<Mutex<Option<NotifyEvent>>>>,
+    /// `None` alongside `events`. Only ever holds a `ProfileSwitched`.
+    pending_switch: Option<Slot>,
+    /// `None` alongside `events`. Only ever holds a `FallbackError`. A slot of
+    /// its own rather than a share of `pending_switch`: coalescing an outage
+    /// notification into a profile switch would drop one of them, and they are
+    /// unrelated events.
+    pending_fallback_error: Option<Slot>,
+}
+
+/// One coalescing slot: latest-wins, holding at most one event.
+///
+/// The lock is taken and released *inside* `take`/`put`, which is what keeps it
+/// from being held across a hook run. That is not a style preference — an early
+/// draft of the drain-order mutation in
+/// `a_live_flood_of_switches_does_not_delay_a_transition_queued_mid_flood`
+/// accidentally passed because `if let Some(e) = lock().take()` extends the
+/// guard's lifetime over the body, blocking every sender for the hook's whole
+/// duration. A method boundary makes that shape unwritable here.
+#[derive(Clone, Default)]
+struct Slot(Arc<Mutex<Option<NotifyEvent>>>);
+
+impl Slot {
+    fn put(&self, event: NotifyEvent) {
+        *self.0.lock().expect("poisoned") = Some(event);
+    }
+
+    fn take(&self) -> Option<NotifyEvent> {
+        self.0.lock().expect("poisoned").take()
+    }
 }
 
 impl Notifier {
@@ -181,13 +209,32 @@ impl Notifier {
             return Self {
                 events: None,
                 pending_switch: None,
+                pending_fallback_error: None,
             };
         };
         let timeout = Duration::from_secs(config.timeout_secs);
         let (events, inbox) = mpsc::channel::<NotifyEvent>();
-        let pending_switch = Arc::new(Mutex::new(None::<NotifyEvent>));
-        let worker_switch = pending_switch.clone();
+        let pending_switch = Slot::default();
+        let pending_fallback_error = Slot::default();
+        let slots = [pending_switch.clone(), pending_fallback_error.clone()];
         thread::spawn(move || {
+            // Which slot gets first refusal, alternating on every event actually
+            // taken from one. Fixed priority in either direction would let a slot
+            // that is repopulated as fast as it is drained hold the other off
+            // indefinitely, and both can be repopulated at traffic rate. This
+            // caps a slot's wait at one pass rather than leaving it unbounded.
+            //
+            // A transition never competes here: the FIFO is read first and
+            // `recv_timeout` returns the moment one is sent, so this is only ever
+            // reached with no transition waiting.
+            let mut first = 0usize;
+            let take_pending = |first: &mut usize| {
+                let taken = slots[*first].take().or_else(|| slots[1 - *first].take());
+                if taken.is_some() {
+                    *first = 1 - *first;
+                }
+                taken
+            };
             // Ends when every clone of this `Notifier` is dropped — `AppState`
             // holds one directly and hands another to `RouteUpdates`, both the
             // same underlying `Sender`, so this outlives either alone.
@@ -195,11 +242,11 @@ impl Notifier {
                 let event = match inbox.recv_timeout(SWITCH_CHECK_INTERVAL) {
                     // A transition is always handled the moment it's seen —
                     // `recv_timeout` returns as soon as one is sent, it does
-                    // not wait out `SWITCH_CHECK_INTERVAL` — so a switch
-                    // sitting in `worker_switch` never runs ahead of one.
+                    // not wait out `SWITCH_CHECK_INTERVAL` — so an event
+                    // sitting in a slot never runs ahead of one.
                     Ok(event) => event,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        let Some(event) = worker_switch.lock().expect("poisoned").take() else {
+                        let Some(event) = take_pending(&mut first) else {
                             continue;
                         };
                         event
@@ -207,16 +254,16 @@ impl Notifier {
                     // The FIFO drains every buffered transition before
                     // reporting `Disconnected` (`mpsc`'s own guarantee), so a
                     // transition sent just before the last `Notifier` drops
-                    // is never lost. A pending switch sits in `worker_switch`
-                    // instead, outside that guarantee, so it needs the same
-                    // one-more-look here — without this, disconnecting
-                    // while a switch is still in the slot loses it silently.
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        match worker_switch.lock().expect("poisoned").take() {
-                            Some(event) => event,
-                            None => break,
-                        }
-                    }
+                    // is never lost. A pending slot event sits outside that
+                    // guarantee, so it needs the same one-more-look here —
+                    // without this, disconnecting while an event is still in a
+                    // slot loses it silently. One per pass is enough: this arm
+                    // is re-entered immediately for as long as anything is
+                    // left, because `Disconnected` is sticky.
+                    Err(mpsc::RecvTimeoutError::Disconnected) => match take_pending(&mut first) {
+                        Some(event) => event,
+                        None => break,
+                    },
                 };
                 // A panic here would otherwise end the thread, and every later
                 // event would vanish into a channel nobody reads.
@@ -228,6 +275,7 @@ impl Notifier {
         Self {
             events: Some(events),
             pending_switch: Some(pending_switch),
+            pending_fallback_error: Some(pending_fallback_error),
         }
     }
 
@@ -245,29 +293,42 @@ impl Notifier {
     /// `/control/profile` handler rather than derived from `RouteTransition`,
     /// and `fallback_error` (spec §4), fired by the fallback route.
     ///
-    /// Routes by variant, not by caller: a `ProfileSwitched` always lands in
-    /// the coalescing slot and everything else always lands on the FIFO
-    /// queue, so this is the one place that distinction has to be kept
-    /// straight, rather than every call site remembering which is which.
+    /// Routes by variant, not by caller: a route transition always lands on the
+    /// FIFO and each of the other two events always lands in its own coalescing
+    /// slot, so this is the one place that distinction has to be kept straight,
+    /// rather than every call site remembering which is which.
+    ///
+    /// **Nothing but a transition may go on the FIFO**, and the reason is
+    /// measured rather than stylistic. `fallback_error` was on it for one review
+    /// round, justified by being edge-triggered — but the edge re-arms on a
+    /// success, so a route failing *intermittently* fires per failure, and each
+    /// event holds the single worker for up to `timeout_secs`. A reviewer drove 40
+    /// alternating requests and a real `failover_engaged` reached the hook 6.79s
+    /// after detection, against the 1.8s bound
+    /// `a_live_flood_of_switches_does_not_delay_a_transition_queued_mid_flood`
+    /// holds for the same property. A slot caps this event's contribution at one
+    /// hook run per pass whatever the request rate, which the edge-trigger alone
+    /// cannot do.
     pub fn notify_event(&self, event: NotifyEvent) {
         match &event {
             NotifyEvent::ProfileSwitched { .. } => {
-                let Some(pending_switch) = &self.pending_switch else {
+                let Some(slot) = &self.pending_switch else {
                     return;
                 };
-                *pending_switch.lock().expect("poisoned") = Some(event);
+                slot.put(event);
             }
-            // **`FallbackError` is only safe on this queue because it is
-            // edge-triggered.** The FIFO's justification in the struct doc above
-            // is "there is no plausible flood of them", and a dead provider key
-            // is exactly a flood: one failure per request, for every request.
-            // What bounds it to one per outage is `AppState::fallback_failing`,
-            // in `fallback::forward` — not anything here. A change that makes
-            // this event fire per failed request has to move it to a coalescing
-            // slot, and nothing else in this file will say so.
-            NotifyEvent::FailoverEngaged { .. }
-            | NotifyEvent::Recovered
-            | NotifyEvent::FallbackError { .. } => {
+            // Latest-wins here loses a *repeat*, and can collapse two different
+            // causes into the most recent one. Both are acceptable for the same
+            // reason `profile_switched`'s slot is: the interesting bit is that the
+            // route is failing now, and the current cause is the freshest truth
+            // about why.
+            NotifyEvent::FallbackError { .. } => {
+                let Some(slot) = &self.pending_fallback_error else {
+                    return;
+                };
+                slot.put(event);
+            }
+            NotifyEvent::FailoverEngaged { .. } | NotifyEvent::Recovered => {
                 let Some(events) = &self.events else {
                     return;
                 };
@@ -832,6 +893,104 @@ mod tests {
         let line = wait_for_file(&log, Duration::from_secs(5));
         assert_eq!(line, "active profile switched to c");
         let _ = fs::remove_file(&log);
+    }
+
+    /// **Fix round 1's arbitration rule, as behaviour.** Two floods at once, one
+    /// into each coalescing slot. Both events must be announced: with fixed
+    /// priority in either direction, a slot repopulated as fast as it is drained
+    /// holds the other off indefinitely — and both of these can be repopulated at
+    /// traffic rate (`profile_switched` by any loopback caller, `fallback_error`
+    /// by an intermittently failing route). The worker alternates which slot gets
+    /// first refusal, so neither can starve the other.
+    ///
+    /// Waits for both rather than asserting a bound: what a fixed priority breaks
+    /// is liveness, and "the starved event never arrives" is what a deadline
+    /// catches.
+    #[test]
+    fn neither_coalescing_slot_starves_the_other_under_a_double_flood() {
+        let log = temp_path("double-flood");
+        let notifier = Notifier::spawn(&NotifyConfig {
+            command: Some(format!(
+                r#"printf '%s\n' "$RELAY_EVENT" >> {}"#,
+                log.display()
+            )),
+            timeout_secs: 5,
+        });
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut floods = Vec::new();
+        for slot in 0..2 {
+            let notifier = notifier.clone();
+            let stop = stop.clone();
+            floods.push(thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    notifier.notify_event(if slot == 0 {
+                        NotifyEvent::ProfileSwitched {
+                            name: "flood".to_string(),
+                        }
+                    } else {
+                        NotifyEvent::FallbackError {
+                            profile: "flood".to_string(),
+                            cause: FallbackCause::Status(401),
+                        }
+                    });
+                    thread::sleep(Duration::from_micros(100));
+                }
+            }));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let seen = loop {
+            let seen = fs::read_to_string(&log).unwrap_or_default();
+            if seen.lines().any(|line| line == "profile_switched")
+                && seen.lines().any(|line| line == "fallback_error")
+            {
+                break seen;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "one slot starved the other: {seen:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for flood in floods {
+            let _ = flood.join();
+        }
+
+        assert!(seen.lines().any(|line| line == "profile_switched"));
+        assert!(seen.lines().any(|line| line == "fallback_error"));
+        let _ = fs::remove_file(&log);
+    }
+
+    /// Y6's twin for the second slot: the "one more look" in the `Disconnected`
+    /// arm has to cover both slots, or a `fallback_error` pending when the last
+    /// `Notifier` clone drops is lost silently.
+    #[test]
+    fn a_pending_fallback_error_is_still_delivered_when_the_notifier_is_dropped() {
+        for attempt in 0..5 {
+            let log = temp_path(&format!("shutdown-drain-fallback-{attempt}"));
+            let notifier = Notifier::spawn(&NotifyConfig {
+                command: Some(format!(
+                    r#"printf '%s' "$RELAY_DETAIL" >> {}"#,
+                    log.display()
+                )),
+                timeout_secs: 5,
+            });
+            notifier.notify_event(NotifyEvent::FallbackError {
+                profile: "vanishing".to_string(),
+                cause: FallbackCause::Relay("upstream_unreachable"),
+            });
+            drop(notifier);
+
+            assert_eq!(
+                wait_for_file(&log, Duration::from_secs(5)),
+                "vanishing: upstream_unreachable",
+                "attempt {attempt}"
+            );
+            let _ = fs::remove_file(&log);
+        }
     }
 
     /// Y6: a `profile_switched` still sitting in the coalescing slot when

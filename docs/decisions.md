@@ -1590,3 +1590,105 @@ hold a message, which is the version of that rule that cannot be forgotten.
 time, so a per-profile flag would model a distinction the request path does not have.
 Per-process because a restart is also when an operator is most likely to be looking, and
 because nothing else about a fallback failure is persisted.
+
+## 2026-08-12 — Task S-1 fix round 1: the edge-trigger bounded a monotone outage and nothing else
+
+Two fresh reviewers, blind to each other, independently found the same defect, and both
+found it by *running* it. `fallback_error`'s edge-trigger re-armed on a single 2xx, and the
+fires list admits 429 and every 5xx — statuses that are **intermittent by nature**, since a
+provider throttling the relay lets some requests through by definition. So the bound was
+never "one per outage"; it was "one per failure that follows a success".
+
+Measured on the branch: a route alternating success and failure produced **6 hook runs from
+12 requests** (429) and **8 from 16** (401). Worse, `fallback_error` was on the notifier's
+FIFO, which serialises and holds the single worker for up to `timeout_secs` per event — so
+40 alternating requests delayed a real `failover_engaged` by **6.79s** against the **1.8s**
+bound `a_live_flood_of_switches_does_not_delay_a_transition_queued_mid_flood` holds for the
+equivalent `profile_switched` property. And because `pending_switch` was consulted only in
+the worker's `Timeout` arm, a non-empty FIFO starved the coalescing slot entirely, so a
+`fallback_error` backlog also starved `profile_switched` — violating that flood test's
+property from the other side.
+
+**The brief was wrong, not the implementation.** "Only a 2xx re-arms it" and an allowlist
+containing 429 and 5xx contradict each other under a partial outage, and neither the brief
+nor the first round's decisions entry noticed. Two independent properties were broken, so
+there are two fixes.
+
+**1. `fallback_error` gets a coalescing slot of its own, and the FIFO goes back to holding
+transitions only.** That is what its doc comment always claimed and what the flood tests
+protect. Reusing the existing mechanism rather than adding a clock or a rate limiter: the
+file already has the shape, already tests it, and the `Disconnected`-arm "one more look"
+that stops a pending event being lost on drop already existed to be copied. A slot caps this
+event's contribution at one hook run per pass **whatever the request rate**, which no
+edge-trigger can do.
+
+*Rejected: sharing `pending_switch`.* Coalescing an outage notification into a profile
+switch drops one of two unrelated events.
+
+*Arbitration between the two slots: alternate.* A transition never competes — the FIFO is
+read first and `recv_timeout` returns the instant one is sent — so the only question is slot
+versus slot, and **fixed priority in either direction lets a slot repopulated as fast as it
+is drained starve the other indefinitely.** Both can be repopulated at traffic rate.
+Alternating first refusal caps a slot's wait at one pass. Held by
+`neither_coalescing_slot_starves_the_other_under_a_double_flood`.
+
+**2. Re-arming takes five consecutive delivered responses, not one.** One 2xx proves a
+request worked; it does not prove the outage ended. Expected requests to reach *k*
+consecutive successes is `(1 - q^k) / ((1 - q) q^k)`, so at a 50% failure rate the measured
+shape costs ~3 requests per notification at `k = 1` and ~63 at `k = 5` — a twentyfold cut.
+Against that, Claude Code sends several requests per turn, so a genuinely recovered route
+re-arms within a turn or two and a later, separate outage still fires.
+
+*Five and not ten*, which would make the intermittent case essentially silent: the higher the
+number, the longer the flag survives a **quiet** period, and a flag that is still set when
+the next outage starts notifies nothing. That residual is real at any `k ≥ 1` and is filed
+rather than closed (`follow-ups.md`).
+
+*Rejected: dropping 429 from the fires list*, which a reviewer offered as the cheapest fix. A
+provider throttling the relay *is* a route-level problem the operator wants to know about
+once, and the same intermittency argument applies to 5xx, which nobody would drop.
+
+The two atomics behind this are deliberately not updated together. Nothing reads them as a
+pair: the fire is one `compare_exchange` on the flag, and the counter only ever gates a
+`store(false)`. Every interleaving of a concurrent success and failure therefore costs at
+most one *extra* notification and can never lose one. Packing both into a single atomic
+would remove the skew and was rejected as exactness far below the statistical noise of `k`
+itself.
+
+**A switch re-arms too.** The first round justified a global flag with "only one profile is
+active at a time, so a per-profile flag would model a distinction the request path does not
+have". **True of the request path, not true of §8b** — `POST /control/profile` is exactly a
+mechanism for changing which profile the flag is about. Without a re-arm, an operator whose
+key dies, who then switches to a second broken profile, gets **no notification** and the
+only `RELAY_DETAIL` on their screen names a profile that is no longer active.
+
+**The streaming hole: the promise was corrected, the mechanism was not extended.** A
+provider whose streams die after the headers fails every request and fires **nothing** —
+confirmed by a reviewer running the repo's own `openai_upstream(recorder, true)` mock, four
+of four requests broken, zero events. `Outcome::Served` is returned at the 2xx head, so the
+event cannot fire for a streaming request at all, and Claude Code streams. The first round
+disclosed this as a re-arm nuisance; that understated it, and it is a hole in the *fire*
+rule whose buffered twin (`fallback_response_unreadable`) is on the fires list.
+
+Spec §4's Fires bullet is narrowed to non-streaming responses instead, because wiring the
+terminal stream event in would add **a second decision point that resolves after the
+response has been handed to axum** — precisely the "one decision point" property that made
+deciding-from-the-client's-answer structural. That deserves its own task and its own gate.
+The motivating case is unaffected: a rejected key answers 401 at the head, before any
+stream, so the dead-key scenario fires correctly. Filed as `follow-ups.md` item 5 naming
+`CountingStream`/`NeverFails` as the seam that already knows when a stream failed.
+
+**Two amendments to what the first round recorded about escalation masking.** The masked set
+is exactly `route_attributable ∩ client_retries` = **{429, every 5xx}** — the first round
+named 429 only, and 5xx behaves identically and is at least as likely (an overloaded top
+rung). And **401, 402 and 403 are structurally immune**, because they are terminal, so
+`client_retries` is false and the hop keeps its own answer. That is the fact that makes the
+residual acceptable, and it is the motivating case.
+
+**One test's claim was withdrawn rather than strengthened.** The concurrency test said it was
+why the edge-trigger is a `compare_exchange` rather than a load-then-store; a reviewer made
+that mutation and got 30 runs, 30 passes — `#[tokio::test]` with no flavor is a
+current-thread runtime and there is no `.await` between the load and the store, so no
+interleaving exists to find. Under `flavor = "multi_thread"` the mutation is caught 2 runs in
+20. The flavor was left alone and the comment rewritten: an honest weak test beats a flaky
+strong one, and the CAS argument belongs next to the CAS.

@@ -64,29 +64,19 @@ pub async fn forward(
     let profile_name = request.profile_name;
 
     match deliver(state, start, method, path, body, request).await {
-        // Spec §4: **only a 2xx re-arms.** It is the sole unambiguous proof that
-        // the whole path works — credentials, network, translation, provider — so
-        // a request-attributable 4xx does not clear the flag, however much
-        // reaching the provider looks like proof that the route is fine.
-        //
-        // `Relaxed`, like `fallback_requests_served`: this flag publishes no
-        // other memory, and the mutual exclusion below is a property of the
-        // read-modify-write itself rather than of any ordering.
+        // Spec §4: **only a delivered 2xx counts toward a re-arm**, and it takes
+        // `RE_ARM_SUCCESSES` of them. A request-attributable 4xx counts for
+        // nothing, however much reaching the provider looks like proof that the
+        // route is fine. `AppState` owns the whole rule — see `fallback_delivered`
+        // and `fallback_failed` for why one success is not enough and why the edge
+        // is a `compare_exchange`.
         Outcome::Served(response) => {
-            state.fallback_failing.store(false, Ordering::Relaxed);
+            state.fallback_delivered();
             response
         }
         Outcome::Rejected(response) => response,
         Outcome::Broken(response, cause) => {
-            // One notification per failing streak, fired on the *edge*. A
-            // `compare_exchange` rather than a load-then-store because a dead key
-            // fails every in-flight request at once, and the load-then-store
-            // version would let several of them all see `false` and all fire.
-            if state
-                .fallback_failing
-                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
+            if state.fallback_failed() {
                 state.notifier.notify_event(NotifyEvent::FallbackError {
                     profile: profile_name.to_string(),
                     cause,
