@@ -7,7 +7,7 @@ mod common;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Once};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -19,7 +19,7 @@ use indexmap::IndexMap;
 use serde_json::Value;
 
 use common::{
-    closed_port, relay_config, serve, serve_relay_with, serve_relay_with_routing_cap,
+    closed_port, dripped_body, relay_config, serve, serve_relay_with, serve_relay_with_routing_cap,
     truncated_body, unique_temp_dir,
 };
 use relay::config::{Config, ProfileConfig};
@@ -379,10 +379,16 @@ async fn drive_to_limited(relay: SocketAddr) {
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     // The body has to be drained: detection classifies when the stream ends.
     response.bytes().await.expect("failed to read limit body");
+    wait_for_limited(relay).await;
+}
 
+/// The state applier runs on a thread of its own, so `LIMITED` is waited for
+/// rather than assumed. Returns the `/status` body that satisfied the wait.
+async fn wait_for_limited(relay: SocketAddr) -> Value {
     for _ in 0..200 {
-        if status(relay).await["state"] == "LIMITED" {
-            return;
+        let status = status(relay).await;
+        if status["state"] == "LIMITED" {
+            return status;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1585,4 +1591,494 @@ async fn a_translated_response_keeps_the_upstreams_status() {
     let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
         .expect("the translated response must be JSON");
     assert_eq!(body["content"][0]["text"], "from the openai profile");
+}
+
+// --- The request that trips the limit (spec §6, `policy.failover_on_detect`) ---
+
+/// A cold relay — `ACTIVE`, no priming request — whose Anthropic mock answers
+/// `/v1/messages` with the subscription limit. The request under test is
+/// therefore the one that *causes* the transition, which is the case Claude Code
+/// treats as terminal: it does not retry, so a 429 here is a hard failure the
+/// user has to notice and re-run.
+async fn start_cold_limited(mode: &str, failover_on_detect: bool) -> Relay {
+    set_profile_keys();
+    let anthropic = Recorder::default();
+    let fallback = Recorder::default();
+    let anthropic_addr = serve(anthropic_upstream(anthropic.clone(), true)).await;
+    let fallback_addr = serve(openai_upstream(fallback.clone(), false)).await;
+    let mut config = config(
+        anthropic_addr,
+        mode,
+        profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+    );
+    config.policy.failover_on_detect = failover_on_detect;
+    let addr = serve_relay_with(config, None).await;
+    Relay {
+        addr,
+        anthropic,
+        fallback,
+    }
+}
+
+/// The default behavior, and the reason this exists: the limit is classified
+/// before anything has been sent to the client, so that request is handed to the
+/// fallback instead of being answered with an error the client will not retry.
+/// Nothing about mid-stream failover is involved — the decision is made while
+/// the response is still entirely in the relay's hands.
+#[tokio::test]
+async fn the_request_that_trips_the_limit_is_handed_to_the_fallback() {
+    let relay = start_cold_limited("new-sessions", true).await;
+    assert_eq!(
+        status(relay.addr).await["state"],
+        "ACTIVE",
+        "this test is about the request that trips the limit, not a later one"
+    );
+
+    let response = authenticated(
+        format!("http://{}/v1/messages", relay.addr),
+        session_start(OPUS),
+    )
+    .send()
+    .await
+    .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("the translated response must be JSON");
+    assert_eq!(body["content"][0]["text"], "from the openai profile");
+
+    assert_eq!(
+        relay.anthropic.count(),
+        1,
+        "the attempt on Anthropic is what produced the limit response"
+    );
+    let seen = relay.fallback.only();
+    assert_eq!(seen.path, "/v1/chat/completions");
+    assert_eq!(
+        seen.json()["model"],
+        OPUS_TARGET,
+        "a failed-over request is remapped (§7a), on this path too"
+    );
+    assert_eq!(
+        seen.header("authorization"),
+        Some(&format!("Bearer {OPENAI_KEY}")[..]),
+        "the profile's own key, not the client's"
+    );
+
+    // The transition still happens: later requests fail over without another
+    // Anthropic round trip.
+    let status = wait_for_limited(relay.addr).await;
+    assert_eq!(status["fallback_requests_served"], 1);
+}
+
+/// `failover_on_detect = false` restores the older behavior exactly: the client
+/// gets Anthropic's own limit error, and the route still transitions so later
+/// requests fail over.
+#[tokio::test]
+async fn failover_on_detect_off_returns_the_limit_error_and_still_limits_the_route() {
+    let relay = start_cold_limited("new-sessions", false).await;
+
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(session_start(OPUS))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().get("x-relay-route").is_none());
+    assert_eq!(
+        response.bytes().await.expect("failed to read body"),
+        LIMIT_BODY.as_bytes(),
+        "the client must see Anthropic's own limit error, unaltered"
+    );
+    assert_eq!(relay.fallback.count(), 0);
+    assert_eq!(relay.anthropic.count(), 1);
+
+    let status = wait_for_limited(relay.addr).await;
+    assert_eq!(status["fallback_requests_served"], 0);
+}
+
+/// `notify-only` exists to *not* switch models. Getting this wrong would defeat
+/// the whole mode, so it is asserted on the detect-time path as well as on the
+/// already-`LIMITED` one.
+#[tokio::test]
+async fn notify_only_never_fails_over_the_request_that_trips_the_limit() {
+    let relay = start_cold_limited("notify-only", true).await;
+
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(session_start(OPUS))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().get("x-relay-route").is_none());
+    assert_eq!(
+        response.bytes().await.expect("failed to read body"),
+        LIMIT_BODY.as_bytes()
+    );
+    assert_eq!(relay.fallback.count(), 0);
+    // The notification the mode is named for still fires, which is the same
+    // thing as the route transitioning.
+    wait_for_limited(relay.addr).await;
+}
+
+/// `new-sessions`' session-start heuristic applies to the triggering request
+/// too: a conversation already in flight fails visibly rather than switching
+/// models mid-thought, exactly as it does once the route is `LIMITED`.
+#[tokio::test]
+async fn a_mid_conversation_request_that_trips_the_limit_is_not_failed_over() {
+    let relay = start_cold_limited("new-sessions", true).await;
+
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(mid_conversation(OPUS))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().get("x-relay-route").is_none());
+    assert_eq!(
+        response.bytes().await.expect("failed to read body"),
+        LIMIT_BODY.as_bytes()
+    );
+    assert_eq!(relay.fallback.count(), 0);
+    wait_for_limited(relay.addr).await;
+
+    // ...and the *next* session start does fail over, so the mode is being
+    // applied per request rather than the re-route being off altogether.
+    let next = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(session_start(OPUS))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(next.headers()["x-relay-route"], "fallback");
+    next.bytes().await.expect("failed to read body");
+}
+
+/// With no `active_profile` there is nothing to hand the request to, so the
+/// limit error passes through — and the route still transitions, which is all
+/// the relay can do for this one.
+#[tokio::test]
+async fn without_an_active_profile_the_triggering_limit_passes_through() {
+    set_profile_keys();
+    let anthropic = Recorder::default();
+    let fallback = Recorder::default();
+    let anthropic_addr = serve(anthropic_upstream(anthropic.clone(), true)).await;
+    let fallback_addr = serve(openai_upstream(fallback.clone(), false)).await;
+    let mut config = config(
+        anthropic_addr,
+        "all",
+        profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+    );
+    config.policy.active_profile = None;
+    let relay = serve_relay_with(config, None).await;
+
+    let response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(session_start(OPUS))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.bytes().await.expect("failed to read body"),
+        LIMIT_BODY.as_bytes()
+    );
+    assert_eq!(fallback.count(), 0);
+    wait_for_limited(relay).await;
+}
+
+/// Global Constraint 7 on the new path. A count that trips the limit is still
+/// Anthropic's to answer: routing it to an `openai` profile would bill an
+/// inference call and answer a count with a message.
+#[tokio::test]
+async fn a_count_tokens_that_trips_the_limit_stays_on_anthropic() {
+    set_profile_keys();
+    let anthropic = Recorder::default();
+    let fallback = Recorder::default();
+    let counts = anthropic.clone();
+    let anthropic_addr = serve(
+        Router::new()
+            .route(
+                "/v1/messages/count_tokens",
+                any(move |request: Request| {
+                    let recorder = counts.clone();
+                    async move {
+                        record(&recorder, request).await;
+                        limit_response()
+                    }
+                }),
+            )
+            .route("/v1/messages", any(|| async { limit_response() })),
+    )
+    .await;
+    let fallback_addr = serve(openai_upstream(fallback.clone(), false)).await;
+    // `all` — the most permissive mode there is, so nothing but the
+    // `count_tokens` pin can be what keeps this request on Anthropic.
+    let relay = serve_relay_with(
+        config(
+            anthropic_addr,
+            "all",
+            profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+        ),
+        None,
+    )
+    .await;
+
+    let response = client()
+        .post(format!("http://{relay}/v1/messages/count_tokens"))
+        .body(session_start(OPUS))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().get("x-relay-route").is_none());
+    assert_eq!(
+        response.bytes().await.expect("failed to read body"),
+        LIMIT_BODY.as_bytes(),
+        "spec §6: on failure a count passes the error through"
+    );
+    assert_eq!(fallback.count(), 0);
+    assert_eq!(anthropic.count(), 1);
+    // Detection itself is unaffected by the pin: the limit is still recorded.
+    wait_for_limited(relay).await;
+}
+
+/// Spec §5's conservative rule, which the buffering must not disturb: a
+/// per-minute burst 429 is not the subscription limit, so it reaches the client
+/// with its status, headers and body intact and changes no state — even though
+/// it is a `detect.status` response on a request that was eligible to fail over.
+#[tokio::test]
+async fn a_burst_429_on_an_eligible_request_reaches_the_client_unchanged() {
+    set_profile_keys();
+    let fallback = Recorder::default();
+    const BURST_BODY: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of requests has exceeded your per-minute rate limit."}}"#;
+    let anthropic_addr = serve(Router::new().route(
+        "/v1/messages",
+        any(|| async {
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("content-type", "application/json")
+                .header("retry-after", "12")
+                .header("anthropic-ratelimit-requests-remaining", "0")
+                .body(Body::from(BURST_BODY))
+                .expect("failed to build mock response")
+        }),
+    ))
+    .await;
+    let fallback_addr = serve(openai_upstream(fallback.clone(), false)).await;
+    let relay = serve_relay_with(
+        config(
+            anthropic_addr,
+            "all",
+            profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+        ),
+        None,
+    )
+    .await;
+
+    let response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(session_start(OPUS))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["retry-after"], "12");
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-requests-remaining"],
+        "0"
+    );
+    assert!(response.headers().get("x-relay-route").is_none());
+    assert_eq!(
+        response.bytes().await.expect("failed to read body"),
+        BURST_BODY.as_bytes(),
+        "a burst 429 is passed through byte for byte"
+    );
+    assert_eq!(fallback.count(), 0, "a burst 429 is not a failover trigger");
+
+    // Long enough for the applier to have run had anything been recorded.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(status(relay).await["state"], "ACTIVE");
+}
+
+/// A candidate response whose body dies mid-flight classifies nothing — a
+/// partial document is not evidence — and must never reach the client looking
+/// complete. It fails, as it would have without the buffering; *where* it fails
+/// is the one thing buffering moves. The read now finishes before the head is
+/// sent, so hyper can abort the connection while the client is still parsing the
+/// head instead of after it has a chunk in hand, and both shapes are the same
+/// answer: no complete body.
+#[tokio::test]
+async fn a_candidate_body_that_dies_mid_flight_is_not_classified_and_still_fails() {
+    set_profile_keys();
+    let fallback = Recorder::default();
+    let anthropic_addr = serve(Router::new().route(
+        "/v1/messages",
+        any(|| async {
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("content-type", "application/json")
+                .body(truncated_body(r#"{"type":"error","error":{"type":"rat"#))
+                .expect("failed to build mock response")
+        }),
+    ))
+    .await;
+    let fallback_addr = serve(openai_upstream(fallback.clone(), false)).await;
+    let relay = serve_relay_with(
+        config(
+            anthropic_addr,
+            "all",
+            profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+        ),
+        None,
+    )
+    .await;
+
+    let read_whole = async {
+        let mut response = client()
+            .post(format!("http://{relay}/v1/messages"))
+            .body(session_start(OPUS))
+            .send()
+            .await?;
+        let status = response.status();
+        let mut collected = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            collected.extend_from_slice(&chunk);
+        }
+        Ok::<(StatusCode, Vec<u8>), reqwest::Error>((status, collected))
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(5), read_whole)
+        .await
+        .expect("the client hung after the upstream died");
+    assert!(
+        outcome.is_err(),
+        "a body that died mid-flight must never arrive as a complete response: {outcome:?}"
+    );
+
+    assert_eq!(fallback.count(), 0);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        status(relay).await["state"],
+        "ACTIVE",
+        "a partial body is not evidence of a limit"
+    );
+}
+
+/// The buffering is armed on this request — eligible policy, active profile —
+/// and must still never touch a success. A 200 SSE stream keeps its pacing:
+/// buffering it would hold every byte until generation finished.
+#[tokio::test]
+async fn an_eligible_request_still_streams_a_successful_response() {
+    set_profile_keys();
+    let chunk_delay = Duration::from_millis(300);
+    let anthropic_addr = serve(Router::new().route(
+        "/v1/messages",
+        any(move || async move {
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(dripped_body(
+                    vec!["event: a\n", "event: b\n", "event: c\n"],
+                    chunk_delay,
+                ))
+                .expect("failed to build mock response")
+        }),
+    ))
+    .await;
+    let fallback_addr = serve(openai_upstream(Recorder::default(), false)).await;
+    let relay = serve_relay_with(
+        config(
+            anthropic_addr,
+            "all",
+            profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+        ),
+        None,
+    )
+    .await;
+
+    let start = Instant::now();
+    let mut response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(session_start(OPUS))
+        .send()
+        .await
+        .expect("request failed");
+
+    let mut time_to_first_chunk = None;
+    let mut collected = Vec::new();
+    while let Some(chunk) = response.chunk().await.expect("failed to read chunk") {
+        time_to_first_chunk.get_or_insert_with(|| start.elapsed());
+        collected.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(collected, b"event: a\nevent: b\nevent: c\n");
+    let first = time_to_first_chunk.expect("stream produced no chunks");
+    assert!(
+        first < chunk_delay,
+        "first chunk took {first:?}, so a successful response was buffered"
+    );
+}
+
+/// The production shape, not an edge case: Claude Code's client always asks for
+/// compression, so the limit response that trips this path arrives gzipped. The
+/// re-route decision has to survive that — classification decompresses its own
+/// copy, and the buffered body is never inspected any other way.
+#[tokio::test]
+async fn a_gzipped_limit_response_still_hands_the_request_to_the_fallback() {
+    use std::io::Write;
+
+    set_profile_keys();
+    let fallback = Recorder::default();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(LIMIT_BODY.as_bytes())
+        .expect("gzip write failed");
+    let gzipped = encoder.finish().expect("gzip finish failed");
+
+    let anthropic_addr = serve(Router::new().route(
+        "/v1/messages",
+        any(move || {
+            let gzipped = gzipped.clone();
+            async move {
+                Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("content-type", "application/json")
+                    .header("content-encoding", "gzip")
+                    .header("retry-after", "3600")
+                    .body(Body::from(gzipped))
+                    .expect("failed to build mock response")
+            }
+        }),
+    ))
+    .await;
+    let fallback_addr = serve(openai_upstream(fallback.clone(), false)).await;
+    let relay = serve_relay_with(
+        config(
+            anthropic_addr,
+            "new-sessions",
+            profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+        ),
+        None,
+    )
+    .await;
+
+    let response = authenticated(format!("http://{relay}/v1/messages"), session_start(OPUS))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    response.bytes().await.expect("failed to read body");
+    assert_eq!(fallback.only().json()["model"], OPUS_TARGET);
+    wait_for_limited(relay).await;
 }

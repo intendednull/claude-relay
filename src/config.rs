@@ -219,6 +219,14 @@ pub struct PolicyConfig {
     /// for new requests only and is never written back here (spec §8b).
     #[serde(default)]
     pub active_profile: Option<String>,
+    /// Whether the request that *causes* the `Limited` transition is handed to
+    /// the fallback rather than answered with the limit error (spec §6).
+    /// Defaults to on: Claude Code treats a subscription-limit 429 as terminal
+    /// and does not retry, so passing that one through costs a hard, visible
+    /// failure per limit window. `false` restores the older behavior, where
+    /// only requests after the transition fail over.
+    #[serde(default = "default_failover_on_detect")]
+    pub failover_on_detect: bool,
     /// Without a marker, a reset horizon must exceed this to count as the
     /// subscription limit rather than a burst 429 (spec §5). Also the floor
     /// every classified window gets, so no match ever produces one that has
@@ -243,6 +251,10 @@ fn default_mode() -> String {
     "new-sessions".to_string()
 }
 
+fn default_failover_on_detect() -> bool {
+    true
+}
+
 fn default_min_reset_horizon_secs() -> u64 {
     300
 }
@@ -264,6 +276,7 @@ impl Default for PolicyConfig {
         Self {
             mode: default_mode(),
             active_profile: None,
+            failover_on_detect: default_failover_on_detect(),
             min_reset_horizon_secs: default_min_reset_horizon_secs(),
             max_reset_horizon_secs: default_max_reset_horizon_secs(),
             reset_jitter_secs: default_reset_jitter_secs(),
@@ -1144,6 +1157,10 @@ mod tests {
         let policy = PolicyConfig::default();
         assert_eq!(policy.mode, "new-sessions");
         assert_eq!(policy.active_profile, None);
+        assert!(
+            policy.failover_on_detect,
+            "the request that trips the limit fails over unless the file says otherwise"
+        );
         assert_eq!(policy.min_reset_horizon_secs, 300);
         assert_eq!(policy.max_reset_horizon_secs, 7 * 24 * 60 * 60);
         assert_eq!(policy.reset_jitter_secs, [15, 60]);
