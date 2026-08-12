@@ -1,66 +1,16 @@
 mod common;
 
-use std::io;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::response::Response;
 use axum::routing::any;
-use tracing_subscriber::fmt::MakeWriter;
 
-use common::{closed_port, serve, serve_relay};
+use common::{Buffer, closed_port, serve, serve_relay};
 
 const AUTHORIZATION: &str = "Bearer sk-ant-oat01-DO-NOT-LOG-THIS-VALUE";
 const API_KEY: &str = "sk-ant-api03-DO-NOT-LOG-THIS-EITHER";
 const BETA: &str = "prompt-caching-DO-NOT-LOG-THIS-BETA";
-
-#[derive(Clone)]
-struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-impl Buffer {
-    fn contents(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().expect("log buffer poisoned")).into_owned()
-    }
-}
-
-impl io::Write for Buffer {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .expect("log buffer poisoned")
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Buffer {
-    type Writer = Buffer;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-async fn logs_containing(buffer: &Buffer, needle: &str) -> String {
-    for _ in 0..100 {
-        let logs = buffer.contents();
-        if logs.contains(needle) {
-            return logs;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!(
-        "timed out waiting for {needle:?} in captured logs:\n{}",
-        buffer.contents()
-    );
-}
 
 /// Reports back the secret headers the upstream actually received, so the test
 /// can show they were in flight rather than merely absent from the logs.
@@ -86,7 +36,7 @@ async fn echo_secrets(request: Request) -> Response {
 /// this file would interleave its own output into the buffer.
 #[tokio::test]
 async fn secret_header_values_never_reach_the_logs() {
-    let buffer = Buffer(Arc::new(Mutex::new(Vec::new())));
+    let buffer = Buffer::new();
     tracing_subscriber::fmt()
         .with_writer(buffer.clone())
         .with_max_level(tracing::Level::INFO)
@@ -128,8 +78,8 @@ async fn secret_header_values_never_reach_the_logs() {
     assert_eq!(response.status(), 502);
     response.bytes().await.expect("failed to read body");
 
-    logs_containing(&buffer, "proxied request").await;
-    let logs = logs_containing(&buffer, "upstream request failed").await;
+    buffer.logs_containing("proxied request").await;
+    let logs = buffer.logs_containing("upstream request failed").await;
 
     // Guards against a vacuous pass: the capture really is seeing our requests.
     assert!(logs.contains("/v1/messages"), "captured logs:\n{logs}");

@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn a_detected_limit_moves_the_machine_to_limited() {
-        let machine = Arc::new(RouteStateMachine::new(None).unwrap());
+        let machine = Arc::new(RouteStateMachine::new(None, [15, 60]).unwrap());
         let updates = RouteUpdates::spawn(machine.clone(), notifier());
 
         updates.record(RequestOutcome::LimitDetected {
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn a_success_recovers_from_probing() {
-        let machine = Arc::new(RouteStateMachine::new(None).unwrap());
+        let machine = Arc::new(RouteStateMachine::new(None, [15, 60]).unwrap());
         let updates = RouteUpdates::spawn(machine.clone(), notifier());
 
         updates.record(RequestOutcome::LimitDetected {
@@ -136,7 +136,7 @@ mod tests {
     /// depend on someone having polled `/status` first.
     #[test]
     fn a_success_recovers_without_an_intervening_state_query() {
-        let machine = Arc::new(RouteStateMachine::new(None).unwrap());
+        let machine = Arc::new(RouteStateMachine::new(None, [15, 60]).unwrap());
         let updates = RouteUpdates::spawn(machine.clone(), notifier());
 
         updates.record(RequestOutcome::LimitDetected {
@@ -151,7 +151,7 @@ mod tests {
     /// lets a later outcome stand as proof that an earlier one was handled.
     #[test]
     fn outcomes_are_applied_in_order() {
-        let machine = Arc::new(RouteStateMachine::new(None).unwrap());
+        let machine = Arc::new(RouteStateMachine::new(None, [15, 60]).unwrap());
         let updates = RouteUpdates::spawn(machine.clone(), notifier());
 
         updates.record(RequestOutcome::Succeeded);

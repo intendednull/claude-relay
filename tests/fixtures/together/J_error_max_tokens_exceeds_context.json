@@ -1,0 +1,9 @@
+{
+  "id": "ovq42tn-4YNCb4-a29afb8aca25a3ad",
+  "error": {
+    "message": "Input validation error: `inputs` tokens + `max_new_tokens` must be <= 32769. Given: 30 `inputs` tokens and 999999999 `max_new_tokens`",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": null
+  }
+}

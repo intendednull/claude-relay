@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use indexmap::IndexMap;
+
 use relay::build_router;
-use relay::config::{AnthropicConfig, Config, NotifyConfig};
+use relay::config::{AnthropicConfig, Config, NotifyConfig, PolicyConfig};
 use relay::detect::DetectConfig;
 use relay::state::AppState;
 
@@ -15,6 +17,8 @@ async fn healthz_returns_200_ok() {
         },
         detect: DetectConfig::default(),
         notify: NotifyConfig::default(),
+        profiles: IndexMap::new(),
+        policy: PolicyConfig::default(),
     };
     let state = AppState::new(Arc::new(config), None, "test-digest".to_string())
         .expect("failed to build app state");

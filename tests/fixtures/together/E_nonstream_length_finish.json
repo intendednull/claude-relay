@@ -1,0 +1,26 @@
+{
+  "id": "ovq3wtC-4YNCb4-a29afb2319102b22",
+  "object": "chat.completion",
+  "created": 1786490532,
+  "model": "Qwen/Qwen2.5-7B-Instruct-Turbo",
+  "prompt": [],
+  "choices": [
+    {
+      "finish_reason": "length",
+      "seed": 2794473745967840000,
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "role": "assistant",
+        "content": "Rome,",
+        "tool_calls": []
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 44,
+    "completion_tokens": 3,
+    "total_tokens": 47,
+    "cached_tokens": 0
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "id": "ovq42Yf-2kFHot-a29afb844e986e7d",
+  "error": {
+    "message": "Unable to access model totally-fake-model-that-does-not-exist-xyz. Please visit https://api.together.ai/models to view the list of supported models.",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": "model_not_available"
+  }
+}

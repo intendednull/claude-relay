@@ -60,6 +60,12 @@ async fn status_returns_documented_shape_with_stable_digest() {
         assert_eq!(body["state"], "ACTIVE");
         assert!(body["limited_until"].is_null());
         assert_eq!(body["fallback_requests_served"], 0);
+        assert_eq!(
+            body.get("active_profile"),
+            Some(&serde_json::Value::Null),
+            "active_profile must be present and null, not merely absent, \
+             with no profiles configured and no policy.active_profile set"
+        );
         assert_eq!(body["config_digest"], expected_digest);
     }
 

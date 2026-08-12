@@ -172,6 +172,54 @@ async fn headers_pass_through_in_both_directions() {
     );
 }
 
+/// F1's amplifier: whether the relay's client may *read* a response is the
+/// relay's decision. An upstream answering `access-control-allow-origin: *`
+/// — misconfigured, or a `base_url` pointed somewhere it shouldn't be — would
+/// otherwise have it forwarded verbatim, which is what turns `install_gate`'s
+/// blind cross-origin refusal into a page that can read the response it
+/// provoked. Asserted alongside a same-request non-CORS header, so "stripped"
+/// cannot be "this mock's headers never arrive".
+#[tokio::test]
+async fn upstream_cors_headers_are_not_forwarded_to_the_client() {
+    let permissive = Router::new().route(
+        "/v1/messages",
+        any(|| async {
+            Response::builder()
+                .header("access-control-allow-origin", "*")
+                .header("access-control-allow-credentials", "true")
+                .header("access-control-expose-headers", "*")
+                .header("x-mock-response-header", "response-value")
+                .body(Body::from(MOCK_BODY))
+                .expect("failed to build mock response")
+        }),
+    );
+    let upstream = serve(permissive).await;
+    let relay = serve_relay(format!("http://{upstream}")).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(r#"{"model":"claude-opus-5","messages":[]}"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-mock-response-header"],
+        "response-value",
+        "this mock's other response headers must still arrive"
+    );
+    let forwarded: Vec<_> = response
+        .headers()
+        .keys()
+        .filter(|name| name.as_str().starts_with("access-control-"))
+        .collect();
+    assert!(
+        forwarded.is_empty(),
+        "upstream CORS headers must not reach the client: {forwarded:?}"
+    );
+}
+
 #[tokio::test]
 async fn count_tokens_is_forwarded() {
     let upstream = serve(echo_upstream()).await;

@@ -132,7 +132,8 @@ the body or a reset horizon above a configurable threshold (e.g. > 5 minutes).
 
 ## 6. Failover policy
 
-Config `mode`, applied only while the Anthropic route is `LIMITED`:
+Config `mode`, applied while the Anthropic route is `LIMITED` **and to the request whose
+own response puts it there** (see "The triggering request" below):
 
 | mode | Behavior |
 |---|---|
@@ -147,10 +148,41 @@ session starts, and those harmlessly hit the fallback. Document the imperfection
 don't over-engineer. If false positives matter later, refine with request metadata,
 but ship the simple heuristic first.
 
+**The triggering request** (`policy.failover_on_detect`, default `true`). A request whose
+response is what classifies as the subscription limit is handed to the fallback too,
+instead of being answered with that limit error. It is subject to every rule above
+without exception — the same `mode`, the same session-start heuristic, the same
+requirement that an `active_profile` exist, the same `count_tokens` pin — because it is
+the same decision, evaluated once per request.
+
+The default changed from the original design, which applied `mode` only while the route
+was already `LIMITED`, leaving the request that *caused* the transition out by
+construction. Claude Code treats a subscription-limit 429 as terminal: it does not retry.
+So passing that response through cost a hard, user-visible failure and a manual re-run
+once per limit window, before the fallback this relay exists for engaged at all. Found by
+running a real `claude -p` session, not by a test. `failover_on_detect = false` restores
+the older behavior exactly: the limit error reaches the client, the route still
+transitions, and only later requests fail over.
+
+This does not weaken §5. Classification is unchanged and still conservative — anything
+that does not match the signature (a burst 429 with `retry-after: 12`) reaches the client
+with its status, headers and body intact, and changes no state. What changed is only
+*when* the classification happens: for a response carrying `detect.status`, the body is
+read whole before the response head is handed to the client, so the verdict is available
+while the response can still be replaced. Nothing else is buffered: a 2xx, streamed or
+not, is untouched (`detect.status` is validated to be a 4xx or 5xx), the read is bounded,
+and a read that is interrupted — past the cap, or a failed stream — classifies nothing and
+delivers the response exactly as a streamed pass-through would have.
+
 Failing over mid-stream is prohibited: once any SSE bytes have been sent to the
 client, an upstream failure terminates that stream with an error event. Only requests
 that have not yet produced client-visible bytes are retried on the fallback (and only
-when policy allows).
+when policy allows). The triggering-request re-route above is not in tension with this,
+though it looks adjacent to it: the decision is made while the whole response — head
+included — is still in the relay's hands, so nothing client-visible has been sent.
+
+One request that fails over this way emits **two** §9 log lines: the Anthropic attempt
+that produced the limit response, and the fallback request that answered the client.
 
 `count_tokens` requests always go to Anthropic regardless of state; on failure, pass
 the error through. (Token counts against the wrong tokenizer are worse than an error.)
@@ -266,6 +298,7 @@ model_map = { "*" = "moonshotai/Kimi-K3" }
 [policy]
 mode = "new-sessions"                  # new-sessions | all | notify-only
 active_profile = "deepseek"            # startup default; runtime switches via /control
+failover_on_detect = true              # §6: the request that trips the limit fails over too
 min_reset_horizon_secs = 300           # below this, a 429 is a burst, not the limit
 reset_jitter_secs = [15, 60]
 
@@ -314,7 +347,9 @@ benchmarks don't capture; every switch is an explicit, instantly-revertible comm
 
 - `GET /status` → `{state, limited_until, fallback_requests_served, config_digest}`.
 - Structured logs (`tracing`): one line per request — route chosen, model in/out,
-  status, latency, stream bytes. **Never bodies, never auth headers.**
+  status, latency, stream bytes. **Never bodies, never auth headers.** (One line per
+  *upstream* request, strictly: a client request that fails over on detection, §6, logs
+  the Anthropic attempt and the fallback request that replaced it.)
 - A visible marker for fallback responses: inject a response header
   (`x-relay-route: fallback`) so a session can be audited after the fact. (Claude Code
   ignores unknown headers.)
@@ -341,9 +376,9 @@ benchmarks don't capture; every switch is an explicit, instantly-revertible comm
 |---|---|---|
 | 1 | Transparent passthrough proxy, streaming intact, `/status`, `--capture-errors` | Real session indistinguishable from direct; subscription billing confirmed intact |
 | 2 | Limit detection + state machine + notifier + state persistence | Fixture tests pass; real limit event flips state and fires notification; burst 429 does not |
-| 3 | Name-based routing (§7d) + failover to Anthropic-compatible fallback (profile schema §8b, model remap, header hygiene, `new-sessions` policy, `POST /control/profile`) | E2E drill passes; auth-stripping invariant tested; explicit open-model requests route by name with Anthropic ACTIVE; profile switch applies to new requests only |
+| 3 | Name-based routing (§7d) + failover to the fallback provider (profile schema §8b, model remap, header hygiene, `new-sessions` policy, `POST /control/profile`) + the §7c wire-format layer the chosen provider actually needs | E2E drill passes; auth-stripping invariant tested; explicit open-model requests route by name with Anthropic ACTIVE; profile switch applies to new requests only |
 | 4 | Policy modes + `/control/mode`, `relay ctl` CLI wrapper, hot reload, jittered recovery, `x-relay-route` marker | Recovery observed across a real reset window; switch-and-revert of profiles verified under concurrent streams |
-| 5 | (Conditional) OpenAI translator or LiteLLM sidecar integration | Golden-file suite green; tool-heavy session completes on fallback |
+| 5 | (Only if a later profile needs a wire format Milestone 3 didn't already build) another §7c translator | Golden-file suite green; tool-heavy session completes on fallback |
 
 ## 12. Risks and mitigations
 
@@ -354,5 +389,5 @@ benchmarks don't capture; every switch is an explicit, instantly-revertible comm
 | Fallback model inherits Claude-shaped context (thinking blocks, Claude idioms) and degrades | `new-sessions` default avoids mid-conversation handoff; thinking blocks dropped in translation; document that `--continue` across the boundary is best-effort |
 | OAuth token leaked to third party via bug | Header hygiene as tested invariant (§7b); fallback client constructed with an allowlist of headers, not a denylist |
 | Provider Anthropic-compat endpoint has partial tool-use support | Phase-1 acceptance requires a real tool-heavy session, not a smoke test |
-| Proxy becomes bottleneck under parallel subagents | Pure async streaming passthrough, no buffering of bodies; load-test with 10+ concurrent streams in Milestone 1 |
+| Proxy becomes bottleneck under parallel subagents | Async streaming passthrough wherever the route allows it, and every buffer that remains is capped — but **per request, with no aggregate bound across concurrent ones**. With any profile configured, `/v1/messages` and `/v1/messages/count_tokens` buffer the whole request body (≤8 MiB) before routing, because the `model` that decides the route is inside it; a body past that cap is forwarded to Anthropic uninspected rather than held. The fallback route additionally buffers a non-streaming upstream response (≤4 MiB) to translate it, and SSE translation holds ≤4 MiB per unterminated frame and across tool-call slots. A zero-profile relay still streams frame-for-frame, request and response. Load-test with 10+ concurrent streams in Milestone 1 (`docs/decisions.md`, 2026-08-11 "Failover wiring", for why the routing cap is small and deliberately not a config key) |
 | Control API exposed if listener ever bound beyond loopback | Code-enforced: non-loopback listen address disables `/control/*` unless a control token is configured (§8b) |

@@ -1,0 +1,14 @@
+data: {"id":"ovq3pQJ-4YNCb4-a29afa859f0cdf11","object":"chat.completion.chunk","created":1786490507,"choices":[{"index":0,"role":"assistant","text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":""}}],"model":"Qwen/Qwen2.5-7B-Instruct-Turbo"}
+
+data: {"id":"ovq3pQJ-4YNCb4-a29afa859f0cdf11","object":"chat.completion.chunk","created":1786490507,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","tool_calls":[{"index":0,"id":"call_td2toa5xcm6sl1xqs0tuykkp","type":"function","function":{"name":"get_weather","arguments":""}}]}}],"model":"Qwen/Qwen2.5-7B-Instruct-Turbo"}
+
+data: {"id":"ovq3pQJ-4YNCb4-a29afa859f0cdf11","object":"chat.completion.chunk","created":1786490507,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":"tool_calls","delta":{"token_id":null,"role":"assistant","content":"","tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]}}],"model":"Qwen/Qwen2.5-7B-Instruct-Turbo"}
+
+data: {"id":"ovq3pQJ-4YNCb4-a29afa859f0cdf11","object":"chat.completion.chunk","created":1786490507,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","tool_calls":[{"index":1,"id":"call_76dfykrwubdiuofgrtiyy57b","type":"function","function":{"name":"get_weather","arguments":""}}]}}],"model":"Qwen/Qwen2.5-7B-Instruct-Turbo"}
+
+data: {"id":"ovq3pQJ-4YNCb4-a29afa859f0cdf11","object":"chat.completion.chunk","created":1786490507,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":"tool_calls","delta":{"token_id":null,"role":"assistant","content":"","tool_calls":[{"index":1,"function":{"arguments":"{\"city\":\"Tokyo\"}"}}]}}],"model":"Qwen/Qwen2.5-7B-Instruct-Turbo"}
+
+data: {"id":"ovq3pQJ-4YNCb4-a29afa859f0cdf11","object":"chat.completion.chunk","created":1786490507,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":"tool_calls","seed":5051380033226666000,"delta":{"token_id":151645,"role":"assistant","content":""}}],"model":"Qwen/Qwen2.5-7B-Instruct-Turbo","usage":{"prompt_tokens":215,"completion_tokens":36,"total_tokens":251,"cached_tokens":0}}
+
+data: [DONE]
+

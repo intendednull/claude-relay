@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -11,12 +13,16 @@ pub struct StatusResponse {
     state: &'static str,
     limited_until: Option<String>,
     fallback_requests_served: u64,
+    /// Spec §8b's stated `/status` extension: the profile new requests
+    /// currently route against — the runtime switch if one has happened,
+    /// else `policy.active_profile`. `null` with zero profiles configured or
+    /// no default and no switch.
+    active_profile: Option<String>,
     config_digest: String,
 }
 
-/// `fallback_requests_served` stays 0 until there is fallback routing to count
-/// (Milestone 3). `limited_until` is null outside `LIMITED`, `PROBING`
-/// included: the window it named has already elapsed by then.
+/// `limited_until` is null outside `LIMITED`, `PROBING` included: the window it
+/// named has already elapsed by then.
 pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, StatusCode> {
     let route = state.route.clone();
     // A state query performs the lazy `Limited -> Probing` transition, which
@@ -37,7 +43,8 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
     Ok(Json(StatusResponse {
         state: state_label,
         limited_until,
-        fallback_requests_served: 0,
+        fallback_requests_served: state.fallback_requests_served.load(Ordering::Relaxed),
+        active_profile: state.active_profile(),
         config_digest: state.config_digest.to_string(),
     }))
 }

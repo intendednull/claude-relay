@@ -17,6 +17,11 @@ pub struct Cli {
     /// are redacted; successful responses are never captured.
     #[arg(long)]
     pub capture_errors: Option<PathBuf>,
+
+    /// File to append log lines to, in addition to stderr. Created if absent
+    /// (mode 600). Capped at 10 MB, keeping one rotated `<PATH>.1`.
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
 }
 
 impl Cli {
@@ -47,6 +52,7 @@ mod tests {
         Cli {
             config: None,
             capture_errors: None,
+            log_file: None,
         }
     }
 
@@ -55,6 +61,7 @@ mod tests {
         let cli = Cli {
             config: Some(PathBuf::from("/tmp/from-flag.toml")),
             capture_errors: None,
+            log_file: None,
         };
         let path = cli
             .resolve_config_path_with_env(Some("/tmp/from-env.toml".to_string()))

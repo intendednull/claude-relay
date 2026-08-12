@@ -1,0 +1,26 @@
+{
+  "id": "ovq42ww-4YNCb4-a29afb8d8de108b1",
+  "object": "chat.completion",
+  "created": 1786490549,
+  "model": "Qwen/Qwen2.5-7B-Instruct-Turbo",
+  "prompt": [],
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "seed": 5431193839167667000,
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "role": "assistant",
+        "content": "Given the sunny and warm weather in Rome, you should wear lightweight clothing and a hat to stay cool and protected from the sun.",
+        "tool_calls": []
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 265,
+    "completion_tokens": 27,
+    "total_tokens": 292,
+    "cached_tokens": 0
+  }
+}

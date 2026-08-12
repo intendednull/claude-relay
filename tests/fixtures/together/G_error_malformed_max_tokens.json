@@ -1,0 +1,26 @@
+{
+  "id": "ovq42dn-4YNCb4-a29afb861d982b03",
+  "object": "chat.completion",
+  "created": 1786490548,
+  "model": "Qwen/Qwen2.5-7B-Instruct-Turbo",
+  "prompt": [],
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "seed": 5421318880005927000,
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "role": "assistant",
+        "content": "Hello! How can I assist you today?",
+        "tool_calls": []
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 30,
+    "completion_tokens": 10,
+    "total_tokens": 40,
+    "cached_tokens": 0
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "id": "ovq3TC9-6Ng1vN-a29af8c94c877522",
+  "error": {
+    "message": "Input validation error: grammar is not valid: failed to compile grammar",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": null
+  }
+}

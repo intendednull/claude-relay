@@ -4,22 +4,215 @@ use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime};
 
 use axum::Json;
-use axum::body::{Body, Bytes};
+use axum::body::{Body, BodyDataStream, Bytes};
 use axum::extract::{Request, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_core::Stream;
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::capture::Capture;
-use crate::config::Config;
+use crate::config::{Config, ProfileConfig};
+use crate::fallback::{self, FallbackRequest};
+use crate::log_safety::safe_identifier;
+use crate::route_state::RouteState;
 use crate::route_updates::{RequestOutcome, RouteUpdates};
+use crate::router::{self, RouteDecision};
 use crate::state::AppState;
+
+const MESSAGES_PATH: &str = "/v1/messages";
+const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
+
+/// A request body has to be in hand before its route is known — the `model`
+/// that decides it is inside. This is what keeps that bounded (Global
+/// Constraint 3): a body past the cap is not inspected at all, and the bytes
+/// already read are handed back in front of the rest of the stream, so the
+/// Anthropic route still forwards exactly what the client sent. Far larger
+/// than any real Claude Code request, including one carrying images, so what
+/// it protects against is a runaway rather than ordinary traffic — and it is
+/// per request, with no bound across concurrent ones, which is the reason to
+/// keep it as small as that allows rather than as large as Anthropic's own
+/// request-size limit.
+///
+/// The cost of exceeding it is a lost routing decision, not a failed request:
+/// a `claude-*` request that would have failed over goes to Anthropic instead,
+/// and a name-routed one reaches Anthropic under a name Anthropic will reject.
+pub(crate) const ROUTING_BODY_CAP: usize = 8 * 1024 * 1024;
 
 pub async fn forward(State(state): State<AppState>, request: Request) -> Response {
     let start = Instant::now();
     let (parts, body) = request.into_parts();
 
+    let path = parts.uri.path();
+    let count_tokens = path == COUNT_TOKENS_PATH;
+    // Every other path under `/v1` carries no `model` to route on. With no
+    // profile configured, nothing can route anywhere else either: the router
+    // could only ever answer `Anthropic`, so reading the body would buy a
+    // decision that is already made. Both cases keep Milestone 1's streamed
+    // verbatim forward, body untouched.
+    if !(count_tokens || path == MESSAGES_PATH) || state.config.profiles.is_empty() {
+        let body = reqwest::Body::wrap_stream(body.into_data_stream());
+        return to_anthropic(&state, start, &parts, body, None, None).await;
+    }
+
+    let buffered = match read_for_routing(body, state.routing_body_cap).await {
+        Ok(buffered) => buffered,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not read the request body");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "request_body_read_failed" })),
+            )
+                .into_response();
+        }
+    };
+
+    let body = match buffered {
+        RequestBody::TooLarge(rest) => {
+            tracing::warn!(
+                cap_bytes = state.routing_body_cap,
+                "request body too large to route on; forwarding to Anthropic"
+            );
+            // Unbuffered, so there is nothing to re-send: a limit on this one
+            // passes through however `policy.failover_on_detect` is set.
+            let body = reqwest::Body::wrap_stream(rest);
+            return to_anthropic(&state, start, &parts, body, None, None).await;
+        }
+        RequestBody::Buffered(body) => body,
+    };
+
+    let view = RoutingView::parse(&body);
+    let Some(model) = view.model.clone() else {
+        // No `model` to route on, so §7d has nothing to say: Anthropic, and
+        // its own error if the request was malformed.
+        return to_anthropic(&state, start, &parts, body.into(), None, None).await;
+    };
+
+    // Read once, here, at the point the route is decided: `active_profile`
+    // covers both the startup default and any `/control/profile` switch, and
+    // this value — not a later re-read of either — is what the rest of this
+    // request (including a streamed response) is bound to (spec §8b: a
+    // switch applies to new requests only).
+    let active_profile = state.active_profile();
+    let named = router::route(&model, &state.config.profiles, active_profile.as_deref());
+    // Set by exactly one arm below — the profile this request is handed to if
+    // Anthropic answers *it* with the subscription limit (spec §6).
+    let mut on_limit = None;
+    let target = match named {
+        // §7d: routed by name, so the name is passed through unremapped. A
+        // `count_tokens` request may only go to a profile that can actually
+        // count — see `counts_tokens`.
+        Ok(RouteDecision::Profile(name)) => {
+            (!count_tokens || counts_tokens(&state, &name)).then_some((name, false))
+        }
+        // Spec §6: `count_tokens` never fails over, whatever the route state
+        // and whatever the policy mode — including the detect-time re-route,
+        // which no arm but the next one can reach. Anything else may, and that
+        // one *is* remapped (§7a).
+        Ok(RouteDecision::Anthropic) if count_tokens => None,
+        Ok(RouteDecision::Anthropic) => match failover(&state, &view, active_profile).await {
+            Failover::Now(name) => Some((name, true)),
+            Failover::OnDetect(name) => {
+                on_limit = Some(name);
+                None
+            }
+            Failover::Never => None,
+        },
+        // Global Constraint 7 from the other side: a name nothing claims has
+        // no route but Anthropic's, and a count is pinned there regardless.
+        // Answering the relay's own 400 would put the relay's opinion of the
+        // name where the tokenizer's belongs (spec §6: "on failure, pass the
+        // error through").
+        Err(_) if count_tokens => None,
+        Err(err) => {
+            // `safe_identifier`, not `%model`: the `%` sigil renders through
+            // `format_args!` unescaped, and this value is straight out of the
+            // request body — a newline in it forges a whole log record, which
+            // is the one place spec §9's audit trail can be written to by a
+            // client. `error = %err` is safe: its message interpolates
+            // `{model:?}`. (F2, `docs/decisions.md`.)
+            tracing::warn!(
+                model = safe_identifier(&model),
+                error = %err,
+                "no route for the requested model"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "no_route_for_model" })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some((name, remap)) = target else {
+        // A `Bytes` clone is a refcount bump, so carrying the body along for a
+        // re-route that may never happen costs nothing.
+        let on_limit = on_limit.and_then(|name| {
+            Some(LimitFailover {
+                profile: state.config.profiles.get(&name)?,
+                profile_name: name,
+                body: body.clone(),
+                model: model.clone(),
+            })
+        });
+        return to_anthropic(&state, start, &parts, body.into(), Some(model), on_limit).await;
+    };
+
+    let Some(profile) = state.config.profiles.get(&name) else {
+        // Startup validation rules this out. If it happens anyway, the
+        // always-available route is a better answer than a 500.
+        tracing::error!(profile = %name, "routed to an unconfigured profile; staying on Anthropic");
+        return to_anthropic(&state, start, &parts, body.into(), Some(model), None).await;
+    };
+
+    fallback::forward(
+        &state,
+        start,
+        parts.method.clone(),
+        parts.uri.path().to_owned(),
+        body,
+        FallbackRequest {
+            profile_name: &name,
+            profile,
+            model: &model,
+            remap,
+        },
+    )
+    .await
+}
+
+/// Everything needed to hand this request to the fallback if Anthropic answers
+/// it with the subscription limit. Built only where `failover` already said the
+/// policy allows it, so nothing on the response side decides eligibility a
+/// second time.
+struct LimitFailover<'a> {
+    profile_name: String,
+    profile: &'a ProfileConfig,
+    /// The request body, already buffered to decide the route — which is what
+    /// makes re-sending the request possible at all.
+    body: Bytes,
+    /// The model the client asked for; the fallback route remaps it (§7a).
+    model: String,
+}
+
+/// Milestone 1's route: everything the client sent, forwarded verbatim to
+/// Anthropic, and everything Anthropic sent, streamed back verbatim.
+///
+/// `on_limit` is the one departure. With it set, a response whose status
+/// `[detect]` could match is read whole *before* anything reaches the client and
+/// classified there and then, so a subscription limit can be answered by the
+/// fallback instead of by the error Claude Code treats as terminal (spec §6).
+/// Every other response — success, stream, any other status — is untouched.
+async fn to_anthropic(
+    state: &AppState,
+    start: Instant,
+    parts: &Parts,
+    body: reqwest::Body,
+    model: Option<String>,
+    on_limit: Option<LimitFailover<'_>>,
+) -> Response {
     let target = format!(
         "{}{}",
         state.config.anthropic.base_url.trim_end_matches('/'),
@@ -37,7 +230,7 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
         .http
         .request(method.clone(), target)
         .headers(forwardable(&parts.headers))
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        .body(body)
         .send()
         .await;
 
@@ -65,6 +258,10 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
     // Latency is taken at response headers, not at end of body: a streamed
     // response stays open for as long as the model keeps generating.
     let log = RequestLog {
+        route: "anthropic",
+        profile: None,
+        model_in: model.clone(),
+        model_out: model,
         method,
         path,
         status,
@@ -81,12 +278,67 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
     // all. Below 2xx, the body is accumulated once and read by both consumers:
     // limit detection always (it cannot depend on a debug flag being set), and
     // a `--capture-errors` fixture when the flag is on.
-    let observation = (!status.is_success())
-        .then(|| ErrorObservation::new(&state, status, &headers))
+    let mut observation = (!status.is_success())
+        .then(|| ErrorObservation::new(state, status, &headers))
         .flatten();
 
+    let mut stream: ByteStream = Box::pin(upstream.bytes_stream());
+
+    // Detection normally runs as the body streams past, long after the head is
+    // beyond recall. A re-route needs the verdict while the response can still
+    // be replaced, so a candidate status is read whole first — a body of a few
+    // hundred bytes, and never a 2xx, streamed or otherwise, since
+    // `detect.status` is validated to be a 4xx or 5xx.
+    if let Some(failover) = on_limit.filter(|_| state.config.detect.matches_status(status))
+        && let Some(mut pending) = observation.take()
+    {
+        match read_candidate(stream, ERROR_BODY_CAP).await {
+            Candidate::Complete(bytes) => {
+                pending.accumulate(&bytes);
+                // Read to the body's own end — anything short of that is
+                // `Interrupted`. The flag is still read from the accumulator
+                // rather than passed as `false`, so the two caps staying equal
+                // is not something this has to know.
+                let incomplete = pending.truncated;
+                let detected = pending.finish(incomplete).is_some();
+                // The attempt is still a request Anthropic answered, so it
+                // keeps its own §9 log line; a re-route adds the fallback's.
+                log.emit(bytes.len() as u64);
+                if detected {
+                    return fallback::forward(
+                        state,
+                        start,
+                        parts.method.clone(),
+                        parts.uri.path().to_owned(),
+                        failover.body,
+                        FallbackRequest {
+                            profile_name: &failover.profile_name,
+                            profile: failover.profile,
+                            model: &failover.model,
+                            remap: true,
+                        },
+                    )
+                    .await;
+                }
+                // Not the subscription limit, so spec §5's conservative rule
+                // stands: the client gets this response as it is.
+                let mut response = Response::new(Body::from(bytes));
+                *response.status_mut() = status;
+                *response.headers_mut() = headers;
+                return response;
+            }
+            // Past the cap, or the read failed. Nothing was classified from a
+            // body this incomplete, and the response goes out exactly as it
+            // would have without the buffering.
+            Candidate::Interrupted(rejoined) => {
+                observation = Some(pending);
+                stream = Box::pin(rejoined);
+            }
+        }
+    }
+
     let body = Body::from_stream(CountingStream {
-        inner: Box::pin(upstream.bytes_stream()),
+        inner: stream,
         response_bytes: 0,
         log: Some(log),
         observation,
@@ -98,7 +350,173 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
     response
 }
 
-fn elapsed_ms(start: Instant) -> u64 {
+/// Whether a `count_tokens` request may be routed to this profile at all.
+///
+/// Global Constraint 7 pins `count_tokens` to Anthropic; spec §7d routes every
+/// non-`claude-*` name to the profile that claims it. They only reconcile for
+/// an `anthropic`-format profile, whose `/v1/messages/count_tokens` this route
+/// mirrors and which answers in the shape the client is expecting. An
+/// `openai`-format profile has no counting endpoint at all: the request would
+/// go to `/v1/chat/completions`, bill a real inference call, and come back as
+/// a `message` where the client wanted `{"input_tokens": N}`. So that one
+/// keeps the Anthropic pin — not a route this can safely extend to.
+fn counts_tokens(state: &AppState, profile: &str) -> bool {
+    state
+        .config
+        .profiles
+        .get(profile)
+        .is_some_and(|profile| profile.format == "anthropic")
+}
+
+/// What spec §6 allows this request, which the router already pointed at
+/// Anthropic. One decision with three answers rather than two decisions: every
+/// rule that governs failover — the mode, the session-start heuristic, whether
+/// an `active_profile` exists at all — is applied once, here, so neither
+/// failover form can drift from the other or be reached without it.
+enum Failover {
+    /// The route is already `Limited`: this request goes to the profile now and
+    /// never touches Anthropic.
+    Now(String),
+    /// The route is not `Limited` yet. The request goes to Anthropic, and goes
+    /// to the profile only if *its own* response classifies as the limit.
+    OnDetect(String),
+    /// Anthropic, and a limit error passes through to the client as the visible
+    /// failure the mode asked for.
+    Never,
+}
+
+/// `active_profile` is a parameter, not a second call to
+/// `state.active_profile()`: the caller already read it once, at the single
+/// point this request's route is decided, and passing it in makes "read
+/// exactly once per request" structural rather than something that happens
+/// to hold because the other branch that would re-read it is unreachable
+/// from here.
+async fn failover(
+    state: &AppState,
+    view: &RoutingView,
+    active_profile: Option<String>,
+) -> Failover {
+    // Nothing configured to fail over to.
+    let Some(active) = active_profile else {
+        return Failover::Never;
+    };
+    let policy = &state.config.policy;
+    let eligible = match policy.mode.as_str() {
+        "all" => true,
+        // The session-start heuristic: a conversation with no assistant turn
+        // yet has no thought to switch models in the middle of. Known
+        // imperfection, per spec §6 — Claude Code's own title-generation and
+        // summarization requests look like session starts too, and land on the
+        // fallback harmlessly. Not worth engineering around.
+        "new-sessions" => view.is_session_start(),
+        // "notify-only"; startup validation admits no other value. The mode
+        // exists to not switch models, so it declines both forms.
+        _ => false,
+    };
+    if !eligible {
+        return Failover::Never;
+    }
+    // The state query comes after the mode because it is the expensive half: it
+    // can write the state file on the lazy `Limited -> Probing` transition, so a
+    // request that could not fail over anyway never pays for it.
+    if is_limited(state).await {
+        return Failover::Now(active);
+    }
+    if policy.failover_on_detect {
+        Failover::OnDetect(active)
+    } else {
+        Failover::Never
+    }
+}
+
+async fn is_limited(state: &AppState) -> bool {
+    let route = state.route.clone();
+    // Same reason `/status` does this: the query can persist a transition, and
+    // a synchronous file write does not belong on an async worker.
+    match tokio::task::spawn_blocking(move || route.current_state()).await {
+        Ok(state) => matches!(state, RouteState::Limited { .. }),
+        Err(err) => {
+            tracing::warn!(error = %err, "route state query failed; staying on the Anthropic route");
+            false
+        }
+    }
+}
+
+/// The only two things a routing decision reads out of a `/v1/messages` body:
+/// which model it asks for (§7d) and whether the conversation has an assistant
+/// turn yet (§6). Every other field is skipped rather than materialized, so a
+/// megabyte of conversation is walked but not copied.
+#[derive(Debug, Default, Deserialize)]
+struct RoutingView {
+    model: Option<String>,
+    #[serde(default)]
+    messages: Vec<RoutingMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutingMessage {
+    role: Option<String>,
+}
+
+impl RoutingView {
+    /// A body this cannot read is a body with no route to decide — the request
+    /// goes to Anthropic and gets Anthropic's own opinion of it. This proxy
+    /// does not validate requests.
+    fn parse(body: &[u8]) -> Self {
+        serde_json::from_slice(body).unwrap_or_default()
+    }
+
+    fn is_session_start(&self) -> bool {
+        !self
+            .messages
+            .iter()
+            .any(|message| message.role.as_deref() == Some("assistant"))
+    }
+}
+
+enum RequestBody {
+    Buffered(Bytes),
+    /// The prefix already read, in front of the rest of the client's stream.
+    TooLarge(Prefixed),
+}
+
+async fn read_for_routing(body: Body, cap: usize) -> Result<RequestBody, axum::Error> {
+    let mut stream = Box::pin(body.into_data_stream());
+    let mut buffered: Vec<u8> = Vec::new();
+    loop {
+        let Some(chunk) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await else {
+            return Ok(RequestBody::Buffered(Bytes::from(buffered)));
+        };
+        let chunk = chunk?;
+        let over_cap = buffered.len() + chunk.len() > cap;
+        buffered.extend_from_slice(&chunk);
+        if over_cap {
+            return Ok(RequestBody::TooLarge(Prefixed {
+                prefix: Some(Bytes::from(buffered)),
+                rest: stream,
+            }));
+        }
+    }
+}
+
+struct Prefixed {
+    prefix: Option<Bytes>,
+    rest: Pin<Box<BodyDataStream>>,
+}
+
+impl Stream for Prefixed {
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Some(prefix) = this.prefix.take() {
+            return Poll::Ready(Some(Ok(prefix)));
+        }
+        this.rest.as_mut().poll_next(cx)
+    }
+}
+
+pub(crate) fn elapsed_ms(start: Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
 
@@ -109,12 +527,41 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
     )
 }
 
+/// Whether the relay's client may read a response is the relay's decision, not
+/// an upstream's: a `base_url` answering `access-control-allow-origin: *` (a
+/// misconfigured or hostile one, or a CORS-permissive provider) would otherwise
+/// have it forwarded verbatim and turn `install_gate`'s blind cross-origin
+/// refusal into a page that can read the response it provoked. The relay sets
+/// no CORS headers of its own, so stripping the whole family — rather than
+/// naming the two that matter today — leaves nothing to keep in sync with the
+/// CORS spec. Same rule read forwards on the request side: a client's
+/// `access-control-*` header is a browser preflight artifact that says nothing
+/// to the upstream this relay talks to.
+fn is_cors(name: &HeaderName) -> bool {
+    name.as_str().starts_with("access-control-")
+}
+
 /// Everything the peer sent, minus the hop-by-hop headers the next connection
-/// recomputes for itself.
-fn forwardable(headers: &HeaderMap) -> HeaderMap {
+/// recomputes for itself, minus the relay's own audit marker, which only the
+/// relay may set, and minus the CORS family (`is_cors`), which is the relay's
+/// answer to give and not an upstream's.
+///
+/// Both of the Anthropic route's call sites share this, so `x-relay-route` is
+/// stripped in both directions. On the response it is the anti-forgery rule: an
+/// upstream that emits it — misconfigured, or hostile in the case of a
+/// `base_url` pointed somewhere it shouldn't be — must not be able to forge a
+/// claim about which route served a response. On the request it keeps a client
+/// from putting a marker of its own on the wire to Anthropic, which is the same
+/// rule read forwards: the header means what the relay says it means.
+///
+/// This is the *Anthropic* route's rule, and a denylist on purpose: that route
+/// exists to forward what the client sent. The fallback route must never reuse
+/// it for a request — see `fallback::outgoing_headers`, which builds its
+/// request headers from nothing instead (spec §7b).
+pub(crate) fn forwardable(headers: &HeaderMap) -> HeaderMap {
     let mut forwarded = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers {
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name) || is_cors(name) || name == crate::fallback::ROUTE_MARKER {
             continue;
         }
         // `append`, not `insert`: repeated headers (`set-cookie`) must survive.
@@ -123,11 +570,34 @@ fn forwardable(headers: &HeaderMap) -> HeaderMap {
     forwarded
 }
 
-struct RequestLog {
-    method: Method,
-    path: String,
-    status: StatusCode,
-    latency_ms: u64,
+pub(crate) struct RequestLog {
+    pub(crate) route: &'static str,
+    pub(crate) profile: Option<String>,
+    pub(crate) model_in: Option<String>,
+    pub(crate) model_out: Option<String>,
+    pub(crate) method: Method,
+    pub(crate) path: String,
+    pub(crate) status: StatusCode,
+    pub(crate) latency_ms: u64,
+}
+
+impl RequestLog {
+    /// Spec §9's one line per request. Names only — a model name, a profile
+    /// name, a path — never a body and never a header value.
+    pub(crate) fn emit(self, response_bytes: u64) {
+        tracing::info!(
+            route = self.route,
+            profile = self.profile.as_deref().unwrap_or("-"),
+            model_in = self.model_in.as_deref().unwrap_or("-"),
+            model_out = self.model_out.as_deref().unwrap_or("-"),
+            method = %self.method,
+            path = %self.path,
+            status = self.status.as_u16(),
+            latency_ms = self.latency_ms,
+            response_bytes,
+            "proxied request"
+        );
+    }
 }
 
 /// An accumulated body is the one thing this proxy holds in memory, so it is
@@ -184,18 +654,116 @@ impl ErrorObservation {
         }
     }
 
-    fn finish(self, incomplete: bool) {
-        if let Some(config) = &self.detect
-            && let Some(reset_at) =
-                config
-                    .detect
-                    .classify(&self.headers, &self.body, incomplete, SystemTime::now())
-        {
+    /// The classified window, if this response was the subscription limit — the
+    /// one place in the program that classifies, and the one place that records
+    /// the outcome. The streaming path drops the answer; the synchronous path
+    /// (`to_anthropic`'s `on_limit`) is the reason it is returned at all, since
+    /// it decides that request's route with it.
+    fn finish(self, incomplete: bool) -> Option<SystemTime> {
+        let reset_at = self.detect.as_ref().and_then(|config| {
+            config.detect.classify(
+                &self.headers,
+                &self.body,
+                incomplete,
+                SystemTime::now(),
+                config.policy.min_reset_horizon_secs,
+                config.policy.max_reset_horizon_secs,
+            )
+        });
+        if let Some(reset_at) = reset_at {
             self.route_updates
                 .record(RequestOutcome::LimitDetected { reset_at });
         }
         if let Some(capture) = &self.capture {
             capture.write_fixture(self.status, &self.headers, &self.body, incomplete);
+        }
+        reset_at
+    }
+}
+
+/// An upstream response body, in the one shape both routes' tails speak.
+pub(crate) type ByteStream = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
+
+enum Candidate {
+    /// The whole body, at or under the cap.
+    Complete(Bytes),
+    /// The bytes read, in front of whatever is left of the response.
+    Interrupted(Rejoined),
+}
+
+/// Reads a detection-candidate response whole, so it can be classified while it
+/// can still be replaced by a fallback answer. Bounded by `cap` (Global
+/// Constraint 3) — a limit error is a few hundred bytes, so exceeding it means
+/// this is not the response we are looking for.
+///
+/// Every interruption keeps what it read and hands back the rest of the stream:
+/// the cost of a body too large, or of a stream that failed, is a lost
+/// classification, never a byte the client should have seen.
+async fn read_candidate(mut stream: ByteStream, cap: usize) -> Candidate {
+    let mut buffered: Vec<u8> = Vec::new();
+    loop {
+        match std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+            None => return Candidate::Complete(Bytes::from(buffered)),
+            Some(Ok(chunk)) => {
+                buffered.extend_from_slice(&chunk);
+                if buffered.len() > cap {
+                    return Candidate::Interrupted(Rejoined::over_cap(buffered, stream));
+                }
+            }
+            Some(Err(err)) => return Candidate::Interrupted(Rejoined::failed(buffered, err)),
+        }
+    }
+}
+
+/// What `read_candidate` read, put back in front of the response it came out
+/// of. The failure that ended a read is replayed too, in its place: a client
+/// that would have seen a body die mid-flight still does, rather than receiving
+/// a truncated one that looks whole.
+struct Rejoined {
+    prefix: Option<Bytes>,
+    error: Option<reqwest::Error>,
+    rest: Option<ByteStream>,
+}
+
+impl Rejoined {
+    fn over_cap(buffered: Vec<u8>, rest: ByteStream) -> Self {
+        Self {
+            prefix: prefix(buffered),
+            error: None,
+            rest: Some(rest),
+        }
+    }
+
+    fn failed(buffered: Vec<u8>, err: reqwest::Error) -> Self {
+        Self {
+            prefix: prefix(buffered),
+            error: Some(err),
+            rest: None,
+        }
+    }
+}
+
+/// No empty frame where the read never got a byte: `CountingStream` would count
+/// and observe it, and it says nothing.
+fn prefix(buffered: Vec<u8>) -> Option<Bytes> {
+    (!buffered.is_empty()).then(|| Bytes::from(buffered))
+}
+
+impl Stream for Rejoined {
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Some(prefix) = this.prefix.take() {
+            return Poll::Ready(Some(Ok(prefix)));
+        }
+        if let Some(err) = this.error.take() {
+            return Poll::Ready(Some(Err(err)));
+        }
+        match &mut this.rest {
+            Some(rest) => rest.as_mut().poll_next(cx),
+            // The stream that failed is not polled again.
+            None => Poll::Ready(None),
         }
     }
 }
@@ -206,26 +774,33 @@ impl ErrorObservation {
 /// chunk is also copied into it so limit detection can classify the response,
 /// and a `--capture-errors` fixture can be written, on the same terminal events
 /// as the log line — without delaying forwarding.
-struct CountingStream {
-    inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
+///
+/// The fallback route shares this for the counting and the log line, and never
+/// for the observation: a fallback provider's 429 says nothing about
+/// Anthropic's limit window, and its error bodies are not fixtures Anthropic
+/// detection rules can be derived from.
+pub(crate) struct CountingStream {
+    inner: ByteStream,
     response_bytes: u64,
     log: Option<RequestLog>,
     observation: Option<ErrorObservation>,
 }
 
 impl CountingStream {
+    pub(crate) fn new(inner: ByteStream, log: RequestLog) -> Self {
+        Self {
+            inner,
+            response_bytes: 0,
+            log: Some(log),
+            observation: None,
+        }
+    }
+
     fn emit(&mut self) {
         let Some(log) = self.log.take() else {
             return;
         };
-        tracing::info!(
-            method = %log.method,
-            path = %log.path,
-            status = log.status.as_u16(),
-            latency_ms = log.latency_ms,
-            response_bytes = self.response_bytes,
-            "proxied request"
-        );
+        log.emit(self.response_bytes);
     }
 
     /// `ended_early` covers every way the body stopped short of its own end —
@@ -287,12 +862,19 @@ mod tests {
     use axum::http::HeaderValue;
 
     #[test]
-    fn drops_hop_by_hop_headers_only() {
+    fn drops_hop_by_hop_and_cors_headers_only() {
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("relay.local"));
         headers.insert("content-length", HeaderValue::from_static("12"));
         headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
         headers.insert("connection", HeaderValue::from_static("keep-alive"));
+        // Whether the client may read this response is the relay's answer to
+        // give, not an upstream's (`is_cors`).
+        headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+        headers.insert(
+            "access-control-allow-credentials",
+            HeaderValue::from_static("true"),
+        );
         headers.insert("authorization", HeaderValue::from_static("Bearer token"));
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
 
@@ -313,5 +895,236 @@ mod tests {
 
         let cookies: Vec<_> = forwarded.get_all("set-cookie").iter().collect();
         assert_eq!(cookies, vec!["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn a_conversation_with_an_assistant_turn_is_not_a_session_start() {
+        let mid = RoutingView::parse(
+            br#"{"model":"claude-opus-4-6","messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"hello"},
+                {"role":"user","content":"more"}]}"#,
+        );
+        assert_eq!(mid.model.as_deref(), Some("claude-opus-4-6"));
+        assert!(!mid.is_session_start());
+    }
+
+    #[test]
+    fn a_first_user_turn_is_a_session_start() {
+        let start = RoutingView::parse(
+            br#"{"model":"claude-opus-4-6","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert!(start.is_session_start());
+    }
+
+    /// A tool result comes back as a `user` message, so a request that is
+    /// really mid-conversation still carries an assistant turn ahead of it —
+    /// which is what the heuristic keys on, rather than the last role.
+    #[test]
+    fn a_tool_result_turn_is_not_mistaken_for_a_session_start() {
+        let after_tool = RoutingView::parse(
+            br#"{"model":"claude-opus-4-6","messages":[
+                {"role":"user","content":"run ls"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}"#,
+        );
+        assert!(!after_tool.is_session_start());
+    }
+
+    #[test]
+    fn an_unreadable_body_yields_no_model_and_no_route_of_its_own() {
+        let broken = RoutingView::parse(b"not json at all");
+        assert!(broken.model.is_none());
+        // An empty conversation is vacuously a session start; with no model
+        // there is no failover decision to reach it.
+        assert!(broken.is_session_start());
+    }
+
+    const CAP: usize = 64;
+
+    /// Bytes distinct enough that a dropped or duplicated chunk cannot
+    /// coincidentally still compare equal.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| b'a' + (i % 26) as u8).collect()
+    }
+
+    /// A body whose frames land on exactly the boundaries a test names. The
+    /// end-to-end reassembly test in `tests/fallback.rs` takes whatever
+    /// framing hyper chooses, which cannot pin the cap arithmetic — one frame
+    /// either side of the boundary is the whole question here.
+    fn body_of(chunks: &[&[u8]]) -> Body {
+        let chunks: Vec<Bytes> = chunks.iter().map(|c| Bytes::copy_from_slice(c)).collect();
+        Body::from_stream(ChunkStream {
+            chunks: chunks.into_iter().collect(),
+        })
+    }
+
+    struct ChunkStream {
+        chunks: std::collections::VecDeque<Bytes>,
+    }
+
+    impl Stream for ChunkStream {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.get_mut().chunks.pop_front().map(Ok))
+        }
+    }
+
+    /// Every frame `Prefixed` yields, in order — so a test can assert both what
+    /// the prefix held and that the whole stream is the client's bytes back.
+    async fn frames(mut stream: Prefixed) -> Vec<Bytes> {
+        let mut frames = Vec::new();
+        while let Some(chunk) = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await
+        {
+            frames.push(chunk.expect("the test stream never fails"));
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn a_body_of_exactly_the_cap_is_still_buffered() {
+        let body = pattern(CAP);
+        let read = read_for_routing(body_of(&[&body]), CAP)
+            .await
+            .expect("read failed");
+        let RequestBody::Buffered(buffered) = read else {
+            panic!("`cap` bytes is at the cap, not over it");
+        };
+        assert_eq!(buffered, body);
+    }
+
+    /// The same boundary reached across two frames: the check is cumulative,
+    /// so what matters is the running total, not any one chunk's size.
+    #[tokio::test]
+    async fn two_frames_summing_to_exactly_the_cap_are_still_buffered() {
+        let body = pattern(CAP);
+        let (head, tail) = body.split_at(CAP - 1);
+        let read = read_for_routing(body_of(&[head, tail]), CAP)
+            .await
+            .expect("read failed");
+        let RequestBody::Buffered(buffered) = read else {
+            panic!("two frames summing to `cap` are at the cap, not over it");
+        };
+        assert_eq!(buffered, body);
+    }
+
+    /// One byte past the cap, on a frame of its own. The chunk that busts the
+    /// cap is kept in the prefix rather than deferred to `rest`, so the prefix
+    /// is everything read so far and the client's bytes come back exactly once.
+    #[tokio::test]
+    async fn one_byte_past_the_cap_is_too_large_and_loses_nothing() {
+        let body = pattern(CAP + 1);
+        let (head, tail) = body.split_at(CAP);
+        let read = read_for_routing(body_of(&[head, tail]), CAP)
+            .await
+            .expect("read failed");
+        let RequestBody::TooLarge(rest) = read else {
+            panic!("`cap + 1` bytes is over the cap");
+        };
+        let frames = frames(rest).await;
+        assert_eq!(
+            frames[0].len(),
+            CAP + 1,
+            "the prefix holds every byte read, including the one that busted the cap"
+        );
+        assert_eq!(frames.concat(), body, "the client's bytes, unaltered");
+    }
+
+    /// The response side of the same arithmetic. A candidate error body is read
+    /// whole so it can be classified before anything reaches the client; these
+    /// pin where "whole" stops. Only the `Ok` frames are testable here —
+    /// `reqwest::Error` has no public constructor, so the failed-read path is
+    /// driven end to end in `tests/fallback.rs` instead.
+    fn response_of(chunks: &[&[u8]]) -> ByteStream {
+        let chunks: Vec<Bytes> = chunks.iter().map(|c| Bytes::copy_from_slice(c)).collect();
+        Box::pin(ResponseStream {
+            chunks: chunks.into_iter().collect(),
+        })
+    }
+
+    struct ResponseStream {
+        chunks: std::collections::VecDeque<Bytes>,
+    }
+
+    impl Stream for ResponseStream {
+        type Item = reqwest::Result<Bytes>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.get_mut().chunks.pop_front().map(Ok))
+        }
+    }
+
+    /// Every frame a rejoined response yields, in order.
+    async fn response_frames(mut stream: Rejoined) -> Vec<Bytes> {
+        let mut frames = Vec::new();
+        while let Some(chunk) = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await
+        {
+            frames.push(chunk.expect("the test stream never fails"));
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn a_candidate_body_of_exactly_the_cap_is_read_whole() {
+        let body = pattern(CAP);
+        let Candidate::Complete(buffered) = read_candidate(response_of(&[&body]), CAP).await else {
+            panic!("`cap` bytes is at the cap, not over it");
+        };
+        assert_eq!(buffered, body);
+    }
+
+    /// One byte past the cap: nothing is classified, and the client still gets
+    /// every byte — the prefix already read in front of the rest of the stream.
+    #[tokio::test]
+    async fn a_candidate_body_past_the_cap_is_rejoined_losing_nothing() {
+        let body = pattern(CAP * 2);
+        let (head, remainder) = body.split_at(CAP - 10);
+        let (straddle, tail) = remainder.split_at(30);
+        let Candidate::Interrupted(rejoined) =
+            read_candidate(response_of(&[head, straddle, tail]), CAP).await
+        else {
+            panic!("the second frame crosses the cap");
+        };
+        let frames = response_frames(rejoined).await;
+        assert_eq!(
+            frames[0].len(),
+            CAP - 10 + 30,
+            "the prefix ends where the cap was crossed, not where the cap is"
+        );
+        assert_eq!(frames.concat(), body, "the upstream's bytes, unaltered");
+    }
+
+    /// An empty body is still a complete one — and yields no frame of its own,
+    /// which is the case `prefix` exists for.
+    #[tokio::test]
+    async fn an_empty_candidate_body_is_complete_and_empty() {
+        let Candidate::Complete(buffered) = read_candidate(response_of(&[]), CAP).await else {
+            panic!("an empty body cannot be over the cap");
+        };
+        assert!(buffered.is_empty());
+    }
+
+    /// Chunks straddling the cap, with a frame after the split still to come:
+    /// the prefix and the untouched remainder of the stream reassemble to the
+    /// input, in order, with nothing lost or repeated.
+    #[tokio::test]
+    async fn a_straddling_split_reassembles_byte_identically() {
+        let body = pattern(CAP * 2);
+        let (head, remainder) = body.split_at(CAP - 10);
+        let (straddle, tail) = remainder.split_at(30);
+        let read = read_for_routing(body_of(&[head, straddle, tail]), CAP)
+            .await
+            .expect("read failed");
+        let RequestBody::TooLarge(rest) = read else {
+            panic!("the second frame crosses the cap");
+        };
+        let frames = frames(rest).await;
+        assert_eq!(
+            frames[0].len(),
+            CAP - 10 + 30,
+            "the prefix ends where the cap was crossed, not where the cap is"
+        );
+        assert_eq!(frames.concat(), body, "the client's bytes, unaltered");
     }
 }
