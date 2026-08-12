@@ -52,7 +52,7 @@ fn translating_upstream(delay: Duration) -> Router {
         "/v1/chat/completions",
         any(move || async move {
             let upstream = dripped_body(CHUNKS.to_vec(), delay).into_data_stream();
-            Response::new(Body::from_stream(sse_stream(upstream)))
+            Response::new(Body::from_stream(sse_stream(upstream, true)))
         }),
     )
 }
@@ -66,7 +66,7 @@ fn talkative_upstream(delay: Duration) -> Router {
             let mut chunks = vec![CHUNKS[0], "data: [DONE]\n\n"];
             chunks.extend(std::iter::repeat_n(CHUNKS[0], 20));
             let upstream = dripped_body(chunks, delay).into_data_stream();
-            Response::new(Body::from_stream(sse_stream(upstream)))
+            Response::new(Body::from_stream(sse_stream(upstream, true)))
         }),
     )
 }
@@ -204,7 +204,7 @@ async fn an_upstream_that_dies_mid_stream_ends_with_an_error_event() {
         "/v1/chat/completions",
         any(|| async {
             let upstream = truncated_body(CHUNKS[0]).into_data_stream();
-            Response::new(Body::from_stream(sse_stream(upstream)))
+            Response::new(Body::from_stream(sse_stream(upstream, true)))
         }),
     ))
     .await;

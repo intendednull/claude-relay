@@ -137,6 +137,13 @@ pub struct Choice {
 pub struct ResponseMessage {
     #[serde(default)]
     pub content: Option<TextContent>,
+    /// The model's reasoning, on providers that expose it. Not in OpenAI's own
+    /// schema; `reasoning_content` is the key Together AI, DeepSeek and several
+    /// others settled on, and it arrives alongside `content` rather than inside
+    /// it. Read as `TextContent` for the same reason `content` is: a provider
+    /// that sends one as a parts array sends the other that way too.
+    #[serde(default)]
+    pub reasoning_content: Option<TextContent>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub tool_calls: Vec<ResponseToolCall>,
 }
@@ -216,6 +223,11 @@ pub struct ChunkChoice {
 pub struct Delta {
     #[serde(default)]
     pub content: Option<TextContent>,
+    /// Streamed in fragments exactly as `content` is, and — on every provider
+    /// observed — entirely *before* the first `content` fragment. The translator
+    /// does not rely on that ordering; see `SseTranslator::open_thinking`.
+    #[serde(default)]
+    pub reasoning_content: Option<TextContent>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub tool_calls: Vec<ToolCallDelta>,
 }

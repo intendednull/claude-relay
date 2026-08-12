@@ -171,10 +171,15 @@ pub async fn forward(
         return passthrough_response(status, upstream, log);
     }
 
+    // Read once here rather than per-chunk: a config reload mid-stream must not
+    // change the shape of a message already in flight.
+    let surface_reasoning = state.config.policy.surface_fallback_reasoning;
+
     if prepared.stream {
         let body = Body::from_stream(CountingStream::new(
             Box::pin(NeverFails(Box::pin(translate::sse_stream(
                 upstream.bytes_stream(),
+                surface_reasoning,
             )))),
             log,
         ));
@@ -200,7 +205,7 @@ pub async fn forward(
             return fallback_error(StatusCode::BAD_GATEWAY, "fallback_response_unreadable");
         }
     };
-    let anthropic = match translate::response_to_anthropic(&raw) {
+    let anthropic = match translate::response_to_anthropic(&raw, surface_reasoning) {
         Ok(anthropic) => anthropic,
         Err(err) => {
             tracing::warn!(

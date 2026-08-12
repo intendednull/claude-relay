@@ -791,6 +791,150 @@ async fn a_streamed_fallback_response_is_translated_back_into_anthropic_events()
     assert!(relay.fallback.only().json()["stream"] == Value::Bool(true));
 }
 
+/// A provider that reasons: `reasoning_content` alongside `content`, in both
+/// response shapes. Modelled on real `moonshotai/Kimi-K3` traffic — reasoning
+/// fragments arrive first, then the answer.
+const REASONING_COMPLETION: &str = concat!(
+    r#"{"id":"chatcmpl-2","object":"chat.completion","model":"target/Big-Model","#,
+    r#""choices":[{"index":0,"message":{"role":"assistant","#,
+    r#""reasoning_content":"All but 9 run away, so 9 remain.","content":"9 sheep."},"#,
+    r#""finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5}}"#
+);
+
+const REASONING_CHUNKS: [&str; 4] = [
+    concat!(
+        r#"data: {"id":"chatcmpl-2","object":"chat.completion.chunk","model":"target/Big-Model","#,
+        r#""choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"All but 9"},"#,
+        r#""finish_reason":null}]}"#,
+        "\n\n"
+    ),
+    concat!(
+        r#"data: {"id":"chatcmpl-2","object":"chat.completion.chunk","model":"target/Big-Model","#,
+        r#""choices":[{"index":0,"delta":{"content":"9 sheep."},"finish_reason":null}]}"#,
+        "\n\n"
+    ),
+    concat!(
+        r#"data: {"id":"chatcmpl-2","object":"chat.completion.chunk","model":"target/Big-Model","#,
+        r#""choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "\n\n"
+    ),
+    "data: [DONE]\n\n",
+];
+
+fn reasoning_upstream(recorder: Recorder) -> Router {
+    Router::new().route(
+        "/v1/chat/completions",
+        any(move |request: Request| {
+            let recorder = recorder.clone();
+            async move {
+                let body = record(&recorder, request).await;
+                if body["stream"] != Value::Bool(true) {
+                    return json(StatusCode::OK, REASONING_COMPLETION);
+                }
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(REASONING_CHUNKS.concat()))
+                    .expect("failed to build mock response")
+            }
+        }),
+    )
+}
+
+/// `start`, plus the one config knob this pair of tests is about. Separate
+/// rather than a parameter on `start`: every other test in this file wants the
+/// default, and threading a flag through all of them to serve two would be
+/// noise.
+async fn start_reasoning(surface: bool) -> Relay {
+    set_profile_keys();
+    let anthropic = Recorder::default();
+    let fallback = Recorder::default();
+    let anthropic_addr = serve(anthropic_upstream(anthropic.clone(), true)).await;
+    let fallback_addr = serve(reasoning_upstream(fallback.clone())).await;
+    let mut config = config(
+        anthropic_addr,
+        "all",
+        profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+    );
+    config.policy.surface_fallback_reasoning = surface;
+    let addr = serve_relay_with(config, None).await;
+    Relay {
+        addr,
+        anthropic,
+        fallback,
+    }
+}
+
+async fn fallback_content(relay: &Relay, stream: bool) -> Value {
+    let body = format!(
+        r#"{{"model":"{OPUS}","max_tokens":64,"stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#
+    );
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(body)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("failed to read body");
+    if !stream {
+        return serde_json::from_slice::<Value>(&bytes).expect("body is not JSON")["content"]
+            .clone();
+    }
+    // The blocks a client would assemble from the event stream, in order.
+    Value::Array(
+        events(&bytes)
+            .into_iter()
+            .filter(|(name, _)| name == "content_block_start")
+            .map(|(_, data)| data["content_block"].clone())
+            .collect(),
+    )
+}
+
+/// The config knob, end to end through the route rather than through the
+/// translator alone: nothing else proves `policy.surface_fallback_reasoning`
+/// is actually read on the request path.
+#[tokio::test]
+async fn the_fallbacks_reasoning_reaches_the_client_as_a_thinking_block() {
+    let relay = start_reasoning(true).await;
+    drive_to_limited(relay.addr).await;
+
+    assert_eq!(
+        fallback_content(&relay, false).await,
+        serde_json::json!([
+            {"type": "thinking", "thinking": "All but 9 run away, so 9 remain."},
+            {"type": "text", "text": "9 sheep."},
+        ])
+    );
+
+    let relay = start_reasoning(true).await;
+    drive_to_limited(relay.addr).await;
+    assert_eq!(
+        fallback_content(&relay, true).await,
+        serde_json::json!([
+            {"type": "thinking", "thinking": ""},
+            {"type": "text", "text": ""},
+        ])
+    );
+}
+
+#[tokio::test]
+async fn surface_fallback_reasoning_false_restores_the_dropped_reasoning() {
+    let relay = start_reasoning(false).await;
+    drive_to_limited(relay.addr).await;
+
+    assert_eq!(
+        fallback_content(&relay, false).await,
+        serde_json::json!([{"type": "text", "text": "9 sheep."}])
+    );
+
+    let relay = start_reasoning(false).await;
+    drive_to_limited(relay.addr).await;
+    assert_eq!(
+        fallback_content(&relay, true).await,
+        serde_json::json!([{"type": "text", "text": ""}])
+    );
+}
+
 /// Global Constraint 6. The eligibility decision happened before any byte
 /// reached the client, so a stream that dies afterwards is terminal: an error
 /// event, and no second attempt anywhere.

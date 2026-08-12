@@ -6,7 +6,10 @@ use serde_json::{Value, json};
 use super::openai::{ChatCompletion, ResponseToolCall, TextContent};
 use super::parse_failure;
 
-pub fn response_to_anthropic(body: &[u8]) -> Result<Vec<u8>> {
+/// `surface_reasoning` is `policy.surface_fallback_reasoning`: when false the
+/// provider's `reasoning_content` is dropped, which is what every version before
+/// this one did unconditionally.
+pub fn response_to_anthropic(body: &[u8], surface_reasoning: bool) -> Result<Vec<u8>> {
     let completion: ChatCompletion = serde_json::from_slice(body)
         .map_err(|err| parse_failure("upstream response is not a chat completion", &err))?;
     let Some(choice) = completion.choices.into_iter().next() else {
@@ -14,6 +17,19 @@ pub fn response_to_anthropic(body: &[u8]) -> Result<Vec<u8>> {
     };
 
     let mut content = Vec::new();
+    // Ahead of the text block, because that is the order the model produced
+    // them. No `signature`: Anthropic signs its own thinking blocks and this one
+    // is not Anthropic's, so there is no value to put there that would not be a
+    // forgery (`config::PolicyConfig::surface_fallback_reasoning`).
+    let reasoning = choice
+        .message
+        .reasoning_content
+        .filter(|_| surface_reasoning)
+        .map(TextContent::into_text)
+        .filter(|reasoning| !reasoning.is_empty());
+    if let Some(reasoning) = reasoning {
+        content.push(json!({"type": "thinking", "thinking": reasoning}));
+    }
     let text = choice
         .message
         .content
@@ -102,15 +118,19 @@ mod tests {
     use super::*;
 
     fn translate(body: Value) -> Value {
-        let translated =
-            response_to_anthropic(body.to_string().as_bytes()).expect("translation failed");
+        translate_with(body, true)
+    }
+
+    fn translate_with(body: Value, surface_reasoning: bool) -> Value {
+        let translated = response_to_anthropic(body.to_string().as_bytes(), surface_reasoning)
+            .expect("translation failed");
         serde_json::from_slice(&translated).expect("output is not valid JSON")
     }
 
     fn error(body: Value) -> String {
         format!(
             "{:#}",
-            response_to_anthropic(body.to_string().as_bytes())
+            response_to_anthropic(body.to_string().as_bytes(), true)
                 .expect_err("expected translation to fail")
         )
     }
@@ -176,6 +196,97 @@ mod tests {
             ])
         );
         assert_eq!(out["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn reasoning_content_becomes_a_thinking_block_before_the_text_block() {
+        let out = translate(completion(
+            json!({
+                "role": "assistant",
+                "reasoning_content": "All but 9 run away, so 9 remain.",
+                "content": "9 sheep.",
+            }),
+            "stop",
+        ));
+
+        assert_eq!(
+            out["content"],
+            json!([
+                {"type": "thinking", "thinking": "All but 9 run away, so 9 remain."},
+                {"type": "text", "text": "9 sheep."},
+            ])
+        );
+    }
+
+    /// No `signature` key at all, rather than one this relay made up. Pinned as a
+    /// requirement because a later "make it look more like Anthropic's shape"
+    /// change would be a forged attestation, not a fix.
+    #[test]
+    fn a_synthesized_thinking_block_carries_no_signature() {
+        let out = translate(completion(
+            json!({"role": "assistant", "reasoning_content": "hm", "content": "x"}),
+            "stop",
+        ));
+        assert!(
+            out["content"][0].get("signature").is_none(),
+            "unexpected: {}",
+            out["content"][0]
+        );
+    }
+
+    #[test]
+    fn reasoning_is_dropped_when_the_policy_switch_is_off() {
+        let out = translate_with(
+            completion(
+                json!({"role": "assistant", "reasoning_content": "hm", "content": "x"}),
+                "stop",
+            ),
+            false,
+        );
+        assert_eq!(out["content"], json!([{"type": "text", "text": "x"}]));
+    }
+
+    #[test]
+    fn empty_or_absent_reasoning_produces_no_thinking_block() {
+        for message in [
+            json!({"role": "assistant", "reasoning_content": "", "content": "x"}),
+            json!({"role": "assistant", "reasoning_content": Value::Null, "content": "x"}),
+            json!({"role": "assistant", "content": "x"}),
+        ] {
+            let out = translate(completion(message.clone(), "stop"));
+            assert_eq!(
+                out["content"],
+                json!([{"type": "text", "text": "x"}]),
+                "not an empty thinking block, no thinking block: {message}"
+            );
+        }
+    }
+
+    /// Reasoning with no answer after it is still the turn's whole content —
+    /// dropping it because `content` was empty would be the original bug again.
+    #[test]
+    fn reasoning_alone_is_still_surfaced() {
+        let out = translate(completion(
+            json!({"role": "assistant", "reasoning_content": "thought", "content": Value::Null}),
+            "stop",
+        ));
+        assert_eq!(
+            out["content"],
+            json!([{"type": "thinking", "thinking": "thought"}])
+        );
+    }
+
+    #[test]
+    fn reasoning_precedes_tool_use_blocks_too() {
+        let out = translate(completion(
+            json!({"role": "assistant", "reasoning_content": "need the disk", "content": Value::Null,
+                   "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "Bash", "arguments": "{}"}},
+            ]}),
+            "tool_calls",
+        ));
+        assert_eq!(out["content"][0]["type"], "thinking");
+        assert_eq!(out["content"][1]["type"], "tool_use");
     }
 
     #[test]

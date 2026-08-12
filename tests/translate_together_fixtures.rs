@@ -59,14 +59,14 @@ fn events(bytes: &[u8]) -> Vec<(String, Value)> {
 /// drains every frame; `finish()` afterward is a documented no-op once
 /// `[DONE]` has already closed the message.
 fn replay_stream(raw: &[u8]) -> Vec<(String, Value)> {
-    let mut translator = SseTranslator::new();
+    let mut translator = SseTranslator::new(true);
     let mut out = translator.push(raw);
     out.extend(translator.finish());
     events(&out)
 }
 
 fn translate_response(raw: &[u8]) -> Value {
-    let out = response_to_anthropic(raw).expect("translation failed");
+    let out = response_to_anthropic(raw, true).expect("translation failed");
     serde_json::from_slice(&out).expect("translated output is not valid JSON")
 }
 
