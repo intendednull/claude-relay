@@ -276,12 +276,13 @@ fn a_real_multiturn_roundtrip_response_translates_exactly() {
     );
 }
 
-/// The five pure-error captures never reach the translator in production —
-/// `src/fallback.rs`'s non-2xx branch passes an upstream error through
-/// verbatim, untranslated — so there is no translator behavior for them to
-/// exercise. This pins the shape that comment now cites instead of guesses:
-/// OpenAI-style `{"error": {message, type, param, code}}` plus a harmless
-/// top-level `id`.
+/// The five pure-error captures never reach *this* translator in production:
+/// `src/fallback.rs`'s non-2xx branch hands them to `src/provider_error.rs`,
+/// which rebuilds them as Anthropic error envelopes (spec §7d), not to the
+/// response translator. What this test pins is unaffected by that — it is a
+/// claim about the bytes Together **sends**, which `provider_error` reads and
+/// `docs/spec.md` §7d cites: OpenAI-style `{"error": {message, type, param,
+/// code}}` plus a harmless top-level `id`.
 #[test]
 fn every_real_error_capture_is_openai_shaped() {
     for raw in [

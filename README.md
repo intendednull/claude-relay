@@ -208,8 +208,14 @@ curl -sD- http://127.0.0.1:8484/v1/messages -H 'content-type: application/json' 
   variable `api_key_env` names is unset, or holds something unsendable),
   `upstream_unreachable`, `fallback_request_untranslatable`,
   `fallback_response_unreadable` (past the 4 MiB buffer cap, or the response
-  stream failed), `fallback_response_untranslatable`. Anything else — the
-  provider's own 4xx/5xx — is passed through untranslated, with its own status.
+  stream failed), `fallback_response_untranslatable`.
+- Anything else — the provider's own 4xx/5xx — reaches you in **Anthropic's error
+  envelope**, keeping the provider's status and message: `{"type":"error","error":
+  {"type":"invalid_request_error","message":"…"}}`. The relay rewords one case, a
+  context-limit error, to lead with `prompt is too long: <tokens> tokens > <limit>`
+  and the provider's own sentence after it, because that is the wording Claude
+  Code's compact-and-retry looks for (spec §7d). The provider's raw body goes to
+  the log, capped.
 
 To exercise the *failover* path instead, a mock-limited Anthropic is the
 supported route (see `tests/fallback.rs`); with `[policy] mode = "all"` and a

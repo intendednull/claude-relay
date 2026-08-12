@@ -275,6 +275,46 @@ profile claims falls through to the active profile. A name the active profile's
 endpoint rejects surfaces as that provider's error — the proxy does not validate
 model names.
 
+**A provider's error surfaces in Anthropic's envelope, not the provider's own shape.**
+This rule replaces the original "passed through verbatim, untranslated". That rule was
+written when no provider's error shapes had been captured, and translating from a guess
+would have been worse; the shapes are captured now
+(`tests/fixtures/together/{F,H,I,J}*`), and verbatim pass-through turned out to cost the
+user a whole session in the one case that matters most. **Claude Code detects a
+context-overflow by lowercased substring match on the error message** — `prompt is too
+long`, `input is too long for requested model`, or ``input length and `max_tokens`
+exceed context limit`` — and extracts the two token counts with
+`prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)`. A provider that words the same
+failure differently (Together AI says "The input (170071 tokens) is longer than the
+model's context length (131072 tokens).") matches none of them, so none of the client's
+compact-and-retry fires and the session is unrecoverable in place.
+
+So the relay emits `{"type":"error","error":{"type":…,"message":…}}`, and:
+
+- **The provider's status is preserved.** The captures show 400, 401, 404 and 422 all
+  occur; normalising them would report a different failure than the one that happened.
+  `x-relay-route: fallback` is on every one, §9's claim unchanged.
+- **The provider's own message is preserved**, and its `error.type` is mapped onto
+  Anthropic's name for the status (`invalid_request_error`, `authentication_error`,
+  `rate_limit_error`, …). The status decides wherever Anthropic documents a type for it,
+  because a provider's type string is not reliable — Together answers a 401 with
+  `invalid_request_error`. Anything unrecognised becomes Anthropic's generic `api_error`
+  rather than an invented name.
+- **For a context-limit error, the message leads with Anthropic's wording and the pair**
+  — `prompt is too long: 170071 tokens > 131072` — with the provider's own sentence after
+  it, which is the only thing that reported the real limit. The numbers are parsed out of
+  the provider's message and never invented: with no usable pair the phrase goes *last*
+  instead, so no digit the provider sent can be misread as one. This is the recovery that
+  matters, because Claude Code sends `max_tokens: 64000` — on a 131k model most of the
+  overflow is the output reservation, not the transcript, so shrinking `max_tokens` alone
+  fixes it with no compaction.
+- **Not every 4xx is a context-limit error.** Detection needs both a plausible status
+  (400 or 413) and matching wording; reshaping a malformed request into a too-long claim
+  would send the client shrinking and retrying forever. Only Together's wording is
+  measured — the other patterns matched are unverified guesses at other providers.
+- **The provider's raw body is logged**, capped and with the profile's own key redacted,
+  since the envelope necessarily reshapes what was sent.
+
 This makes deliberate mixed-backend use a client-side choice: `/model` (or
 `--model`, or `CLAUDE_CODE_SUBAGENT_MODEL`, or agent-view dispatch pickers) selects
 an open model by name and the proxy routes it, while `claude-*` selections continue
