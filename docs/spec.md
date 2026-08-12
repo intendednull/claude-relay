@@ -312,7 +312,10 @@ So the relay emits `{"type":"error","error":{"type":…,"message":…}}`, and:
   it, which is the only thing that reported the real limit. This is the recovery that
   matters, because Claude Code sends `max_tokens: 64000` — on a 131k model most of the
   overflow is the output reservation, not the transcript, so shrinking `max_tokens` alone
-  fixes it with no compaction.
+  fixes it with no compaction. It is not the whole answer, and §7e is the other half:
+  when the transcript *by itself* exceeds the window, shrinking `max_tokens` cannot help
+  and compaction may not be able to run at all, so the error is retried on a larger model
+  before it is emitted at all.
 - **The pair is read from the provider's message, and the parser refuses rather than
   guesses.** "Never invented" is not a strong enough claim to make about numbers taken
   out of arbitrary text: digits that came from the provider can still be the *wrong*
@@ -353,6 +356,74 @@ Client-side picker exposure is configuration outside this tool's scope (the
 Code skips model-name validation). Document the recommended combo in the README, but
 the proxy itself needs no knowledge of it.
 
+### 7e. Context-limit escalation
+
+Claude Code decides a session's context window **client-side**, from the `claude-*` name
+it selected, and the relay can neither see nor influence that number. So a request the
+client believes fits overflows the smaller model its alias mapped to (§7a), and §7d's
+translated error is the *client's* half of the recovery, not the whole of it: when the
+transcript alone exceeds the window, shrinking `max_tokens` cannot help and compaction
+needs a request that also would not fit.
+
+So a fallback request whose target answers with a context-limit error (§7d's detection,
+unchanged) is **retried against the next larger model before anything reaches the client**.
+
+- **The ladder is the profile's own `model_map` slots**, in the order
+  `policy.escalation_order` names — `claude-haiku` → `claude-sonnet` → `claude-opus` by
+  default, since Anthropic's alias hierarchy is the ordering a map's targets were chosen
+  against. Named explicitly rather than taken from `model_map`'s declaration order, which
+  §7a already uses for settling equal-length prefix ties: an edit that ties on nothing
+  would otherwise silently reorder the ladder.
+- **A rung is a slot, and only a slot.** `"*"` is not a rung — it is consulted only
+  because no prefix matched, so its target is a safe answer for anything rather than a size
+  tier, and on a real map it is often the *largest* model, which would make it a hop
+  downward. A target from `"*"`, from no entry at all, or from a slot
+  `escalation_order` does not name has no ladder position and does not climb. Neither does
+  a request routed here by name (§7d): the client picked that model itself, and swapping it
+  for another would be wrong behaviour rather than a recovery.
+- **Bounded, because every hop is a whole upstream request the operator pays for.** Each
+  rung is visited at most once and only upward, never revisiting one; a rung whose target
+  this request has already been sent to is skipped, which matters because two slots may
+  point at one model. **The bound per request is therefore one upstream request per rung at
+  or above the starting slot — three under the default order, not two.** On the last rung
+  the client gets §7d's translated error, reporting the model that finally refused —
+  escalation failing is not a reason to lose the recovery it already had.
+- **Only positive evidence of an *input* overflow may spend money.** Detection firing is
+  not that evidence: the same markers match a body saying the *output reservation* did not
+  fit (measured, a 35k transcript with a 160k `max_tokens`), and that case is already fixed
+  for free by the client shrinking `max_tokens` on §7d's error, so escalating it pre-empts
+  the free fix and buys a billed inference. The condition is a parsed token pair, which
+  §7d's anchored parser yields only for a count that precedes the matched wording and
+  exceeds the number after it. The cost, taken knowingly and in the safe direction of §7d's
+  own asymmetry: a genuine overflow worded limit-first, or with thousands separators, gets
+  the translated error and no hop.
+- **A hop's answer replaces the rung below's only if it is at least as final.** Two
+  cases where it is not, and the rung below's answer goes out instead: a hop that produces
+  no response at all (its connection fails), where the alternative is trading an actionable
+  Anthropic error for the relay's own `upstream_unreachable`; and a hop whose status the
+  client would simply retry (408, 409, 429, any 5xx), where — measured — the client retried
+  with backoff and **every retry re-walked the whole ladder**, turning a one-shot failure
+  into unbounded request amplification that nothing in the relay can bound, because the
+  loop is the client's.
+
+  A hop that fails **terminally** does report itself, even when that is less useful than
+  the rung below's error: a rung pointing at a retired `model_map` target surfaces its 404,
+  because it cannot amplify and masking it would hide the misconfiguration. So the
+  invariant is *not* "escalation can never make the answer worse" — it is that escalation
+  never leaves the client with something it can only retry, and never with a relay-internal
+  code in place of the provider's.
+- **Never mid-response.** The decision is made where a provider's status has arrived and
+  no byte of a response exists, so a context limit that arrives *inside* a 200 stream is
+  never escalated — it terminates the stream as §6 already requires.
+- **Every hop logs at INFO**, naming the model that could not fit, the model being tried,
+  and that a context limit is the reason, so a bill for the largest model configured is
+  explainable after the fact. Model names only, never request content. Each attempt that
+  received a response also keeps its own §9 line, as a detect-time re-route already does —
+  a hop that received none has no status, so it has neither a line nor a
+  `fallback_requests_served` increment.
+- **`policy.escalate_on_context_limit = false`** restores the older behaviour, where the
+  translated error goes straight to the client.
+
 ## 8. Configuration
 
 Single TOML file. Everything hot-reloadable except the listen address (SIGHUP or file
@@ -385,6 +456,8 @@ mode = "new-sessions"                  # new-sessions | all | notify-only
 active_profile = "deepseek"            # startup default; runtime switches via /control
 failover_on_detect = true              # §6: the request that trips the limit fails over too
 surface_fallback_reasoning = true      # §7c: a provider's reasoning becomes a thinking block
+escalate_on_context_limit = true       # §7e: a prompt that does not fit is retried one rung up
+escalation_order = ["claude-haiku", "claude-sonnet", "claude-opus"]   # §7e: the rungs
 min_reset_horizon_secs = 300           # below this, a 429 is a burst, not the limit
 reset_jitter_secs = [15, 60]
 

@@ -134,6 +134,64 @@ max_reset_horizon_secs = 604800   # 7 days: Claude limits include weekly windows
 # LIMITED, `[min, max]` inclusive, so the first probe after the window doesn't
 # race the upstream reset boundary.
 reset_jitter_secs = [15, 60]
+# Whether a fallback request the provider rejects as too long is retried against the
+# next larger model in your `model_map` instead of returning that error. Default on.
+#
+# Claude Code decides how big a session's context window is on its own side, from the
+# `claude-*` name it selected — it cannot see which model your `model_map` sent that
+# name to, so it will overshoot a smaller one believing it has room. Once the
+# transcript by itself is over the window there is no way back: shrinking `max_tokens`
+# does not help, and `/compact` needs a request that would also not fit, which is the
+# `Error during compaction: Conversation too long` dead end whose only exit is
+# `/clear`. A bigger model is usually already configured one slot up, so the relay
+# tries it.
+#
+# Each hop is a *whole extra upstream request you pay for*, at the larger model's
+# price, so the walk is bounded: each rung at most once, only upward, never a model this
+# request has already failed on, and never for any error but a context limit. Price it
+# by the rungs, not by the hop — the worst case for one request is **one upstream
+# request per rung at or above where it started, so three under the default order** (and
+# four if you add a fourth slot below).
+#
+# It also climbs only on evidence the *input* overflowed — the provider naming a token
+# count that exceeds its limit. A body saying you "requested 195000 tokens (35000 in the
+# messages, 160000 in the completion)" is your `max_tokens` reservation rather than your
+# transcript, and Claude Code fixes that one itself for free, so paying for a bigger
+# model there would buy an inference nobody needed. The cost of that caution: a genuine
+# overflow a provider words limit-first, or with thousands separators, gets the error and
+# no hop — which is what happened before this feature existed.
+#
+# On the last rung the client gets the same *kind* of translated error, reporting the
+# model that finally refused. It also gets the rung below's error rather than a bare
+# relay 502 when a hop cannot be sent, and rather than a 429 or 5xx when a hop fails with
+# something the client would only retry — that would turn one failure into a retry loop
+# that re-walks the ladder each time. A hop that fails *terminally* does report itself,
+# so a rung pointing at a retired model shows you that 404 instead of hiding it.
+escalate_on_context_limit = true
+# The `model_map` slots that make up the ladder, smallest context window first. The
+# default below is Anthropic's own size hierarchy, which is the ordering your map's
+# targets were chosen against.
+#
+# Written out here rather than taken from the order your `model_map` entries appear
+# in: that order already decides something else (which of two equal-length prefixes
+# wins, §7a), so swapping two lines that tie on nothing would silently reorder the
+# ladder.
+#
+# These are `model_map` keys, matched **exactly** — unlike `model_map` itself, which is
+# prefix-matched against the incoming model name. A map keyed `"claude-sonnet-4-6"` is
+# therefore not the `"claude-sonnet"` rung: that rung is skipped and the walk goes to the
+# next one it can resolve, which is your most expensive model. A map keyed entirely with
+# full model names escalates not at all, silently. Spell the two the same way, or list
+# your own keys here.
+#
+# A slot no profile defines is skipped. A slot that is *not on this list* has no
+# position on the ladder and never escalates — which is why `claude-fable` is absent:
+# where it sits between sonnet and opus is not documented, and a wrong guess is a hop
+# to a model that also cannot fit the prompt. Add it if your map points it at
+# something smaller than your largest model. `"*"` is refused here: it is where names
+# nothing else claims land, not a size tier, and it is often the largest target you
+# have — reading it as the bottom rung would hop the wrong way.
+escalation_order = ["claude-haiku", "claude-sonnet", "claude-opus"]
 # Whether a fallback provider's reasoning — the `reasoning`/`reasoning_content`
 # field a reasoning model returns alongside its answer — is surfaced to the
 # client as an Anthropic `thinking` block, so Claude Code renders it as extended

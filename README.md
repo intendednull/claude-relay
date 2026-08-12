@@ -163,6 +163,62 @@ failover_on_detect = false` to restore the older behavior, where only requests
 *after* the transition fail over. Such a request logs two lines: the Anthropic
 attempt, then the fallback that answered it.
 
+**A prompt that does not fit is retried one model up** (spec §7e). Claude Code sizes
+its context window from the `claude-*` name it picked, not from the model your
+`model_map` sent it to, so it will happily overshoot a smaller one — and once the
+transcript alone is over the window, neither `/compact` nor a smaller `max_tokens`
+can rescue the session. So a fallback request the provider rejects as too long is
+re-sent to the next larger slot in your map: `claude-haiku`'s target, then
+`claude-sonnet`'s, then `claude-opus`'s, per `[policy] escalation_order`.
+
+Three things about it are worth knowing before you leave it on, because **each hop is
+a second upstream request you pay for**, at the larger model's price:
+
+- It visits **each rung at most once, and only upward** — never past the top, never
+  back to a model this request already failed on (two slots pointing at the same model
+  is one hop, not two), and never on any error but a context limit. **The worst case is
+  one upstream request per rung at or above where the request started: three with the
+  default order**, four if you add `claude-fable`. Not two — "climbs one rung" is per
+  hop, not per request.
+- It only climbs on evidence the **input itself** overflowed — the provider naming a
+  token count that exceeds its limit. A "you requested 195000 tokens (35000 in the
+  messages, 160000 in the completion)" failure is your `max_tokens` reservation, not
+  your transcript, and Claude Code fixes that one itself for free by shrinking
+  `max_tokens`; paying for a bigger model there would buy an inference you did not need.
+  The cost of that caution: a genuine overflow whose provider words it in a shape the
+  parser cannot pair (limit first, or with thousands separators) gets the error and no
+  hop, exactly as before this feature existed.
+- On the last rung you get the same *kind* of translated error, reporting the model that
+  **finally** refused — its limit numbers, not the bottom rung's. You also get the rung
+  below's error, rather than a bare relay 502, when a hop cannot be sent at all, and
+  rather than a 429 or 5xx when a hop fails with something you would only retry (which
+  would otherwise turn a one-shot failure into a retry loop that re-walks the ladder
+  every time). A hop that fails *terminally* does report itself: a rung pointing at a
+  retired or mistyped model surfaces that 404, because it cannot loop and hiding it
+  would hide the misconfiguration.
+- It applies only to a **failed-over `claude-*` request**, which is the only kind with
+  a slot to climb from. A model you picked by name is never swapped for another, and
+  neither is a target that came from the `"*"` catch-all — `"*"` is where unmapped
+  names land, not a size tier, and it is often your *largest* model, so treating it as
+  the bottom rung would hop the wrong way.
+- Every hop logs at INFO with the model that could not fit and the model being tried,
+  so a surprise bill is explainable: `grep 'retrying one rung up'`. Each attempt that
+  got a response also gets its own request line and counts toward `/status`'s
+  `fallback_requests_served`; a hop that never got one has no status, so it has neither.
+
+A slot you leave out of `escalation_order` has no position on the ladder and never
+escalates — `claude-fable` is out of the default, because where it sits between sonnet
+and opus is not documented and a wrong guess is a hop that also cannot fit. Add it if
+your map points it somewhere smaller than the top.
+
+**`escalation_order` names `model_map` keys exactly — it is not prefix-matched, though
+`model_map` itself is.** So a map keyed `"claude-sonnet-4-6"` is not the
+`"claude-sonnet"` rung: that rung is skipped and the walk goes straight to the next one
+it can resolve, which is your *most expensive* model. A map keyed entirely with full
+model names gets no escalation at all, silently. Keep the two lists spelled the same, or
+put your own keys in `escalation_order`. Set `[policy] escalate_on_context_limit =
+false` to turn the whole thing off and get the error straight through.
+
 Nothing the client sent reaches a profile: the outgoing request's headers are
 *built*, not filtered, so no client credential can leak by being missing from a
 denylist (spec §7b, and the invariant is a test). Anthropic's prompt-caching

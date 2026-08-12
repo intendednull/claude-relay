@@ -245,6 +245,34 @@ pub struct PolicyConfig {
     /// window doesn't race the upstream reset boundary (spec §4).
     #[serde(default = "default_reset_jitter_secs")]
     pub reset_jitter_secs: [u64; 2],
+    /// Whether a fallback request whose target model rejected the prompt as too
+    /// long is retried against the next larger slot in `escalation_order` (spec
+    /// §7e). Defaults to on: without it the session is lost in place — Claude
+    /// Code sizes its context window from the `claude-*` name it chose, so it
+    /// overshoots a smaller fallback model believing it has room, and
+    /// `/compact` cannot rescue it because summarising needs a request that
+    /// also fits. `false` restores the older behavior, where the translated
+    /// context-limit error goes straight to the client.
+    ///
+    /// The reason it is a switch: each hop is a whole extra upstream request the
+    /// operator pays for, at the larger model's price.
+    #[serde(default = "default_escalate_on_context_limit")]
+    pub escalate_on_context_limit: bool,
+    /// The `model_map` slots that form the escalation ladder, smallest context
+    /// window first.
+    ///
+    /// Named explicitly rather than derived from `model_map`'s own order: that
+    /// order is the file's declaration order, which §7a already uses for
+    /// something else entirely (settling equal-length prefix ties), so reusing
+    /// it would make an unrelated edit — swapping two lines that tie on nothing
+    /// — silently reorder the ladder. Anthropic's alias hierarchy is the
+    /// ordering the map's own targets were chosen against, so it is the one
+    /// worth writing down.
+    ///
+    /// A slot no profile defines is skipped; a slot not named here has no ladder
+    /// position and never escalates. `"*"` is refused (see `validate`).
+    #[serde(default = "default_escalation_order")]
+    pub escalation_order: Vec<String>,
     /// Whether a fallback provider's reasoning (`translate::openai::
     /// reasoning_text`) is surfaced to the client as an Anthropic `thinking`
     /// block. Defaults to on: the operator is billed for those tokens either
@@ -292,6 +320,20 @@ fn default_surface_fallback_reasoning() -> bool {
     true
 }
 
+fn default_escalate_on_context_limit() -> bool {
+    true
+}
+
+/// Anthropic's own size hierarchy, which is what a `model_map`'s targets were
+/// picked against. `claude-fable` is deliberately absent: its place in that
+/// ordering is not documented, and a wrong guess about where it sits is a hop to
+/// a model that cannot fit the prompt either — paid for.
+fn default_escalation_order() -> Vec<String> {
+    ["claude-haiku", "claude-sonnet", "claude-opus"]
+        .map(String::from)
+        .to_vec()
+}
+
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
@@ -301,6 +343,8 @@ impl Default for PolicyConfig {
             min_reset_horizon_secs: default_min_reset_horizon_secs(),
             max_reset_horizon_secs: default_max_reset_horizon_secs(),
             reset_jitter_secs: default_reset_jitter_secs(),
+            escalate_on_context_limit: default_escalate_on_context_limit(),
+            escalation_order: default_escalation_order(),
             surface_fallback_reasoning: default_surface_fallback_reasoning(),
         }
     }
@@ -371,6 +415,35 @@ impl PolicyConfig {
             bail!(
                 "`policy.reset_jitter_secs` max must be at most {MAX_JITTER_SECS} (1 hour), got {jitter_max}"
             );
+        }
+        self.validate_escalation_order()
+    }
+
+    /// Every way an `escalation_order` entry can look configured and do nothing.
+    /// All three are silent otherwise, and the thing they silently disable is a
+    /// recovery from an error that otherwise costs a whole session.
+    fn validate_escalation_order(&self) -> Result<()> {
+        // `"*"` is the catch-all for names no slot claims, not a size tier — a
+        // request that resolved through it has no ladder position at all (see
+        // `fallback::Ladder`). Listing it here looks like configuring the bottom
+        // rung and is ignored, so it is refused rather than accepted-and-dropped.
+        if self.escalation_order.iter().any(|slot| slot == "*") {
+            bail!(
+                "`policy.escalation_order` must not contain \"*\" — the catch-all is not a size tier, and a request that resolved through it has no rung to climb from"
+            );
+        }
+        if self.escalation_order.iter().any(String::is_empty) {
+            bail!(
+                "`policy.escalation_order` entries must not be empty — an empty slot matches no `model_map` key"
+            );
+        }
+        // A repeat means one rung is named twice. The target-already-tried check
+        // makes it harmless at runtime, which is exactly why it would never be
+        // noticed: the operator meant to write two different slots.
+        for (at, slot) in self.escalation_order.iter().enumerate() {
+            if self.escalation_order[..at].contains(slot) {
+                bail!("`policy.escalation_order` names {slot:?} more than once");
+            }
         }
         Ok(())
     }
@@ -1187,6 +1260,15 @@ mod tests {
         assert_eq!(policy.max_reset_horizon_secs, 7 * 24 * 60 * 60);
         assert_eq!(policy.reset_jitter_secs, [15, 60]);
         assert!(
+            policy.escalate_on_context_limit,
+            "a context overflow costs the whole session, so climbing the ladder is the default"
+        );
+        assert_eq!(
+            policy.escalation_order,
+            ["claude-haiku", "claude-sonnet", "claude-opus"],
+            "Anthropic's own size hierarchy, which is what a model_map's targets were picked against"
+        );
+        assert!(
             policy.surface_fallback_reasoning,
             "the operator is billed for the reasoning tokens either way; showing them is the default"
         );
@@ -1206,6 +1288,76 @@ mod tests {
         "#;
         let config = Config::from_toml_str(raw).expect("should parse");
         assert!(!config.policy.surface_fallback_reasoning);
+    }
+
+    /// Both knobs are readable from the file, including an order carrying the
+    /// fourth alias the default leaves out.
+    #[test]
+    fn the_escalation_ladder_is_configurable_from_the_file() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [policy]
+            escalate_on_context_limit = false
+            escalation_order = ["claude-haiku", "claude-sonnet", "claude-opus", "claude-fable"]
+        "#;
+        let config = Config::from_toml_str(raw).expect("should parse");
+        assert!(!config.policy.escalate_on_context_limit);
+        assert_eq!(
+            config.policy.escalation_order,
+            [
+                "claude-haiku",
+                "claude-sonnet",
+                "claude-opus",
+                "claude-fable"
+            ]
+        );
+        assert!(config.policy.validate(&IndexMap::new()).is_ok());
+    }
+
+    /// Three ways to write a rung that is configured and does nothing. Each is
+    /// silent, and what it silently disables is the recovery from an error that
+    /// otherwise costs the session.
+    #[test]
+    fn an_escalation_order_entry_that_could_never_be_a_rung_is_rejected() {
+        for order in [
+            // The catch-all: consulted only when no prefix matched, so its
+            // target is a safe answer for anything rather than a size tier.
+            // Accepting it here would look like configuring the bottom rung.
+            vec!["*", "claude-sonnet"],
+            vec!["claude-haiku", "*"],
+            // Matches no `model_map` key (`model_map` refuses an empty key too).
+            vec!["claude-haiku", ""],
+            // One rung named twice: harmless at runtime only because the
+            // already-tried check catches it, which is why it would never be
+            // noticed. The operator meant two different slots.
+            vec!["claude-haiku", "claude-sonnet", "claude-haiku"],
+        ] {
+            let policy = PolicyConfig {
+                escalation_order: order.iter().map(|slot| (*slot).to_string()).collect(),
+                ..PolicyConfig::default()
+            };
+            let err = policy
+                .validate(&IndexMap::new())
+                .expect_err("a rung that can never be climbed must not pass startup validation")
+                .to_string();
+            assert!(err.contains("escalation_order"), "{order:?}: {err}");
+        }
+    }
+
+    /// An empty ladder is a valid configuration — it is the honest way to say
+    /// "no slot may escalate" without turning the feature off for a future
+    /// profile — so it must not be caught by the checks above.
+    #[test]
+    fn an_empty_escalation_order_is_valid() {
+        let policy = PolicyConfig {
+            escalation_order: Vec::new(),
+            ..PolicyConfig::default()
+        };
+        assert!(policy.validate(&IndexMap::new()).is_ok());
     }
 
     #[test]
