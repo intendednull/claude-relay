@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 
 use crate::config::ProfileConfig;
 use crate::provider_error::ProviderError;
-use crate::proxy::{CountingStream, RequestLog, elapsed_ms, forwardable};
+use crate::proxy::{CountingStream, ERROR_BODY_CAP, RequestLog, elapsed_ms, forwardable};
 use crate::state::AppState;
 use crate::translate::{self, BUFFER_CAP};
 
@@ -385,7 +385,19 @@ async fn provider_error_response(
         headers.insert("retry-after", retry_after);
     }
 
-    let raw = match read_capped(upstream, RESPONSE_CAP).await {
+    // `ERROR_BODY_CAP`, not `RESPONSE_CAP`: the repo already has a cap argued for
+    // exactly this hazard — the Anthropic route's error accumulator, whose 1 MiB is
+    // there so "a broken or hostile upstream must not be able to turn an error
+    // response into unbounded allocation" (Global Constraint 3). `RESPONSE_CAP` is
+    // 4x that and is about a non-streaming 2xx that has to be complete before it can
+    // be translated, which is a different question; inheriting it here would have
+    // been 4x by accident rather than by choice.
+    //
+    // Note the change in resource profile this branch made: a provider error used to
+    // stream through at O(1) and is now buffered whole, so a burst of concurrent
+    // errors costs O(cap) each. Bounded per request, with no aggregate bound across
+    // them — the same property spec §12 already records for every other buffer here.
+    let raw = match read_capped(upstream, ERROR_BODY_CAP).await {
         Ok(raw) => raw,
         Err(reason) => {
             tracing::warn!(

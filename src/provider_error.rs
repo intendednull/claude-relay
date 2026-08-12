@@ -26,7 +26,8 @@ pub(crate) struct ContextLimit {
 pub(crate) struct ProviderError {
     /// Anthropic's own name for this failure.
     kind: &'static str,
-    /// The provider's `error.message`, when the body carried one.
+    /// What the provider said, from whichever of three shapes carried it — see
+    /// `read`. `None` only for a body with nothing in it at all.
     message: Option<String>,
     /// Set only for the failure Task 9A escalates on.
     pub(crate) context_limit: Option<ContextLimit>,
@@ -59,13 +60,39 @@ const CONTEXT_LIMIT_MARKERS: [&str; 3] = [
     "context window",
 ];
 
+/// How much of an unrecognised body reaches the client as the message. Bounded
+/// because it is provider-controlled and unbounded, and counted in `char`s so the
+/// clip cannot split a multi-byte boundary. Independent of the log's own cap: this
+/// one is about what a client should be asked to render, that one about log volume.
+const MESSAGE_SNIPPET_CHARS: usize = 512;
+
 impl ProviderError {
     pub(crate) fn read(status: StatusCode, body: &[u8]) -> Self {
         let parsed: Option<Value> = serde_json::from_slice(body).ok();
         let error = parsed.as_ref().and_then(|value| value.get("error"));
         let field = |name: &str| error.and_then(|error| error.get(name))?.as_str();
 
-        let message = field("message").map(str::to_string);
+        // Three shapes, in order of how much they tell us. Reading only the first
+        // lost the provider's message entirely for the other two — a regression
+        // against the verbatim pass-through this replaced, where a flat body still
+        // reached the client's SDK, which prefers a top-level `message`.
+        let message = field("message")
+            .map(str::to_string)
+            // vLLM and several OpenAI-compatible servers put the sentence at the
+            // top level: `{"object":"error","message":…,"type":"BadRequestError"}`.
+            .or_else(|| {
+                parsed
+                    .as_ref()?
+                    .get("message")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            // Anything else — `{"detail":…}`, a `text/plain` 413, an HTML page from
+            // an intermediary. A bounded snippet of what arrived beats a sentence
+            // that says nothing: the operator has the log, the client's user has
+            // only this. Detection reads it too, so a plain-text "the input is
+            // longer than the model's context length" still rescues the session.
+            .or_else(|| snippet(body));
         Self {
             kind: anthropic_type(status, field("type")),
             context_limit: message
@@ -88,9 +115,10 @@ impl ProviderError {
     /// The message the client sees. For a context-limit error this is the part
     /// that does the work: Claude Code detects the condition by lowercased
     /// substring match and extracts the two numbers with
-    /// `prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)`, so where the
-    /// phrase sits relative to the digits decides whether the client can size
-    /// its retry (docs/decisions.md).
+    /// `/prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)/i`, whose captures it
+    /// reads as `actualTokens` then `limitTokens` — so both the order of the pair
+    /// and where the phrase sits relative to the digits decide whether the client
+    /// can size its retry (docs/decisions.md).
     fn client_message(&self) -> String {
         let Some(provider) = self.message.as_deref() else {
             return "the fallback provider returned an error with no message".to_string();
@@ -113,6 +141,18 @@ impl ProviderError {
             Some(ContextLimit { counts: None }) => format!("{provider} (prompt is too long)"),
         }
     }
+}
+
+/// A clipped view of a body no recognised field could be read out of. `None` for
+/// one with nothing in it, which is the only case where the relay genuinely has
+/// nothing to report — a read that failed its cap, or an empty body.
+fn snippet(body: &[u8]) -> Option<String> {
+    let text: String = String::from_utf8_lossy(body)
+        .chars()
+        .take(MESSAGE_SNIPPET_CHARS)
+        .collect();
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn anthropic_type(status: StatusCode, provider_type: Option<&str>) -> &'static str {
@@ -204,7 +244,7 @@ fn last_digit_run(text: &str) -> Option<(u64, usize)> {
         .iter()
         .rposition(|byte| !byte.is_ascii_digit())
         .map_or(0, |at| at + 1);
-    digits(&bytes[start..end]).map(|value| (value, end))
+    whole_number(bytes, start, end).map(|value| (value, end))
 }
 
 fn first_digit_run(text: &str) -> Option<u64> {
@@ -214,7 +254,41 @@ fn first_digit_run(text: &str) -> Option<u64> {
         .iter()
         .position(|byte| !byte.is_ascii_digit())
         .map_or(bytes.len(), |at| start + at);
+    whole_number(bytes, start, end)
+}
+
+/// The run at `start..end` as a number — but only if it is a whole number rather
+/// than one group of a separated one.
+///
+/// A thousands separator splits `170,071` into `170` and `071`, and the
+/// input-over-limit guard cannot catch what that produces: measured, a message
+/// reading `(170,071 tokens) … (2,072 tokens)` yields `(71, 2)`, which passes the
+/// guard and tells the client to shed 69 tokens from a request tens of thousands
+/// over. It then shaves nothing, retries, and loops — carrying the relay's own
+/// numbers, which is worse than failing honestly. So a group of a separated number
+/// is refused outright: read as one number or not at all.
+///
+/// This cannot fire on Together's captured wording, which uses no separators. It is
+/// here because two of the three `CONTEXT_LIMIT_MARKERS` exist only to match
+/// wordings nobody here has captured, so the parser has to survive wordings nobody
+/// here has captured.
+fn whole_number(bytes: &[u8], start: usize, end: usize) -> Option<u64> {
+    let continues_a_number =
+        start >= 2 && is_group_separator(bytes[start - 1]) && bytes[start - 2].is_ascii_digit();
+    let is_continued_by =
+        end + 1 < bytes.len() && is_group_separator(bytes[end]) && bytes[end + 1].is_ascii_digit();
+    if continues_a_number || is_continued_by {
+        return None;
+    }
     digits(&bytes[start..end])
+}
+
+/// Separators seen in the wild between groups of one number: `,` (English), `.`
+/// (European), and space or `_` (both used by some formatters). A separator only
+/// counts as one when a digit sits on both sides of it, so an ordinary sentence's
+/// full stop or space is unaffected.
+fn is_group_separator(byte: u8) -> bool {
+    matches!(byte, b',' | b'.' | b'_' | b' ')
 }
 
 /// `None` for a run too large for `u64`, rather than a wrapped number.
@@ -378,6 +452,73 @@ mod tests {
         }
     }
 
+    /// Thousands separators split a number into groups, and the input-over-limit
+    /// guard cannot catch what that produces — measured, the last case here yielded
+    /// `(71, 2)`, which passes the guard and tells the client to shed 69 tokens from
+    /// a request tens of thousands over. Anchoring alone does not close this: it
+    /// happens to reject the first two, and does not reject the last.
+    #[test]
+    fn a_separated_number_is_read_whole_or_not_at_all() {
+        for (label, message) in [
+            (
+                "English separators, both numbers",
+                "The input (170,071 tokens) is longer than the model's context length (131,072 tokens).",
+            ),
+            (
+                "separators, limit before input",
+                "This model's maximum context length is 131,072 tokens. However, you requested 170,071 tokens.",
+            ),
+            (
+                // The one anchoring alone gets wrong: `(71, 2)` survives the guard.
+                "separators whose groups pass the guard",
+                "The input (170,071 tokens) is longer than the model's context length (2,072 tokens).",
+            ),
+            (
+                "European separators",
+                "The input (170.071 tokens) is longer than the model's context length (131.072 tokens).",
+            ),
+            (
+                "space separators",
+                "The input (170 071 tokens) is longer than the model's context length (131 072 tokens).",
+            ),
+        ] {
+            assert_eq!(
+                counts(message),
+                None,
+                "{label} must not yield a pair built from one group"
+            );
+        }
+
+        // A version string is separated the same way, and must not be mistaken for
+        // the input size either. Anchoring already looks past it, so this pins that
+        // the separator guard did not make the case worse.
+        assert_eq!(
+            counts(
+                "deepseek-ai/DeepSeek-V3.1: The input (170071 tokens) is longer than the model's context length (131072 tokens)."
+            ),
+            Some((170071, 131072)),
+            "a dotted model version must not disturb the real pair"
+        );
+    }
+
+    /// The separator rule must not fire on ordinary punctuation: a full stop or a
+    /// space with no digit on the far side is just prose.
+    #[test]
+    fn ordinary_punctuation_around_a_number_is_not_a_separator() {
+        assert_eq!(
+            counts(
+                "The input (170071 tokens) is longer than the model's context length (131072 tokens)."
+            ),
+            Some((170071, 131072)),
+            "the measured wording ends in a full stop right after a digit run"
+        );
+        assert_eq!(
+            counts("sent 99999 tokens, past the maximum context length of 8192"),
+            Some((99999, 8192)),
+            "a comma after a digit run with a space on the far side is prose"
+        );
+    }
+
     /// The `token` requirement, which is what stops a numeric model name from
     /// standing in for the input size when the wording puts the limit first.
     #[test]
@@ -490,14 +631,52 @@ mod tests {
 
     /// A body that is not an OpenAI- or Anthropic-shaped error at all still has
     /// to produce a usable envelope, since the status is all the client gets.
+    ///
+    /// This test used to assert the generic sentence for every one of these, and
+    /// that was the suite **defending** a regression rather than missing one: the
+    /// verbatim pass-through it replaced let a flat body reach the client's SDK,
+    /// which prefers a top-level `message`, so the user saw the real reason. Only
+    /// the truly empty body has nothing to report.
     #[test]
-    fn an_unreadable_body_still_produces_an_envelope() {
-        for body in [
-            "<html>502 Bad Gateway</html>",
-            "",
-            "null",
-            r#"{"error":"flat"}"#,
+    fn a_body_in_an_unrecognised_shape_still_carries_what_it_said() {
+        // vLLM and friends: the sentence is at the top level, not under `error`.
+        let flat = r#"{"object":"error","message":"This model's maximum context length is 131072 tokens. However, you requested 170071 tokens.","type":"BadRequestError"}"#;
+        assert_eq!(
+            read(400, flat).client_message(),
+            "This model's maximum context length is 131072 tokens. However, you requested 170071 tokens. (prompt is too long)",
+            "a top-level message is read, and detection sees it"
+        );
+
+        // Neither shape: a snippet of what arrived, which is strictly more than a
+        // sentence saying nothing.
+        for (body, expected) in [
+            (
+                r#"{"detail":"The input (170071 tokens) is longer than the model's context length (131072 tokens)."}"#,
+                "The input (170071 tokens) is longer than the model's context length",
+            ),
+            (
+                // A `text/plain` 413 from an intermediary. This one is why the rule
+                // has to be uniform rather than JSON-only — and, being plain text,
+                // it is the same rule that decides the HTML case below.
+                "Request too large: the input is longer than the model's context length",
+                "Request too large",
+            ),
+            ("<html>502 Bad Gateway</html>", "502 Bad Gateway"),
+            (r#"{"error":"flat"}"#, "flat"),
         ] {
+            let message = read(400, body).client_message();
+            assert!(
+                message.contains(expected),
+                "the provider's own bytes must survive into the message: {message:?}"
+            );
+        }
+    }
+
+    /// The one case with genuinely nothing to report: an empty body, which is also
+    /// what a read that failed its cap produces.
+    #[test]
+    fn an_empty_body_still_produces_an_envelope() {
+        for body in ["", "   "] {
             let value: Value =
                 serde_json::from_slice(&read(502, body).to_anthropic()).expect("valid JSON");
             assert_eq!(value["type"], "error");
@@ -507,6 +686,15 @@ mod tests {
                 "the fallback provider returned an error with no message"
             );
         }
+    }
+
+    /// A snippet is bounded: an unrecognised body is provider-controlled and
+    /// unbounded, and it now reaches the client rather than only the log.
+    #[test]
+    fn an_unrecognised_body_is_clipped_before_it_reaches_the_client() {
+        let huge = "z".repeat(MESSAGE_SNIPPET_CHARS * 4);
+        let message = read(400, &huge).client_message();
+        assert_eq!(message.chars().count(), MESSAGE_SNIPPET_CHARS);
     }
 
     /// The message is a JSON string, so a provider that puts quotes and newlines

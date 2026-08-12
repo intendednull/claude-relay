@@ -603,7 +603,7 @@ impl RequestLog {
 /// An accumulated body is the one thing this proxy holds in memory, so it is
 /// bounded: a broken or hostile upstream must not be able to turn an error
 /// response into unbounded allocation (Global Constraint 3).
-const ERROR_BODY_CAP: usize = 1024 * 1024;
+pub(crate) const ERROR_BODY_CAP: usize = 1024 * 1024;
 
 /// A non-2xx response's status/headers plus the body bytes accumulated so far,
 /// so detection can classify — and a fixture can be written — once the stream

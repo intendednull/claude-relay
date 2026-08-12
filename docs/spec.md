@@ -294,12 +294,19 @@ So the relay emits `{"type":"error","error":{"type":…,"message":…}}`, and:
 - **The provider's status is preserved.** The captures show 400, 401, 404 and 422 all
   occur; normalising them would report a different failure than the one that happened.
   `x-relay-route: fallback` is on every one, §9's claim unchanged.
-- **The provider's own message is preserved**, and its `error.type` is mapped onto
-  Anthropic's name for the status (`invalid_request_error`, `authentication_error`,
-  `rate_limit_error`, …). The status decides wherever Anthropic documents a type for it,
-  because a provider's type string is not reliable — Together answers a 401 with
-  `invalid_request_error`. Anything unrecognised becomes Anthropic's generic `api_error`
-  rather than an invented name.
+- **The provider's own message is preserved**, from whichever shape carried it:
+  `error.message` first, then a top-level `message` (vLLM and several
+  OpenAI-compatible servers put it there), then a bounded snippet of the body itself —
+  which is what keeps a `{"detail": …}` body or a `text/plain` 413 from arriving as a
+  sentence that says nothing. Only a body with nothing in it produces the relay's own
+  "no message" wording. Reading `error.message` alone would be a regression against the
+  verbatim pass-through this replaced, where a flat body still reached the client's SDK
+  and the user saw the real reason.
+- **The `error.type` is mapped onto Anthropic's name for the status**
+  (`invalid_request_error`, `authentication_error`, `rate_limit_error`, …). The status
+  decides wherever Anthropic documents a type for it, because a provider's type string is
+  not reliable — Together answers a 401 with `invalid_request_error`. Anything
+  unrecognised becomes Anthropic's generic `api_error` rather than an invented name.
 - **For a context-limit error, the message leads with Anthropic's wording and the pair**
   — `prompt is too long: 170071 tokens > 131072` — with the provider's own sentence after
   it, which is the only thing that reported the real limit. This is the recovery that
@@ -311,13 +318,15 @@ So the relay emits `{"type":"error","error":{"type":…,"message":…}}`, and:
   out of arbitrary text: digits that came from the provider can still be the *wrong*
   digits. So the parse is anchored to the wording that matched — the last token count
   before it and the first number after it — and it yields nothing unless the leading
-  number is a count of tokens and exceeds the trailing one. That is what makes a request
-  id or an ISO timestamp an intermediary prepended irrelevant; unanchored, a
-  `2026-08-12T…` prefix in front of Together's own sentence reports a context limit of
-  8 tokens, which drives the client's `max_tokens` toward zero without converging. When
-  no pair survives those checks the phrase goes *last* in the message instead, so no
-  digit the provider sent sits where the extraction regex could read it as the pair. A
-  wrong pair is worse than no pair.
+  number is a count of tokens, is a whole number rather than one group of a
+  separated one, and exceeds the trailing number. Those checks are each there for a
+  measured failure: unanchored, a `2026-08-12T…` prefix an intermediary added in front of
+  Together's own sentence reports a context limit of **8 tokens**; and a thousands
+  separator splits `170,071` into `170` and `071`, which on one real-shaped wording
+  yields `(71, 2)` — both of which drive the client's `max_tokens` toward zero without
+  ever converging. When no pair survives the checks the phrase goes *last* in the message
+  instead, so no digit the provider sent sits where the extraction regex could read it as
+  the pair. A wrong pair is worse than no pair.
 - **Not every 4xx is a context-limit error.** Detection needs both a plausible status
   (400 or 413) and matching wording; reshaping a malformed request into a too-long claim
   would send the client shrinking and retrying forever. Only Together's wording is

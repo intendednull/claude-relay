@@ -2282,11 +2282,19 @@ const TOO_LONG_PHRASES: [&str; 3] = [
     "input length and `max_tokens` exceed context limit",
 ];
 
-/// The number-extraction regex, also from the binary. No regex crate is in this
-/// tree (Global Constraint 3), so `token_pair` below is a hand transcription of
-/// exactly this pattern; the source stays here so a reader can check the
+/// The number-extraction regex, also from the binary — `M7r` in 2.1.220, whose
+/// body is `e.match(/prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)/i)`
+/// followed by `actualTokens: t[1]`, `limitTokens: t[2]`. Those two lines are the
+/// evidence that `(tokens, limit)` is the right order and that the relay's
+/// input-over-limit guard matches the real client rather than an assumption.
+///
+/// **The `/i` flag is part of it**, so the client is case-insensitive here; a
+/// transcription without it would be stricter than reality and could fail on a
+/// casing difference the client would accept. No regex crate is in this tree
+/// (Global Constraint 3), so `token_pair` below is a hand transcription of exactly
+/// this pattern, flag included; the source stays here so a reader can check the
 /// transcription rather than take it on trust.
-const TOKEN_PAIR_REGEX: &str = r"prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)";
+const TOKEN_PAIR_REGEX: &str = r"prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)/i";
 
 /// `TOKEN_PAIR_REGEX` applied to `haystack`: the first match's two captures.
 ///
@@ -2294,9 +2302,14 @@ const TOKEN_PAIR_REGEX: &str = r"prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*
 /// cross a digit, so the digit run it stops at is forced, and shortening the
 /// greedy `(\d+)` can only leave a digit where `\s*tokens?` must match. `\s*` is
 /// `trim_start`, a superset of the regex's whitespace class.
+///
+/// `/i` is honoured by matching against a lowercased copy. Only numbers come back
+/// out, so nothing indexes into the original — which is what makes that safe, since
+/// `to_lowercase` can change a string's length.
 fn token_pair(haystack: &str) -> Option<(u64, u64)> {
     const PHRASE: &str = "prompt is too long";
-    let mut rest = haystack;
+    let lowered = haystack.to_lowercase();
+    let mut rest = lowered.as_str();
     loop {
         let at = rest.find(PHRASE)?;
         if let Some(pair) = token_pair_after_phrase(&rest[at + PHRASE.len()..]) {
@@ -2598,5 +2611,47 @@ async fn a_key_the_provider_quotes_back_never_reaches_the_client() {
         message.starts_with("Invalid API key provided:")
             && message.contains("api.together.ai/settings/api-keys"),
         "the provider's own sentence must survive around the redaction: {message}"
+    );
+}
+
+/// Blocker 5 of fix round 1: the flat top-level-`message` shape, which several
+/// OpenAI-compatible servers use. Reading only `error.message` lost the sentence
+/// entirely, and that was a *regression* — under the verbatim pass-through this
+/// replaced, the body reached the client's SDK, which prefers a top-level
+/// `message`, so the user saw the real reason. Here it also has to reach detection,
+/// because the sentence is a context-limit sentence.
+#[tokio::test]
+async fn a_flat_top_level_message_still_reaches_the_client_and_detection() {
+    const FLAT: &str = concat!(
+        r#"{"object":"error","message":"This model's maximum context length is 131072 tokens. "#,
+        r#"However, you requested 170071 tokens (39071 in the messages, 64000 in the completion)."#,
+        r#"","type":"BadRequestError","param":null,"code":400}"#
+    );
+    let relay = start_erroring(StatusCode::BAD_REQUEST, FLAT, None).await;
+    let (status, headers, body) = provider_error(relay).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(headers["x-relay-route"], "fallback");
+    let message = body["error"]["message"].as_str().expect("a message string");
+
+    assert!(
+        message.contains("This model's maximum context length is 131072 tokens"),
+        "the provider's own sentence must survive: {message:?}"
+    );
+    // Detection fires, so the client can act at all.
+    let lowered = message.to_lowercase();
+    assert!(
+        TOO_LONG_PHRASES
+            .iter()
+            .any(|phrase| lowered.contains(phrase)),
+        "no too-long predicate fires on {message:?}"
+    );
+    // But no pair: this wording puts the limit before the input, so the anchored
+    // parse refuses rather than reporting them backwards. The client compacts
+    // blind, which is the safe half of the recovery.
+    assert_eq!(
+        token_pair(message),
+        None,
+        "a limit-before-input wording must not yield a reversed pair: {message:?}"
     );
 }
