@@ -151,9 +151,19 @@ pub async fn forward(
     // fallback provider must not put the Anthropic route into `Limited`, and a
     // 200 from it must not recover the route out of it.
     if !status.is_success() {
-        // Spec §7d: the provider's own error is what surfaces. Translating an
-        // error envelope would mean inventing a mapping for shapes this
-        // project has never seen — the body passes through as it arrived.
+        // Spec §7d: the provider's own error is what surfaces, untranslated.
+        // The shape is captured now, not guessed: real Together AI error
+        // bodies (`tests/fixtures/together/{A,F,H,I,J}*`) are all
+        // OpenAI-style `{"error": {message, type, param, code}}` plus a
+        // harmless top-level `id`, pinned by
+        // `tests/translate_together_fixtures.rs`'s
+        // `every_real_error_capture_is_openai_shaped`. The decision to pass
+        // through rather than translate is unchanged and better supported
+        // than when it was a guess. Status codes are not uniform across
+        // those captures (400, 401, 404 — for an unknown model, unusually —
+        // and 422 were all observed): nothing here depends on that today
+        // since this branch only checks `!is_success()`, but a future change
+        // that assumes "provider errors are 400" would be wrong.
         return passthrough_response(status, upstream, log);
     }
 

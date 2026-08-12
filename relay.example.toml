@@ -80,6 +80,17 @@ format = "unix-seconds"
 # format = "anthropic"
 # serves = ["moonshotai/"]
 # model_map = { "*" = "moonshotai/Kimi-K3" }
+#
+# Two things learned against real Together AI traffic (docs/decisions.md,
+# Milestone 3 Task 5) before picking a model_map target:
+# - Forced tool choice (Anthropic tool_choice "any"/"tool") needs a model
+#   whose grammar backend can compile a real parameter schema.
+#   Qwen/Qwen2.5-7B-Instruct-Turbo 422s on that; meta-llama/Llama-3.3-70B-
+#   Instruct-Turbo handles it correctly. "auto"/"none" are unaffected either way.
+# - A model priced in /v1/models is not necessarily reachable.
+#   meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo and mistralai/Mistral-7B-
+#   Instruct-v0.3 both 400 as "non-serverless" — verify with a real request
+#   before committing a model_map entry to one.
 
 # Failover policy (spec §8). The whole section is optional and every key has a
 # default: what is written out below IS the built-in default, except

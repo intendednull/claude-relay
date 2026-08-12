@@ -167,6 +167,22 @@ when it does.
   can delay the next `failover_engaged`/`recovered`, which are never
   coalesced or dropped.
 
+## Choosing a fallback model
+
+Two things Milestone 3's real-traffic testing against Together AI surfaced
+(`docs/decisions.md`), worth knowing before picking `model_map` targets:
+
+- **Forced tool choice needs a model whose grammar backend can compile a
+  real schema.** `Qwen/Qwen2.5-7B-Instruct-Turbo` 422s on any forced
+  `tool_choice` with a non-empty parameter schema (Anthropic's `any`/`tool`
+  modes); `meta-llama/Llama-3.3-70B-Instruct-Turbo` handles the identical
+  request correctly. `auto`/`none` are unaffected either way.
+- **A model priced in `/v1/models` is not necessarily reachable.**
+  `meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo` and
+  `mistralai/Mistral-7B-Instruct-v0.3` both list a price but return `400
+  Unable to access non-serverless model …` — verify with a real request
+  before committing a `model_map` entry to one.
+
 ## Notifications
 
 Set `notify.command` to be told when the route state changes, or a profile is

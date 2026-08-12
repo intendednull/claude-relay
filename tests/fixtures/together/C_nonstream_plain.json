@@ -1,0 +1,26 @@
+{
+  "id": "ovq3wXL-6Ng1vN-a29afb1c2942ddb8",
+  "object": "chat.completion",
+  "created": 1786490531,
+  "model": "Qwen/Qwen2.5-7B-Instruct-Turbo",
+  "prompt": [],
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "seed": 2856421553934730000,
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "role": "assistant",
+        "content": "The capital of France is Paris.",
+        "tool_calls": []
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 41,
+    "completion_tokens": 8,
+    "total_tokens": 49,
+    "cached_tokens": 0
+  }
+}

@@ -1644,6 +1644,51 @@ mod tests {
         }
     }
 
+    /// Real Together AI traffic (`tests/fixtures/together/B_stream_two_tool_calls.raw.txt`,
+    /// captured 2026-08-11) does something no fixture above modelled:
+    /// `finish_reason` lands on call 0's argument chunk, reverts to `null` on
+    /// call 1's naming chunk, then reappears on call 1's argument chunk and
+    /// the final chunk. That real capture's two non-null observations happen
+    /// to be identical (`"tool_calls"` both times), so it cannot by itself
+    /// distinguish take-last from first-wins — this reproduces the same
+    /// null-in-the-middle shape with two *different* values, so a regression
+    /// is actually observable.
+    #[test]
+    fn finish_reason_flickering_to_null_and_back_settles_on_the_last_real_value() {
+        let events = synthesize(&[
+            &tool_chunk(json!({
+                "index": 0, "id": "call_1", "function": {"name": "get_weather", "arguments": ""},
+            })),
+            &frame(json!({
+                "id": "chatcmpl-1", "model": "target/Model",
+                "choices": [{"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "function": {"arguments": "{\"city\":\"Paris\"}"}},
+                ]}, "finish_reason": "length"}],
+            })),
+            &tool_chunk(json!({
+                "index": 1, "id": "call_2", "function": {"name": "get_weather", "arguments": ""},
+            })),
+            &frame(json!({
+                "id": "chatcmpl-1", "model": "target/Model",
+                "choices": [{"index": 0, "delta": {"tool_calls": [
+                    {"index": 1, "function": {"arguments": "{\"city\":\"Tokyo\"}"}},
+                ]}, "finish_reason": "tool_calls"}],
+            })),
+            &finish_chunk("tool_calls"),
+            "data: [DONE]\n\n",
+        ]);
+
+        let delta = events
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .expect("a message_delta is always emitted");
+        assert_eq!(
+            delta.1["delta"]["stop_reason"], "tool_use",
+            "the last finish_reason observed (tool_calls) must win over the \
+             earlier length, even with a null arriving in between"
+        );
+    }
+
     #[test]
     fn an_aborted_stream_emits_an_error_event_and_closes_the_open_block() {
         let mut translator = SseTranslator::new();

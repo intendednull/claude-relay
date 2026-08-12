@@ -877,3 +877,91 @@ plain `let` first, exactly like the real code) now reliably fails the test
 as required. Recorded because "the mutation passed, ship it" would have been
 the wrong conclusion, and the right one only came from checking *why* it
 passed rather than treating a red-then-green cycle as sufficient on its own.
+
+## 2026-08-11 — Task 5: real Together AI traffic lands as golden fixtures
+
+Milestone 3's plan deliberately left this outside the four SDD tasks — no
+Together credential existed. One now does, for verification only; Global
+Constraint 10 still binds the test suite exactly as before: no test reaches
+a real provider, ever. Every fixture below is a static file replayed against
+a mock upstream or fed straight into the translator's own pure functions.
+
+**12 requests were captured against `api.together.xyz/v1/chat/completions`,
+model `Qwen/Qwen2.5-7B-Instruct-Turbo`, and landed byte-for-byte at
+`tests/fixtures/together/`.** Verified free of credentials before
+committing — grepped for the real key, any `tgp_` prefix, any
+`authorization`/`bearer` string, on the committed copies, not just the
+source captures. They largely *vindicate* the translator's hand-built
+fixtures rather than finding bugs in it: `tests/translate_together_fixtures.rs`
+replays them and confirms one `tool_calls` entry per chunk, a stable
+`index`, set-once `id`/`name`, strictly sequential (never interleaved)
+parallel calls, exact non-streaming shapes for all three observed
+`finish_reason` values, and OpenAI-style error bodies. **Nothing in the
+translator changed** — everything real traffic touched was already correct.
+
+**One shape no hand-built fixture modelled: `finish_reason` flickers.** The
+two-tool-call capture (`B_stream_two_tool_calls.raw.txt`) shows it land on
+call 0's argument chunk, revert to `null` on call 1's naming chunk, then
+reappear on call 1's argument chunk and the final chunk.
+`src/translate/sse.rs`'s take-last handling (`self.finish_reason =
+Some(reason)` on every `Some`, never touched by a `None`) already gets this
+right. The real capture's two non-null observations happen to be identical
+(`"tool_calls"` both times), so it cannot by itself distinguish take-last
+from first-wins — `sse.rs`'s own test module now has a synthetic
+reproduction of the same null-in-the-middle shape with two *different*
+values, which does. Mutation-tested: swapping the line to
+`self.finish_reason.get_or_insert(reason)` (first-wins) turns the test's
+expected `tool_use` into `max_tokens` and fails it; reverting restores green.
+
+**Two gaps, stated plainly rather than left implied by the fixtures'
+presence.** Every capture's tool-call arguments arrived as a single fragment
+right after the naming chunk, so the multi-fragment reassembly path is still
+backed only by hand-built fixtures — probably correct, since both formats
+simply concatenate fragments, but unverified against real traffic. And every
+streamed chunk's `delta` carries `"role":"assistant"`, not only the first,
+contradicting how the hand-built fixtures model it — zero consequence, since
+`Delta` (`src/translate/openai.rs`) has no `role` field to read it into.
+
+**A genuine provider limitation, not a translator bug:
+`Qwen/Qwen2.5-7B-Instruct-Turbo`'s constrained-grammar backend fails on any
+forced tool choice with a non-empty parameter schema.** Together compiles a
+constrained grammar for any `tool_choice` that forces a call; this model's
+grammar backend cannot compile one against a real schema. Seven controlled
+probes:
+
+| probe | result |
+|---|---|
+| forced specific tool + minimal one-string-property schema | **422** `failed to compile grammar` |
+| forced specific tool + required/enum schema | **422** same |
+| forced specific tool + **empty** `properties` | **200 OK** |
+| `tool_choice: "required"` + minimal schema | **422** same |
+| `tool_choice: "auto"` + required/enum schema | **200 OK** |
+| `meta-llama/Llama-3.3-70B-Instruct-Turbo`, forced tool + minimal schema | **200 OK**, correct call |
+
+(The first row is `tests/fixtures/together/A_stream_single_tool_call.raw.txt`.)
+
+1. **Not a translator bug.** `src/translate/request.rs`'s `tool_choice`
+   mapping emits the canonical OpenAI forced-tool shape
+   (`{"type":"function","function":{"name":...}}`) — verified by reading it.
+2. **Not a Together-wide limitation.** Llama-3.3-70B handles the identical
+   request correctly.
+3. **Two of the four mapped `tool_choice` modes are unusable on this specific
+   model**: Anthropic `any` (→ `"required"`) and `tool` (→ a named function).
+   `auto` and `none` are unaffected.
+4. **The mitigation is operator model selection, not code.** Silently
+   downgrading a forced tool choice to `auto` on a 422 would convert "you
+   must call tool X" into "call whatever you like" — exactly the quiet
+   tool-use fidelity loss the plan's Global Constraint 9 says to flag loudly
+   rather than decide quietly. A clean 422 the operator can see and act on
+   (by choosing a different fallback model) is better than a proxy silently
+   deciding the forced choice didn't matter. No workaround added.
+   `README.md` and `relay.example.toml` now name which of the two probed
+   models is safe.
+
+**A second, unrelated catalogue trap, documented alongside it for the same
+reason (an operator picking a `model_map` target needs both):**
+`meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo` and
+`mistralai/Mistral-7B-Instruct-v0.3` both appear in Together's `/v1/models`
+with a price but return `400 Unable to access non-serverless model … create
+and start a new dedicated endpoint`. Listed with a price does not mean
+reachable.
