@@ -527,6 +527,11 @@ nothing to say, so a hook can run under `set -u`.
   false "your fallback is down" costs more than a missed notification on a shape
   nobody has seen. A *streaming* 2xx is committed at its head, so a stream that
   dies mid-body does not fire it either (`docs/spec.md` §4 has the reasoning).
+  **Like `profile_switched`, a rapid run of these coalesces to the most recent
+  one**, so a hook is not guaranteed to see every firing — two of them close
+  together may announce only the second, and only its cause. Same reason: it
+  bounds how much they can delay the next `failover_engaged`/`recovered`, which
+  are never coalesced or dropped.
 - It inherits the relay's environment, which a desktop notifier needs
   (`DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`), and writes to the relay's own
   stdout/stderr.

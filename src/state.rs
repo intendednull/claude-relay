@@ -53,12 +53,16 @@ const READ_TIMEOUT: Duration = Duration::from_secs(600);
 /// `pub` so the integration tests can express "exactly this many successes"
 /// against the constant rather than against a copy of its value.
 ///
-/// The trade taken at this value: a *low-traffic* profile re-arms slowly, and while
-/// it is un-re-armed a second outage notifies nothing. That costs only a missed
-/// **repeat** — the first notification already went out — which is the cheaper of
-/// the two errors. It is also why this is 5 and not 10: the higher the number, the
-/// longer the flag survives a quiet period (see `follow-ups.md` item 5, the flag
-/// outliving a period with no fallback traffic at all).
+/// The trade taken at this value, stated without the euphemism an earlier draft
+/// used. Against an *intermittently failing* route the cost is a missed **repeat**,
+/// and that is cheap — the first notification already went out. But while the flag
+/// is un-re-armed a **genuinely new** outage's first failure notifies nothing
+/// either, and that is not a repeat of anything. A low-traffic profile, or one whose
+/// fallback traffic stops entirely because Anthropic recovered, can sit un-re-armed
+/// indefinitely. That residual is why this is 5 and not 10 — the higher the number,
+/// the longer the flag survives a quiet period — and it is filed rather than closed
+/// (`follow-ups.md` item 5, with the `recovered`-transition re-arm that would close
+/// it).
 pub const RE_ARM_SUCCESSES: u64 = 5;
 
 /// Shared application state handed to axum handlers.
@@ -502,22 +506,24 @@ mod tests {
     #[test]
     fn one_delivered_response_does_not_re_arm_but_the_kth_does() {
         let state = relay();
-        assert!(state.fallback_failed());
 
-        for i in 1..RE_ARM_SUCCESSES {
-            state.fallback_delivered();
-            assert!(
-                !state.fallback_failed(),
-                "{i} of {RE_ARM_SUCCESSES} successes must not re-arm"
-            );
-            // That failure reset the streak, so start it over.
-            for _ in 0..i {
+        for short_streak in 1..RE_ARM_SUCCESSES {
+            // A fresh outage per iteration, so the streak below starts from zero
+            // rather than from whatever the previous iteration left behind.
+            state.rearm_fallback_error();
+            assert!(state.fallback_failed(), "a fresh outage to recover from");
+
+            for _ in 0..short_streak {
                 state.fallback_delivered();
             }
-            state.rearm_fallback_error();
-            assert!(state.fallback_failed(), "re-armed for the next round");
+            assert!(
+                !state.fallback_failed(),
+                "{short_streak} of {RE_ARM_SUCCESSES} successes must not re-arm"
+            );
         }
 
+        state.rearm_fallback_error();
+        assert!(state.fallback_failed());
         for _ in 0..RE_ARM_SUCCESSES {
             state.fallback_delivered();
         }
@@ -525,6 +531,22 @@ mod tests {
             state.fallback_failed(),
             "{RE_ARM_SUCCESSES} consecutive successes are a recovery, and the failure \
              after one is a new outage"
+        );
+    }
+
+    /// **A lock on the documented value, not on behaviour.** Every other test here is
+    /// written against `RE_ARM_SUCCESSES` rather than against a copy of its number,
+    /// which is deliberate — it keeps them honest across an intended change — and the
+    /// cost is that they are blind to an unintended one. An audit confirmed it: at
+    /// three, all 523 tests still passed, while four documents state five as the
+    /// contract.
+    #[test]
+    fn the_documented_re_arm_threshold_is_the_one_in_the_code() {
+        assert_eq!(
+            RE_ARM_SUCCESSES, 5,
+            "`docs/spec.md` §4, `README.md`, `relay.example.toml` and \
+             `docs/decisions.md` all quote five consecutive delivered responses to the \
+             operator; move them with this constant or not at all"
         );
     }
 
@@ -547,20 +569,14 @@ mod tests {
         }
     }
 
-    /// A request-attributable failure is neither: it does not notify, and it does
-    /// not touch the streak either way (`fallback::forward` never calls into here
-    /// for one). Stated as the absence of a fourth method.
-    #[test]
-    fn a_delivered_response_alone_never_notifies() {
-        let state = relay();
-        for _ in 0..RE_ARM_SUCCESSES * 3 {
-            state.fallback_delivered();
-        }
-        assert!(
-            state.fallback_failed(),
-            "a healthy route's first failure is an outage"
-        );
-    }
+    // `a_delivered_response_alone_never_notifies` was retired here, deliberately: it
+    // asserted the opposite of its name — that a failure after fifteen deliveries
+    // *does* notify — which `only_the_first_failure_of_an_outage_notifies` already
+    // covers from a healthy start. The property the name promised is not testable at
+    // this seam anyway: "a request-attributable failure does not notify" is the
+    // absence of a call site in `fallback::forward`, which only
+    // `a_request_attributable_failure_between_two_route_failures_does_not_re_arm`
+    // can see.
 
     /// F6: a switch points the route at different credentials, so the outage the
     /// operator was told about is not the one in front of them now. Without the

@@ -3525,10 +3525,33 @@ fn fallback_error_lines_now(log: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Waits for at least `count` of them, then reads again past a settle window: a
-/// waiter that returns the instant it has enough cannot catch a spurious extra
-/// line arriving just after, which is the failure every "exactly once" assertion
-/// here is about.
+/// Three times the notifier's 500ms `SWITCH_CHECK_INTERVAL`, matching the margin
+/// `tests/control.rs` already uses for the other slot event. A window shorter than
+/// one poll — the 300ms this started at — can end before the worker has looked at
+/// the slot even once, so a second event that *would* have produced a line has not
+/// had the chance to.
+const SETTLE: Duration = Duration::from_millis(1500);
+
+/// Waits for at least `count` of them, then reads again past `SETTLE`.
+///
+/// **What the settle window can and cannot buy, because getting this wrong emptied
+/// four tests in this file.** `fallback_error` travels on a *coalescing slot*, not
+/// the FIFO: two events sent before the worker drains the slot become **one** hook
+/// line, so for a wrongly-fired second event there is often no "extra line arriving
+/// just after" to wait for at all. Settling cannot reveal what coalescing has
+/// already destroyed, and no amount of it can — re-running the critical mutation at
+/// 5× this window stayed green.
+///
+/// So: **a count assertion over this helper discriminates only if the events are
+/// separated in time or distinguished by content.** Separated in time means a drain
+/// window between the requests that provoke them (`an_intermittent_failure_notifies_once_not_once_per_failure`)
+/// or a wait for the previous line before provoking the next
+/// (`k_consecutive_successes_re_arm_the_event_and_a_later_failure_fires_again`, and
+/// the preferred shape — it is deterministic rather than timed). Distinguished by
+/// content means asserting *which* cause fired, not just how many did
+/// (`a_request_attributable_failure_fires_nothing`). Settling is neither of those
+/// two instruments and cannot be made into one; it only bounds how long a line that
+/// *will* appear has to appear in.
 async fn fallback_error_lines(log: &Path, count: usize) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -3542,7 +3565,7 @@ async fn fallback_error_lines(log: &Path, count: usize) -> Vec<String> {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(SETTLE).await;
     fallback_error_lines_now(log)
 }
 
@@ -3580,6 +3603,25 @@ fn intermittent_script() -> &'static [(StatusCode, &'static str)] {
     SCRIPT.get_or_init(|| {
         let mut script = vec![OK; RE_ARM_SUCCESSES as usize];
         script.push(FAIL);
+        script
+    })
+}
+
+/// One route-attributable failure, then `RE_ARM_SUCCESSES` **consecutive**
+/// request-attributable ones. Cycling, so the request after them is a 401 again.
+///
+/// The 400s have to be consecutive and there have to be `k` of them, or the weaker
+/// of the two defects this shape exists to catch is unreachable: with `k` at five, a
+/// single 400 counted as a delivery cannot re-arm anything, and 400s interleaved
+/// with 401s never accumulate because each 401 resets the streak.
+fn one_failure_then_k_rejections() -> &'static [(StatusCode, &'static str)] {
+    const FAIL: (StatusCode, &str) = (StatusCode::UNAUTHORIZED, UNAUTHORIZED);
+    const REJECT: (StatusCode, &str) = (StatusCode::BAD_REQUEST, MISSING_MESSAGES);
+    static SCRIPT: std::sync::OnceLock<Vec<(StatusCode, &'static str)>> =
+        std::sync::OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        let mut script = vec![FAIL];
+        script.extend(std::iter::repeat_n(REJECT, RE_ARM_SUCCESSES as usize));
         script
     })
 }
@@ -3668,15 +3710,28 @@ async fn a_provider_401_fires_one_fallback_error_naming_the_profile_and_the_stat
 /// The reason the event is edge-triggered at all. A dead key fails every request,
 /// so a notification per failure is one hook run per request — unusable in itself,
 /// and it would delay a real route transition behind a queue of them.
+///
+/// The wait between the first failure and the rest is what makes this a detector
+/// rather than a test of the slot: a harness audit found this test passing with the
+/// edge-trigger deleted, because three requests against a local mock finish inside
+/// ~5ms and three events in one drain window collapse to one hook line. Draining
+/// the first before provoking the others gives the second and third somewhere
+/// visible to land.
 #[tokio::test]
 async fn a_second_and_third_failure_of_the_same_outage_fire_nothing() {
     const SCRIPT: &[(StatusCode, &str)] = &[(StatusCode::UNAUTHORIZED, UNAUTHORIZED)];
     let log = hook_log_path("fallback-error-streak");
     let relay = start_scripted(SCRIPT, &log).await;
 
-    for _ in 0..3 {
-        assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
-    }
+    assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        fallback_error_lines(&log, 1).await.len(),
+        1,
+        "the outage has to have been announced before the next failures are provoked"
+    );
+
+    assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
 
     let lines = fallback_error_lines(&log, 1).await;
     assert_eq!(
@@ -3789,22 +3844,45 @@ async fn an_intermittent_failure_notifies_once_not_once_per_failure() {
     let _ = std::fs::remove_file(&log);
 }
 
-/// **A request-attributable failure does not re-arm**, which is the other half of
-/// "only a 2xx does". Reaching the provider proves less than it looks like it
-/// does: the credentials are still dead, the operator's outage has not ended, and
-/// a second notification for it would be noise.
+/// **A request-attributable failure counts for nothing either way** (spec §4) —
+/// neither re-arming outright nor advancing the recovery streak. Reaching the
+/// provider proves less than it looks like it does: the credentials are still dead
+/// and the operator's outage has not ended.
+///
+/// **This test is the only guard on that rule anywhere in the suite, and for one
+/// round it guarded nothing.** A harness audit found the version before this one
+/// passing 523/523 with `Outcome::Rejected` re-arming outright — the exact defect
+/// round 1 was convened to remove — because the two 401s were 5ms apart and
+/// coalesced into a single hook line. No unit test can stand in: the property is the
+/// *absence of a call site* in `fallback::forward`, which nothing below the
+/// subprocess boundary can observe.
+///
+/// Two things make it a detector again, one for each of the two defects available
+/// here. The wait after the first failure separates the events in time, so a
+/// wrongly-fired second one becomes a second line — that catches a 400 re-arming
+/// outright. And the 400s are `RE_ARM_SUCCESSES` of them, **consecutive**, which
+/// catches the weaker defect of a 400 merely advancing the recovery streak: with `k`
+/// at five a single 400 cannot re-arm anything, and 400s interleaved with 401s never
+/// accumulate because each 401 resets the streak, so both the count and the adjacency
+/// are load-bearing. Round 1 raised `k` and nobody re-checked which tests that made
+/// unfalsifiable.
 #[tokio::test]
 async fn a_request_attributable_failure_between_two_route_failures_does_not_re_arm() {
-    const SCRIPT: &[(StatusCode, &str)] = &[
-        (StatusCode::UNAUTHORIZED, UNAUTHORIZED),
-        (StatusCode::BAD_REQUEST, MISSING_MESSAGES),
-        (StatusCode::UNAUTHORIZED, UNAUTHORIZED),
-    ];
     let log = hook_log_path("fallback-error-no-rearm");
-    let relay = start_scripted(SCRIPT, &log).await;
+    let relay = start_scripted(one_failure_then_k_rejections(), &log).await;
 
     assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
-    assert_eq!(one_request(relay).await, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        fallback_error_lines(&log, 1).await.len(),
+        1,
+        "the outage has to have been announced before the 400s are provoked"
+    );
+
+    for _ in 0..RE_ARM_SUCCESSES {
+        assert_eq!(one_request(relay).await, StatusCode::BAD_REQUEST);
+    }
+    // The script cycles, so this is a 401 again — and the outage it belongs to has
+    // already been announced.
     assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
 
     let lines = fallback_error_lines(&log, 1).await;
@@ -3870,17 +3948,24 @@ async fn a_request_attributable_failure_fires_nothing() {
 
 /// A 2xx the relay cannot use is the route failing to deliver, so it fires — and
 /// it must not re-arm on the way past, however much a 200 looks like proof that
-/// the path works. The provider answered; the client got nothing usable. Two
-/// requests, because a failure that re-armed itself would notify twice.
+/// the path works. The provider answered; the client got nothing usable.
+///
+/// The second request is the whole test, and it only means anything with the first
+/// event drained: an audit found the two-requests-back-to-back version passing with
+/// the edge-trigger deleted, because both events landed in one drain window.
 #[tokio::test]
 async fn a_two_hundred_the_relay_cannot_translate_fires_and_does_not_re_arm() {
     const SCRIPT: &[(StatusCode, &str)] = &[(StatusCode::OK, ANTHROPIC_SHAPED_BODY)];
     let log = hook_log_path("fallback-error-untranslatable-response");
     let relay = start_scripted(SCRIPT, &log).await;
 
-    for _ in 0..2 {
-        assert_eq!(one_request(relay).await, StatusCode::BAD_GATEWAY);
-    }
+    assert_eq!(one_request(relay).await, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        fallback_error_lines(&log, 1).await.len(),
+        1,
+        "the first unusable 200 has to have been announced before the second is sent"
+    );
+    assert_eq!(one_request(relay).await, StatusCode::BAD_GATEWAY);
 
     let lines = fallback_error_lines(&log, 1).await;
     assert_eq!(lines.len(), 1, "{lines:?}");
@@ -3935,12 +4020,20 @@ async fn a_provider_nothing_is_listening_on_fires_upstream_unreachable() {
 /// have to be genuinely concurrent rather than probably concurrent.
 fn barrier_unauthorized_upstream(concurrent: usize) -> Router {
     let barrier = Arc::new(tokio::sync::Barrier::new(concurrent));
+    let arrived = Arc::new(AtomicUsize::new(0));
     Router::new().route(
         "/v1/chat/completions",
         any(move || {
             let barrier = barrier.clone();
+            let arrived = arrived.clone();
             async move {
-                barrier.wait().await;
+                // Only the first `concurrent` requests are held. A `Barrier`
+                // rearms after each generation, so anything later would wait for
+                // `concurrent` companions that are never coming — and the test
+                // needs one further request *after* the burst has been announced.
+                if arrived.fetch_add(1, Ordering::SeqCst) < concurrent {
+                    barrier.wait().await;
+                }
                 json(StatusCode::UNAUTHORIZED, UNAUTHORIZED)
             }
         }),
@@ -3961,9 +4054,17 @@ fn barrier_unauthorized_upstream(concurrent: usize) -> Router {
 /// alone: an honest weak test beats a flaky strong one. The argument for the CAS
 /// lives next to the CAS, in `AppState::fallback_failed`.
 ///
-/// What it does prove is still worth having, and it is not covered serially: eight
-/// simultaneous in-flight failures produce one notification, over real HTTP,
-/// through the coalescing slot and the hook.
+/// **And what the concurrent burst alone cannot prove either**, which a harness
+/// audit established after the rewrite above: the coalescing slot collapses eight
+/// simultaneous events into one hook line *by construction*, so "eight, then one
+/// line" held even with the edge-trigger deleted. Events that arrive together can be
+/// separated neither in time nor by content — they are identical — so the burst is
+/// an exercise, not a detector.
+///
+/// The trailing failure is the detector. It is sent after the burst's notification
+/// has drained, so if the edge-trigger were gone it would produce a second line. The
+/// burst still earns its place: it is what sets the flag under real concurrency, over
+/// real HTTP, with eight requests genuinely in flight together.
 #[tokio::test]
 async fn eight_concurrent_failures_notify_once() {
     const CONCURRENT: usize = 8;
@@ -3980,22 +4081,40 @@ async fn eight_concurrent_failures_notify_once() {
             StatusCode::UNAUTHORIZED
         );
     }
+    assert_eq!(
+        fallback_error_lines(&log, 1).await.len(),
+        1,
+        "{CONCURRENT} concurrent failures notified more than once: \
+         {:?}",
+        fallback_error_lines_now(&log)
+    );
+
+    // One more, alone, with the burst's line already out.
+    assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
 
     let lines = fallback_error_lines(&log, 1).await;
     assert_eq!(
         lines.len(),
         1,
-        "{CONCURRENT} concurrent failures notified more than once: {lines:?}"
+        "a ninth failure of the same outage notified again: {lines:?}"
     );
 
     let _ = std::fs::remove_file(&log);
 }
 
-/// The flood tests' hook, here: each run sleeps before appending its event name,
-/// so a queue of runs is measurable as wall-clock delay on whatever is behind it.
+/// `logging_hook`, plus the flood tests' sleep: a queue of runs is then measurable
+/// as wall-clock delay on whatever is behind it.
+///
+/// Deliberately the *same* three-field line as `logging_hook`, not just the event
+/// name. It emitted only `$RELAY_EVENT` for one round, which meant
+/// `fallback_error_lines_now`'s `"fallback_error|"` filter could never match a line
+/// this hook wrote — so the one test using it counted zero `fallback_error`
+/// notifications no matter what the relay did. An audit measured that zero and read
+/// it as a timing artifact; it was a format mismatch, and the new lower-bound
+/// assertion is what surfaced it.
 fn slow_logging_hook(log: &Path, delay: Duration) -> String {
     format!(
-        r#"sleep {}; printf '%s\n' "$RELAY_EVENT" >> {}"#,
+        r#"sleep {}; printf '%s|%s|%s\n' "$RELAY_EVENT" "$RELAY_RESET_AT" "$RELAY_DETAIL" >> {}"#,
         delay.as_secs_f64(),
         log.display()
     )
@@ -4012,9 +4131,18 @@ fn slow_logging_hook(log: &Path, delay: Duration) -> String {
 ///
 /// The traffic is the worst case the *k*-consecutive-successes rule permits —
 /// `RE_ARM_SUCCESSES` deliveries then a failure, repeated — so this bounds what is
-/// left after 1b rather than what 1b already removed. Each cycle re-arms and
-/// re-fires, so `CYCLES` route-attributable failures are provoked, and every one of
-/// them would have been its own hook run on the FIFO.
+/// left after 1b rather than what 1b already removed. Every cycle re-arms and
+/// re-fires, and on the FIFO every one of those would have been its own hook run.
+///
+/// **The traffic keeps running while the transition is queued**, which is the
+/// live-flood test's shape and not the weaker one. An audit measured the first
+/// version of this test: 120 sequential requests finished in ~150ms against the
+/// notifier's 500ms poll, so the worker had not looked at the slot even once before
+/// the transition was sent — "queued while the backlog is outstanding" was true of
+/// the pre-fix FIFO and not of the fixed code. Now a background task feeds requests
+/// throughout, and the transition is sent after the worker has been in steady state
+/// for longer than one poll interval, exactly as
+/// `a_live_flood_of_switches_does_not_delay_a_transition_queued_mid_flood` does.
 ///
 /// `hook_delay * 6`, deliberately the same bound and the same reasoning as the two
 /// flood tests: at most one slot event can already be mid-run when the transition
@@ -4022,7 +4150,6 @@ fn slow_logging_hook(log: &Path, delay: Duration) -> String {
 /// margin a reviewer measured too tight under contention there.
 #[tokio::test]
 async fn an_intermittent_failure_backlog_does_not_delay_a_real_transition() {
-    const CYCLES: usize = 20;
     let hook_delay = Duration::from_millis(150);
     let log = hook_log_path("fallback-error-backlog");
     let relay = start_notified_with(
@@ -4034,18 +4161,26 @@ async fn an_intermittent_failure_backlog_does_not_delay_a_real_transition() {
     // Name-routed (§7d) while the route is still ACTIVE, so this traffic is not
     // failover and nothing about it touches Anthropic's state — the transition
     // below is then the only one in the whole test.
-    let mut failures = 0;
-    for _ in 0..CYCLES * (RE_ARM_SUCCESSES as usize + 1) {
-        if one_request(relay).await == StatusCode::UNAUTHORIZED {
-            failures += 1;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failures = Arc::new(AtomicUsize::new(0));
+    let traffic = tokio::spawn({
+        let stop = stop.clone();
+        let failures = failures.clone();
+        async move {
+            while !stop.load(Ordering::Relaxed) {
+                if one_request(relay).await == StatusCode::UNAUTHORIZED {
+                    failures.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
-    }
-    assert_eq!(
-        failures, CYCLES,
-        "the backlog this test bounds was never built"
-    );
+    });
 
-    // A real transition, queued while the backlog is outstanding.
+    // Long enough that the worker has drained the slot at least once and settled
+    // into steady state before the transition is queued — the same reasoning, and
+    // the same multiple of the poll interval, as the live-flood test's pre-roll.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let announced_before = fallback_error_lines_now(&log).len();
+
     let started = Instant::now();
     let limit = client()
         .get(format!("http://{relay}/v1/limit"))
@@ -4059,7 +4194,10 @@ async fn an_intermittent_failure_backlog_does_not_delay_a_real_transition() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let logged = std::fs::read_to_string(&log).unwrap_or_default();
-        if logged.lines().any(|line| line == "failover_engaged") {
+        if logged
+            .lines()
+            .any(|line| line.starts_with("failover_engaged|"))
+        {
             break;
         }
         assert!(
@@ -4070,19 +4208,29 @@ async fn an_intermittent_failure_backlog_does_not_delay_a_real_transition() {
     }
     let elapsed = started.elapsed();
 
+    stop.store(true, Ordering::Relaxed);
+    let _ = traffic.await;
+    let failures = failures.load(Ordering::Relaxed);
+
     assert!(
         elapsed < hook_delay * 6,
         "{failures} fallback_error events must not delay failover_engaged by more than a \
          couple of hook executions; took {elapsed:?}"
     );
 
-    // And the slot did its other job: the operator got far fewer notifications
-    // than there were failures. Not a tight bound — the point is the order of
-    // magnitude, since a queue would have delivered one per failure.
-    let announced = fallback_error_lines_now(&log).len();
+    // The positive control, and the reason it has a *lower* bound. The first
+    // version asserted only `announced < failures` and measured 0 < 20 in six of
+    // six runs — so it passed with `fallback_error` dropped on the floor entirely,
+    // and proved nothing about coalescing either. `failures` counts HTTP 401s, not
+    // notifications, so without a lower bound nothing here says the backlog being
+    // bounded exists as events at all.
     assert!(
-        announced < failures,
-        "{announced} notifications for {failures} failures is not coalescing"
+        announced_before >= 1,
+        "no fallback_error was ever announced, so this test bounded nothing"
+    );
+    assert!(
+        announced_before < failures,
+        "{announced_before} notifications for {failures} failures is not coalescing"
     );
 
     let _ = std::fs::remove_file(&log);

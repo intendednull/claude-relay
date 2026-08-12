@@ -160,9 +160,16 @@ fn env_vars(event: &NotifyEvent) -> [(&'static str, String); 3] {
 /// requests, `fallback_error` because a route failing intermittently re-arms and
 /// re-fires (measured: `docs/decisions.md`'s fix-round-1 entry) — so each gets a
 /// single coalescing slot instead: any number in a row collapse to "the most
-/// recent one", which bounds how much they can delay a queued transition to at
-/// most one hook's `timeout_secs` each, not N hooks run in series
-/// (`docs/decisions.md`'s R3 entry has the original measurements).
+/// recent one".
+///
+/// **The bound that buys is one hook run in total, not one per slot.** The loop head
+/// is always `recv_timeout`, which returns an already-queued transition immediately,
+/// so the worker cannot take two slot events without re-reading the FIFO between
+/// them: the worst case for a queued transition is one slot hook already mid-run. An
+/// earlier version of this comment said "one hook's `timeout_secs` each", which reads
+/// as two with two slots; a reviewer measured 157ms against the flood tests' 900ms
+/// bound with both slots hot. (`docs/decisions.md`'s R3 entry has the original
+/// measurements.)
 ///
 /// `Clone`: `AppState` hands one end to `RouteUpdates` and keeps another for
 /// `/control/profile` to fire `profile_switched` directly — both point at the
@@ -959,8 +966,10 @@ mod tests {
             let _ = flood.join();
         }
 
-        assert!(seen.lines().any(|line| line == "profile_switched"));
-        assert!(seen.lines().any(|line| line == "fallback_error"));
+        // Nothing asserted past here, deliberately: the loop above breaks only when
+        // both events are present, so restating that would read as protection it is
+        // not.
+        drop(seen);
         let _ = fs::remove_file(&log);
     }
 
