@@ -1210,3 +1210,78 @@ One cost, accepted and documented: a request that fails over this way emits two
 §9 log lines (the Anthropic attempt, then the fallback). The alternative —
 suppressing the attempt's line — would hide an upstream request that really
 happened from the audit trail.
+
+## 2026-08-12 — Task 8: the fallback's reasoning stops being thrown away
+
+Together AI returns the model's reasoning alongside its answer and the relay
+discarded it: neither `ResponseMessage` nor `Delta` had a field for it, so the
+operator paid for the reasoning tokens and saw none of them. Measured, not
+inferred — `moonshotai/Kimi-K3` reports `completion_tokens_details.reasoning_tokens`
+per turn, and its `message` keys are `['content', 'reasoning_content', 'role']`.
+Both directions of the response path now translate it into an Anthropic
+`thinking` block: non-streaming ahead of the `text` block, streaming as a
+`content_block_start` / `thinking_delta` / `content_block_stop` run with
+contiguous indices ahead of the text block's.
+
+**Two field names, not one.** The task brief named `reasoning_content`; that is
+the *outlier*. Measured across Together AI the same day, `reasoning` is what
+`moonshotai/Kimi-K2.7-Code`, `Kimi-K2.6`, `deepseek-ai/DeepSeek-V4-Flash-0731`,
+`DeepSeek-V4-Pro`, `zai-org/GLM-5.2`, `MiniMaxAI/MiniMax-M3` and
+`openai/gpt-oss-120b` send, while only `Kimi-K3` sends `reasoning_content`. Both
+are read, in both directions, through one `translate::openai::reasoning_text`.
+Two struct fields rather than one with `#[serde(alias)]`: serde's derive rejects
+a payload carrying both keys as a duplicate field, and failing a whole response
+over a redundancy is worse than picking one — whichever is non-empty wins. Every
+reasoning test runs against both spellings and there is a real capture per
+spelling per direction (`tests/fixtures/together/L_`–`O_`), because a golden file
+for only one name is exactly how "works on one model, silently drops the rest"
+ships with a green suite. `token_id`, which rides along on the
+`reasoning`-spelling providers' streamed deltas, needs no handling: none of the
+wire types in `translate::openai` are `deny_unknown_fields`.
+
+**The signature hazard, and the verdict.** Anthropic's own `thinking` blocks
+carry a cryptographic signature the relay cannot produce. The relay emits **no
+`signature` field at all** rather than inventing one: the Anthropic SDK reference
+is explicit that a *tampered* signature is rejected, and omission is
+weakly-to-strictly better than fabrication in every branch — if unsigned blocks
+are tolerated it survives where garbage fails, and either way nothing forges a
+cryptographic attestation.
+
+What omission does **not** buy is a safe round trip. Observed in the live drill:
+Claude Code normalizes the surfaced block into its own transcript as
+`{"type": "thinking", "thinking": "…", "signature": ""}` — it supplies the empty
+signature itself. So the block that would go back up carries an empty signature
+no matter what the relay omits. On the fallback path that is still harmless
+(translating history to OpenAI drops `thinking` blocks), but the Anthropic route
+forwards the client's body verbatim by Milestone 1's design, so a session that
+failed over and later recovers hands Anthropic that block. **Whether Anthropic
+rejects it is unverified** — establishing it would mean spending the user's OAuth
+token, which the task forbade — so it is a known unknown, and
+`policy.surface_fallback_reasoning` (bool, default `true`) is the mitigation:
+`false` restores the drop exactly.
+
+**Runner-up rejected: a `text` block.** It never risks a recovered session, and
+was turned down anyway because it is not a free safety win but a different
+regression. `Kimi-K3`'s and `Kimi-K2.7-Code`'s reasoning is long, exploratory and
+first-person (504 characters for "how many sheep remain" in the drill); folding
+it into `text` makes every fallback answer read as paragraphs of rambling ahead
+of the answer, with no way for a client to collapse it. That is visible damage on
+**every** fallback turn, traded against an unverified 400 on the narrow subset of
+sessions that fail over, recover, and still carry the turn — and that failure is
+recoverable by clearing the session, not data loss. The default is the new
+behavior; the flag exists because "nothing unsigned leaves this relay" is a
+legitimate preference.
+
+**Follow-up, logged not done.** The representation is not what closes the hazard;
+the round trip is. Marking relay-synthesized thinking blocks and stripping them
+on the way back out on the Anthropic route would end it outright — and that route
+is a verbatim forward by design, so touching it is a Milestone 1 design change,
+out of scope here.
+
+**Interleaving is handled without trusting the observed order.** Reasoning
+arrived strictly before content in every capture (9 fragments then 5 on
+`Kimi-K3`, 37 then 7 on `Kimi-K2.7-Code`), and nothing depends on that: a
+`content` fragment during an open thinking block closes it, and reasoning
+arriving *after* content opens a second thinking block rather than being dropped
+— a late fragment is still the user's content, which is the whole point of the
+task. A chunk carrying both fields emits the thinking first.

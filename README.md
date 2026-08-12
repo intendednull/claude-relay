@@ -169,6 +169,24 @@ denylist (spec §7b, and the invariant is a test). Anthropic's prompt-caching
 `cache_control` directives are stripped on the way out, since a fallback
 provider either rejects them or ignores them.
 
+**A reasoning model's reasoning is surfaced, not discarded.** A fallback provider
+that reasons returns that reasoning alongside its answer, and you are billed for
+those tokens whether or not you ever see them. It comes back as an Anthropic
+`thinking` block ahead of the answer, so Claude Code renders it as extended
+thinking. Providers disagree about the field's name — `reasoning` on most,
+`reasoning_content` on `moonshotai/Kimi-K3` — and both are read.
+
+One caveat worth knowing before you leave it on. Anthropic signs its own thinking
+blocks; the relay cannot, so the block it emits is unsigned, and Claude Code
+stores it in the transcript with an empty signature. That is harmless while you
+are on the fallback (history translated back to the OpenAI format drops thinking
+blocks) but the Anthropic route forwards your request body verbatim, so a session
+that failed over and later recovers hands Anthropic a block with an empty
+signature. Whether Anthropic rejects that is untested. Set `[policy]
+surface_fallback_reasoning = false` to go back to discarding the reasoning
+entirely if a recovered session starts erroring, or if you would rather not find
+out.
+
 ### Confirming it works, without waiting for a limit
 
 Name-based routing needs no limit state, so it is the cheap end-to-end check

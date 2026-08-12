@@ -245,6 +245,23 @@ pub struct PolicyConfig {
     /// window doesn't race the upstream reset boundary (spec §4).
     #[serde(default = "default_reset_jitter_secs")]
     pub reset_jitter_secs: [u64; 2],
+    /// Whether a fallback provider's reasoning (`translate::openai::
+    /// reasoning_text`) is surfaced to the client as an Anthropic `thinking`
+    /// block. Defaults to on: the operator is billed for those tokens either
+    /// way, and dropping them is the older behavior, not the safer one.
+    ///
+    /// The reason it is a switch at all: Anthropic's own `thinking` blocks carry
+    /// a signature the relay cannot produce, so a synthesized block is unsigned
+    /// — and Claude Code was observed normalizing it into its transcript with
+    /// `"signature": ""`, so omitting the field does not keep the unsigned block
+    /// out of the history that goes back up. On the fallback path that
+    /// round-trips harmlessly — translating history to OpenAI drops `thinking`
+    /// blocks — but the Anthropic route forwards the client's body verbatim, so
+    /// a session that failed over and later recovers hands Anthropic a block
+    /// with an empty signature. `false` restores the drop, for an operator who
+    /// would rather not find out.
+    #[serde(default = "default_surface_fallback_reasoning")]
+    pub surface_fallback_reasoning: bool,
 }
 
 fn default_mode() -> String {
@@ -271,6 +288,10 @@ fn default_reset_jitter_secs() -> [u64; 2] {
     [15, 60]
 }
 
+fn default_surface_fallback_reasoning() -> bool {
+    true
+}
+
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
@@ -280,6 +301,7 @@ impl Default for PolicyConfig {
             min_reset_horizon_secs: default_min_reset_horizon_secs(),
             max_reset_horizon_secs: default_max_reset_horizon_secs(),
             reset_jitter_secs: default_reset_jitter_secs(),
+            surface_fallback_reasoning: default_surface_fallback_reasoning(),
         }
     }
 }
@@ -1164,7 +1186,26 @@ mod tests {
         assert_eq!(policy.min_reset_horizon_secs, 300);
         assert_eq!(policy.max_reset_horizon_secs, 7 * 24 * 60 * 60);
         assert_eq!(policy.reset_jitter_secs, [15, 60]);
+        assert!(
+            policy.surface_fallback_reasoning,
+            "the operator is billed for the reasoning tokens either way; showing them is the default"
+        );
         assert!(policy.validate(&IndexMap::new()).is_ok());
+    }
+
+    #[test]
+    fn surface_fallback_reasoning_can_be_turned_off_from_the_file() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [policy]
+            surface_fallback_reasoning = false
+        "#;
+        let config = Config::from_toml_str(raw).expect("should parse");
+        assert!(!config.policy.surface_fallback_reasoning);
     }
 
     #[test]

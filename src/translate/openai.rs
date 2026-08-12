@@ -137,8 +137,42 @@ pub struct Choice {
 pub struct ResponseMessage {
     #[serde(default)]
     pub content: Option<TextContent>,
+    /// See [`reasoning_text`]. `reasoning` is the common spelling.
+    #[serde(default)]
+    pub reasoning: Option<TextContent>,
+    #[serde(default)]
+    pub reasoning_content: Option<TextContent>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub tool_calls: Vec<ResponseToolCall>,
+}
+
+/// The model's reasoning, under whichever of the two keys the provider used.
+///
+/// Not in OpenAI's schema at all, and providers did not converge on one name:
+/// measured across Together AI on 2026-08-12, `reasoning` is what
+/// `moonshotai/Kimi-K2.7-Code`, `Kimi-K2.6`, `deepseek-ai/DeepSeek-V4-*`,
+/// `zai-org/GLM-5.2`, `MiniMaxAI/MiniMax-M3` and `openai/gpt-oss-120b` send,
+/// while `moonshotai/Kimi-K3` sends `reasoning_content`. Both appear in the same
+/// two places — the non-streaming `message` and a streaming `delta` — so both
+/// spellings are read in both directions.
+///
+/// Two fields rather than one with `#[serde(alias)]`: serde's derive rejects a
+/// payload carrying *both* keys as a duplicate field, and failing a whole
+/// response over a redundancy is worse than picking one. Whichever is non-empty
+/// wins; an empty string and an absent key are the same answer, `None`, because
+/// an empty thinking block is not a thing to emit.
+///
+/// Read as [`TextContent`] for the same reason `content` is: a provider that
+/// sends one as a parts array sends the other that way too.
+pub fn reasoning_text(
+    reasoning: Option<TextContent>,
+    reasoning_content: Option<TextContent>,
+) -> Option<String> {
+    [reasoning, reasoning_content]
+        .into_iter()
+        .flatten()
+        .map(TextContent::into_text)
+        .find(|text| !text.is_empty())
 }
 
 /// Assistant text as either the plain string OpenAI documents or the parts
@@ -212,10 +246,23 @@ pub struct ChunkChoice {
     pub finish_reason: Option<String>,
 }
 
+/// A streamed `delta` also carries a `token_id` on the providers that spell the
+/// reasoning key `reasoning`. Nothing here reads it, and nothing has to: none of
+/// this module's types are `deny_unknown_fields`, so an unmodelled key is
+/// ignored rather than rejected (deliberately — see `super::anthropic`'s module
+/// doc for the same policy on the Anthropic side).
 #[derive(Debug, Default, Deserialize)]
 pub struct Delta {
     #[serde(default)]
     pub content: Option<TextContent>,
+    /// See [`reasoning_text`]. Streamed in fragments exactly as `content` is,
+    /// and — on every provider observed — entirely *before* the first `content`
+    /// fragment. The translator does not rely on that ordering; see
+    /// `SseTranslator::open_thinking`.
+    #[serde(default)]
+    pub reasoning: Option<TextContent>,
+    #[serde(default)]
+    pub reasoning_content: Option<TextContent>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub tool_calls: Vec<ToolCallDelta>,
 }

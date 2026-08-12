@@ -233,7 +233,25 @@ OpenAI-format only, implement a translator module:
 | image block (base64) | `image_url` with data URI |
 | `stop_reason: end_turn / tool_use / max_tokens` | `finish_reason: stop / tool_calls / length` |
 | `thinking` blocks in history | drop (see risks) |
-| SSE `message_start / content_block_start / content_block_delta (text_delta, input_json_delta) / content_block_stop / message_delta / message_stop` | synthesized from `chat.completion.chunk` deltas; `input_json_delta` accumulates from streamed `tool_calls[].function.arguments` fragments |
+| `thinking` block in a *response* | `message.reasoning` / `message.reasoning_content` (see below) |
+| SSE `message_start / content_block_start / content_block_delta (text_delta, input_json_delta, thinking_delta) / content_block_stop / message_delta / message_stop` | synthesized from `chat.completion.chunk` deltas; `input_json_delta` accumulates from streamed `tool_calls[].function.arguments` fragments, `thinking_delta` from `delta.reasoning` / `delta.reasoning_content` |
+
+**Reasoning, in the response direction** (`policy.surface_fallback_reasoning`, default
+`true`). A reasoning model returns its reasoning alongside its answer, under a field name
+OpenAI never specified and providers did not converge on: `reasoning` on most of Together
+AI's reasoning models, `reasoning_content` on `moonshotai/Kimi-K3`. Both are read, and
+whichever is non-empty becomes a `thinking` block ahead of the turn's `text` block — the
+order the model produced them. An absent or empty field produces no block at all.
+
+The block carries **no `signature`**. Anthropic signs its own thinking blocks and the
+relay cannot, so there is no value to put there that would not be a forgery. That makes
+the round trip the open question rather than the response: Claude Code normalizes the
+block into its transcript with `"signature": ""`, translating history back to OpenAI
+drops `thinking` blocks (so the fallback path is unaffected), but §7's Anthropic route is
+a verbatim forward — a session that failed over and later recovers hands Anthropic a
+block with an empty signature. Whether Anthropic rejects that is **unverified**; the
+config key is the mitigation, and `false` restores the older behavior, where the
+reasoning was discarded and the operator paid for tokens they never saw.
 
 The SSE synthesis is the hairiest code in the project. Golden-file tests against
 recorded real traffic in both directions are mandatory before trusting it. If Phase 2
@@ -299,6 +317,7 @@ model_map = { "*" = "moonshotai/Kimi-K3" }
 mode = "new-sessions"                  # new-sessions | all | notify-only
 active_profile = "deepseek"            # startup default; runtime switches via /control
 failover_on_detect = true              # §6: the request that trips the limit fails over too
+surface_fallback_reasoning = true      # §7c: a provider's reasoning becomes a thinking block
 min_reset_horizon_secs = 300           # below this, a 429 is a burst, not the limit
 reset_jitter_secs = [15, 60]
 

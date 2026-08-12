@@ -134,6 +134,34 @@ max_reset_horizon_secs = 604800   # 7 days: Claude limits include weekly windows
 # LIMITED, `[min, max]` inclusive, so the first probe after the window doesn't
 # race the upstream reset boundary.
 reset_jitter_secs = [15, 60]
+# Whether a fallback provider's reasoning — the `reasoning`/`reasoning_content`
+# field a reasoning model returns alongside its answer — is surfaced to the
+# client as an Anthropic `thinking` block, so Claude Code renders it as extended
+# thinking. Default on: those tokens are billed to you whether or not you ever
+# see them, and dropping them is the older behavior, not the safer one.
+#
+# Why it is a switch at all. Anthropic's own `thinking` blocks carry a
+# cryptographic signature, and the relay cannot produce one — the reasoning came
+# from the fallback provider, not from Anthropic — so the block the relay emits
+# has no `signature` field. Fabricating one is documented to be rejected as
+# tampering, so it does not; what an *unsigned* block does is unverified, which
+# makes this a known unknown rather than a known-safe.
+#
+# Where it could bite is the round trip, not the response. Claude Code was
+# observed normalizing the surfaced block into its transcript with
+# `"signature": ""` — so omitting the field on the way out does not keep an
+# unsigned signature out of the history that goes back up. On the fallback path
+# that is still harmless (translating history to the OpenAI format drops
+# `thinking` blocks entirely), but the Anthropic route forwards the client's body
+# verbatim by design: a session that failed over and later recovers hands
+# Anthropic a `thinking` block with an empty signature. If Anthropic rejects
+# that, the session errors until it is cleared.
+#
+# `false` restores the old behavior exactly: the reasoning is discarded, no
+# `thinking` block is ever synthesized, and nothing unsigned can reach Anthropic.
+# Set it if you would rather not find out, or if a session that spans a limit
+# window and recovers starts failing.
+surface_fallback_reasoning = true
 
 # Optional. A command run when the route state changes, so a limit doesn't have
 # to be noticed by polling /status. Omit the section, or leave `command` out, to
