@@ -163,6 +163,37 @@ failover_on_detect = false` to restore the older behavior, where only requests
 *after* the transition fail over. Such a request logs two lines: the Anthropic
 attempt, then the fallback that answered it.
 
+**A prompt that does not fit is retried one model up** (spec §7e). Claude Code sizes
+its context window from the `claude-*` name it picked, not from the model your
+`model_map` sent it to, so it will happily overshoot a smaller one — and once the
+transcript alone is over the window, neither `/compact` nor a smaller `max_tokens`
+can rescue the session. So a fallback request the provider rejects as too long is
+re-sent to the next larger slot in your map: `claude-haiku`'s target, then
+`claude-sonnet`'s, then `claude-opus`'s, per `[policy] escalation_order`.
+
+Three things about it are worth knowing before you leave it on, because **each hop is
+a second upstream request you pay for**, at the larger model's price:
+
+- It climbs **at most once, and only upward** — never past the top of the ladder,
+  never back to a model this request already failed on (two slots pointing at the same
+  model is one hop, not two), and never on any error but a context limit. On the last
+  rung you get the same translated error you would have got without the feature.
+- It applies only to a **failed-over `claude-*` request**, which is the only kind with
+  a slot to climb from. A model you picked by name is never swapped for another, and
+  neither is a target that came from the `"*"` catch-all — `"*"` is where unmapped
+  names land, not a size tier, and it is often your *largest* model, so treating it as
+  the bottom rung would hop the wrong way.
+- Every hop logs at INFO with the model that could not fit and the model being tried,
+  so a surprise bill is explainable: `grep 'retrying one rung up'`. Each attempt also
+  gets its own request line, and `/status`'s `fallback_requests_served` counts both.
+
+A slot you leave out of `escalation_order` has no position on the ladder and never
+escalates — `claude-fable` is out of the default, because where it sits between sonnet
+and opus is not documented and a wrong guess is a hop that also cannot fit. Add it if
+your map points it somewhere smaller than the top. Set `[policy]
+escalate_on_context_limit = false` to turn the whole thing off and get the error
+straight through.
+
 Nothing the client sent reaches a profile: the outgoing request's headers are
 *built*, not filtered, so no client credential can leak by being missing from a
 denylist (spec §7b, and the invariant is a test). Anthropic's prompt-caching

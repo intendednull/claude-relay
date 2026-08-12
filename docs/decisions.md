@@ -1383,3 +1383,85 @@ Two follow-ups logged, not done:
 - **`error.code` is not consulted.** OpenAI-compatible providers commonly return
   `code: "context_length_exceeded"`, which would be a cheap second signal. No
   capture in this tree carries it, so it stays a guess unmade.
+
+## 2026-08-12 — Task 9A: the ladder is the `model_map`'s own slots
+
+Task 9B gave the client wording its own recovery keys on. This is the case that
+recovery cannot reach: the transcript *by itself* does not fit the model the alias
+mapped to, so shrinking `max_tokens` changes nothing and compaction needs a request
+that also would not fit. Anthropic documents `Error during compaction: Conversation
+too long` as a terminal state whose only recovery is `/clear` — a lost session. So a
+fallback request that overflows is retried one rung up the model ladder before the
+error is emitted at all (spec §7e).
+
+**The ladder is the profile's own `model_map` slots, in an order `[policy]` names.**
+The mapping decisions already encode which target is bigger — an operator who points
+`claude-haiku` at a 131k model and `claude-opus` at a 1M one has *stated* the size
+ordering — so escalation reuses that instead of introducing a second, separately
+maintained notion of "bigger" (a per-target window table, which would then have to be
+kept true against provider catalogs nobody here controls).
+
+**Rejected: `model_map`'s own declaration order.** It is already load-bearing for
+something else — §7a settles equal-length prefix ties by file order — so reusing it
+would mean that swapping two lines which tie on nothing silently reorders the ladder.
+`policy.escalation_order` is explicit, defaults to Anthropic's alias hierarchy
+(`claude-haiku` → `claude-sonnet` → `claude-opus`), and skips slots a profile does not
+define.
+
+**Rejected as *the* answer: 9B's error translation alone, letting the client
+compact.** It handles the common shape more cheaply than a second upstream request —
+Claude Code reserves `max_tokens: 64000`, so on a 131k model most of a typical
+overflow is the output reservation rather than the transcript, and shrinking it needs
+no extra call at all. It stays the first line of defence, and the two are
+complementary. What it cannot do is the case above, where nothing the client shrinks
+or summarises will fit.
+
+**`"*"` is not a rung, and the reason is stronger than "don't guess at operator
+intent".** `"*"` is consulted only because no prefix matched, so its target is chosen
+to be a safe answer for *anything* rather than a position in a size ordering — and on
+the live map it is Kimi-K3, the largest model configured. Reading it as the bottom rung
+would therefore send an overflowing request *down* to a 131k window: a guaranteed
+second failure, paid for. Same rule for a target that came from no entry at all, and
+for a slot `escalation_order` does not name.
+
+**`claude-fable` is deliberately absent from the default order.** Where it sits in
+Anthropic's size hierarchy is not documented, and a wrong guess is a hop to a model
+that also cannot fit the prompt. With the live map (`claude-fable` = Kimi-K3, the top)
+the omission costs nothing; an operator who maps it lower has to name it in
+`escalation_order` themselves, which `relay.example.toml` says.
+
+**The bound is the feature, not boilerplate, because this is the one task that spends
+money.** Every hop is a whole extra upstream request at the larger model's price. Two
+things make it structural rather than remembered:
+
+- The ladder is a **cursor consumed as it walks** (`fallback::Ladder`), so "at most
+  once, upward" is a property of the type — there is no position a bug could reset and
+  no way to walk down.
+- A rung whose target this request has already been sent to is **skipped**. The live
+  map points *both* `claude-fable` and `claude-opus` at Kimi-K3, so without that a walk
+  re-sends an identical request to an identical model and buys a guaranteed identical
+  failure at the top rung's price.
+
+**Never mid-response, and that is structural too.** The decision is made on the
+non-2xx branch, where a provider's status has arrived and no byte of a response exists;
+every path that writes to the client is downstream of it and returns. A context limit
+that arrives *inside* a 200 stream is therefore not escalatable — it terminates the
+stream as §6 already requires. Proving that with a mutation took three separate edits
+(route a 2xx stream into the error path, widen 9B's 400/413 gate to 200, and remove
+9B's authored-message-only rule), which is a fair account of how many independent
+guards stand in the way.
+
+**Where the retry goes was the load-bearing implementation choice.**
+`provider_error_response` did four things in one function — read capped, redact the
+profile key once on the bytes both sinks share, log them, build the envelope — and the
+decision has to happen after the parse and before the envelope. It split into
+`read_provider_error` (once per upstream attempt) and
+`ProviderFailure::into_response`, so an escalating request logs each failure exactly
+once, on that attempt's own bytes, and the redaction cannot be entered twice for the
+same body or skipped for the second one.
+
+**Two operational choices worth recording.** Each attempt gets its own §9 log line,
+which spec §9 already required ("one line per *upstream* request, strictly") and the
+detect-time re-route already did; and `fallback_requests_served` counts attempts, not
+client requests, since an escalated request really did cost two calls and that counter
+is where an operator investigating a bill looks.
