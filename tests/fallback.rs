@@ -2655,3 +2655,36 @@ async fn a_flat_top_level_message_still_reaches_the_client_and_detection() {
         "a limit-before-input wording must not yield a reversed pair: {message:?}"
     );
 }
+
+/// The error path buffers the provider's body, so the cap on it is a choice worth
+/// pinning rather than inheriting. It is `ERROR_BODY_CAP` (1 MiB) — the bound this
+/// repo already argued for exactly this hazard on the Anthropic route — not
+/// `RESPONSE_CAP` (4 MiB), which is about a non-streaming 2xx that has to be whole
+/// before it can be translated.
+#[tokio::test]
+async fn an_error_body_between_the_two_caps_is_refused_but_keeps_the_status() {
+    // Between 1 MiB and 4 MiB: read under the error cap, accepted under the
+    // response cap. A `Box::leak` because the mock's body has to be `'static`.
+    let oversized: &'static str = Box::leak(
+        format!(
+            r#"{{"error":{{"message":"{}","type":"invalid_request_error"}}}}"#,
+            "z".repeat(2 * 1024 * 1024)
+        )
+        .into_boxed_str(),
+    );
+    assert!(
+        oversized.len() > 1024 * 1024 && oversized.len() < 4 * 1024 * 1024,
+        "the body has to sit between the two caps for this test to distinguish them"
+    );
+
+    let relay = start_erroring(StatusCode::BAD_REQUEST, oversized, None).await;
+    let (status, headers, body) = provider_error(relay).await;
+
+    // Refused, but the provider's status is still the honest answer.
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(headers["x-relay-route"], "fallback");
+    assert_eq!(
+        body["error"]["message"], "the fallback provider returned an error with no message",
+        "a body past the cap is not read at all"
+    );
+}
