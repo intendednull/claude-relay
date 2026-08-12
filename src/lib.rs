@@ -44,6 +44,12 @@ fn app_routes() -> Router<AppState> {
 /// earlier version of this comment that claimed otherwise (`docs/decisions.md`).
 /// Add new routes to `app_routes` instead, which is inside the gated region
 /// by construction; there is nothing to remember there.
+///
+/// That advice is for code inside this crate only: `control` is `pub(crate)`
+/// and `app_routes` is private, so an external consumer of this crate as a
+/// library cannot see either one. Such a consumer must not append a
+/// `/control/*` route to this function's return value at all — there is no
+/// way from outside the crate to re-apply the gate to it.
 pub fn build_router(state: AppState) -> Router {
     control::install_gate(app_routes(), &state.config).with_state(state)
 }

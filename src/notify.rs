@@ -592,9 +592,12 @@ mod tests {
 
         // A bound of a small constant number of hook executions, not 200:
         // at most one switch could already be mid-run when the transition
-        // was sent, plus the transition's own run.
+        // was sent, plus the transition's own run. `* 6`, not `* 4`, for the
+        // same reason as the live-flood test below, which shares this exact
+        // bound shape and is where a reviewer actually measured the margin
+        // being too tight under contention.
         assert!(
-            elapsed < hook_delay * 4,
+            elapsed < hook_delay * 6,
             "200 queued profile_switched events must not delay failover_engaged \
              by more than a couple of hook executions; took {elapsed:?}"
         );
@@ -691,8 +694,15 @@ mod tests {
             let _ = flood.join();
         }
 
+        // `* 6`, not `* 4`: a reviewer measured 0/20 false reds at `* 4`
+        // under extreme contention (50 runnable threads competing for one
+        // core, elapsed 648-764ms against a 600ms bound) — clean at 0, 3, 8,
+        // 16 and 32 threads and during a full 16-way release build. The
+        // transition arrived every time in every run; only the margin was
+        // too tight, never the property itself, so this widens the margin
+        // rather than weakening what's being asserted.
         assert!(
-            elapsed < hook_delay * 4,
+            elapsed < hook_delay * 6,
             "a transition queued while a switch flood is still running must not \
              wait behind more than a couple of hook executions; took {elapsed:?}"
         );

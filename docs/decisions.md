@@ -768,22 +768,112 @@ always goes on the `mpsc` channel (unbounded, FIFO, never dropped — there is
 no plausible flood of these, since they only fire on Anthropic's own
 responses), and `ProfileSwitched` always overwrites a single `Mutex<Option<
 NotifyEvent>>` slot instead. The worker thread blocks on the channel with a
-short (`50ms`) timeout; a transition arriving wakes it immediately regardless
-of that value (`recv_timeout` does not wait out the timeout once something is
-sent), and only on an *idle* tick does it check the slot. Any number of
-switches in a row collapse to "the most recent one," so the worst case a
-flood can add ahead of a queued transition is one already-in-flight switch
-hook's run time (bounded by `timeout_secs`, ≤60s) — not N hooks run in
-series. This is the "priority (transitions ahead of switches)" shape the fix
-round's own text offered as an acceptable alternative to bounding the queue,
-chosen over a bounded/dropping channel because `std::sync::mpsc` has no
-built-in way to reorder or peek a FIFO queue, so two channels (or a channel
-plus a slot) was the option available without a new dependency — explicitly
-out of scope for this fix.
+timeout (originally 50ms; raised to 500ms in fix round 3's Y10, see that
+entry below — a transition arriving wakes it immediately regardless of that
+value either way, since `recv_timeout` does not wait out the timeout once
+something is sent), and only on an *idle* tick does it check the slot. Any
+number of switches in a row collapse to "the most recent one," so the worst
+case a flood can add ahead of a queued transition is one already-in-flight
+switch hook's run time (bounded by `timeout_secs`, ≤60s) — not N hooks run
+in series. This is the "priority (transitions ahead of switches)" shape the
+fix round's own text offered as an acceptable alternative to bounding the
+queue, chosen over a bounded/dropping channel because `std::sync::mpsc` has
+no built-in way to reorder or peek a FIFO queue, so two channels (or a
+channel plus a slot) was the option available without a new dependency —
+explicitly out of scope for this fix.
 
-**Both an isolated unit test (`notify.rs`, 200 queued switches, no HTTP
-involved) and the reviewer's exact alternating-`POST` shape at the HTTP
-surface (`tests/control.rs`, 60 alternating switches driving a real
-`failover_engaged` through limit detection) demonstrate the bound, with real
-elapsed time asserted in each** — not just the no-op case R3's own text
-warned was insufficient this round.
+**Correction, fix round 3: the two tests below demonstrate coalescing, not
+the priority bound, and that distinction is the whole reason fix round 3's
+Y3 item exists.** The paragraph originally here claimed the isolated
+200-switch unit test (`notify.rs`) and the 60-alternating-`POST` HTTP test
+(`tests/control.rs`) "demonstrate the bound, with real elapsed time asserted
+in each." They don't: both stop the flood *before* queuing the transition,
+so all they can show is that a stopped flood's last switch gets coalesced
+away — true, but not R3's actual property ("a flood *still running* cannot
+delay or drop a transition"). A reviewer inverted the worker's drain order
+and both tests stayed green. The test that actually pins the bound is
+`notify.rs`'s `a_live_flood_of_switches_does_not_delay_a_transition_queued_
+mid_flood`, added in fix round 3 specifically because these two didn't —
+see that entry for what it took to get *that* test to fail under inversion
+too, which was not the first attempt.
+
+## 2026-08-11 — Task 4 fix round 3: the false gate comment, a poll instead of
+a token, and a shutdown drain
+
+**`src/lib.rs`'s claim that a route "added here later" inherits the gate
+automatically was false, and a reviewer demonstrated it.** A route appended
+to `build_router`'s *result* — after `install_gate` had already run — never
+passed through it: reached with any `Host`, on any bind. Fixed two ways:
+the comment now states the real constraint (`install_gate` must be the last
+operation before `.with_state`), and the route chain moved into a separate
+`app_routes() -> Router<AppState>` so `build_router` is two lines with
+nothing to append to by accident:
+
+```rust
+pub fn build_router(state: AppState) -> Router {
+    control::install_gate(app_routes(), &state.config).with_state(state)
+}
+```
+
+Adding a route now means editing `app_routes`, which is inside the gated
+region by construction — one call site to get right (`build_router` itself)
+instead of every future control-route addition anywhere in the crate.
+
+**The sharp edge this doesn't close, left as a documented gap rather than a
+fix:** `control` is `pub(crate)` and `app_routes` is private, so an
+out-of-crate consumer of this crate as a library who appends a `/control/*`
+route to `build_router`'s returned `Router` can neither re-apply the gate
+nor follow the "edit `app_routes`" advice — both are invisible from outside
+the crate. Closing it needs `build_router` to return a type that refuses
+further `.route()` calls, which means changing `main.rs` and every
+integration test's `serve()` helper that takes a plain `axum::Router`. Left
+alone: the only realistic way this matters is a genuinely external library
+consumer, which spec's own non-goal (a single-purpose, single-user tool, not
+a general gateway) argues doesn't exist today. `build_router`'s doc comment
+says plainly that external consumers must not append `/control/*` routes at
+all, so the constraint is at least stated where it's needed even though it
+can't be enforced there.
+
+**Y10: the notifier's idle-poll interval moved from 50ms to 500ms, not to a
+wake-token scheme.** A relay with `notify.command` set was waking its
+notifier thread 20 times a second for the life of the process even with
+nothing to announce, to check a slot that was empty every time. A wake-token
+design (a second value on the existing `mpsc` channel, pushed only on the
+slot's empty-to-occupied transition, so `recv` never needs a timeout at all)
+was fully worked out and would have preserved the priority bound — a
+transition still gets ordinary FIFO order ahead of any already-queued token,
+and a flood of switches still collapses to at most one token in flight the
+same way it collapses to one slot occupant today. Not built anyway: it is a
+materially bigger surface (a second channel item type, a write-then-maybe-
+send that has to stay correct under concurrent writers) for a problem the
+simple fix already satisfies — 500ms is still well inside "no real latency
+requirement" for a profile-switch notification, and cuts the wakeup rate
+10x. Risk-avoidance, not a correctness objection to the token idea.
+
+**Y6: a `profile_switched` still sitting in the coalescing slot when the
+last `Notifier` clone drops is now drained and delivered, not lost.** The
+FIFO side already got this for free — `mpsc` drains buffered messages before
+reporting `Disconnected` — so a transition sent just before shutdown was
+never lost; a pending switch, living outside the channel in its own
+`Mutex<Option<NotifyEvent>>` slot, didn't have the same guarantee until this
+round added one more check on the `Disconnected` exit path. Chosen over
+documenting the gap because it cost one match arm and closes a genuine,
+if narrow (both live for the process's lifetime in the shipped binary),
+regression from the pre-coalescing behavior.
+
+**Y3's test needed two tries, and the failure of the first try is worth
+recording.** The first version of the live-flood test used the "obvious"
+inverted-drain-order mutation to prove itself against — `if let Some(event)
+= lock().take() { run(event); continue; }` — and passed under it, which is
+the opposite of what the test was supposed to show. Root cause was two
+independent bugs in the *test*, not the shipped code: a startup race (the
+worker's first slot-check can beat the flood's first write, then commits to
+one `recv_timeout` wait the test's original delay didn't clear), and the
+mutation itself accidentally holding the lock across the hook run via
+`if let`'s temporary lifetime extension (Y5's bug, not Y3's), which blocked
+every flood thread and let the worker win an unrelated re-lock race once
+released. Both fixed; the corrected mutation (binding the lock's result to a
+plain `let` first, exactly like the real code) now reliably fails the test
+as required. Recorded because "the mutation passed, ship it" would have been
+the wrong conclusion, and the right one only came from checking *why* it
+passed rather than treating a red-then-green cycle as sufficient on its own.
