@@ -177,7 +177,9 @@ a second upstream request you pay for**, at the larger model's price:
 - It climbs **at most once, and only upward** — never past the top of the ladder,
   never back to a model this request already failed on (two slots pointing at the same
   model is one hop, not two), and never on any error but a context limit. On the last
-  rung you get the same translated error you would have got without the feature.
+  rung you get the same translated error you would have got without the feature — and
+  so you do if a hop cannot be sent at all, rather than a bare relay 502. Turning this
+  on cannot leave you with a worse answer than leaving it off.
 - It applies only to a **failed-over `claude-*` request**, which is the only kind with
   a slot to climb from. A model you picked by name is never swapped for another, and
   neither is a target that came from the `"*"` catch-all — `"*"` is where unmapped

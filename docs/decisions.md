@@ -1465,3 +1465,15 @@ which spec §9 already required ("one line per *upstream* request, strictly") an
 detect-time re-route already did; and `fallback_requests_served` counts attempts, not
 client requests, since an escalated request really did cost two calls and that counter
 is where an operator investigating a bill looks.
+
+**One thing escalation could have made worse, and does not.** A retry introduces a
+failure mode the request did not have: the hop's connection can fail. Answering that
+with the relay's own `upstream_unreachable` would hand the client a
+relay-internal shape in place of an actionable Anthropic error it had already earned —
+worse than not escalating at all, and only because the relay tried to help. So the rung
+below's failure is carried while a hop is in flight and answered with when the hop
+produces no response at all. A hop that *does* respond is reported as itself, including
+a 500 from the larger model: the freshest truth wins where there is one, it is already
+Anthropic-shaped and status-preserving, and reporting a stale error over a fresh one
+would mislead in the other direction. The invariant worth stating is that turning the
+feature on cannot leave the client with a worse answer than leaving it off.

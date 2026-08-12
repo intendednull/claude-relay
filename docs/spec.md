@@ -386,6 +386,12 @@ unchanged) is **retried against the next larger model before anything reaches th
   target this request has already been sent to is skipped, which matters because two slots
   may point at one model. On the last rung the client gets §7d's translated error,
   unchanged — escalation failing is not a reason to lose the recovery it already had.
+- **Turning it on cannot make a response worse than leaving it off.** A hop that
+  produces no response at all (its connection fails) is answered with the error the rung
+  below produced, not with the relay's own `upstream_unreachable`: the client would
+  otherwise trade an actionable Anthropic error for a relay-internal code, purely because
+  the relay tried to help. A hop that *does* respond is reported as itself — the freshest
+  truth wins where there is one, and it is already Anthropic-shaped and status-preserving.
 - **Never mid-response.** The decision is made where a provider's status has arrived and
   no byte of a response exists, so a context limit that arrives *inside* a 200 stream is
   never escalated — it terminates the stream as §6 already requires.
