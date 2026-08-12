@@ -197,10 +197,15 @@ pub async fn forward(
             // same rule `a_fallback_stream_that_dies_mid_response_is_never_retried`
             // already holds for a mid-stream death.
             //
-            // Only that detection fired matters, never `ContextLimit::counts`: a
-            // prompt that did not fit needs a bigger model whether or not the
-            // provider's wording let the pair be parsed.
-            if failure.error.context_limit.is_some()
+            // Detection firing is deliberately *not* the condition —
+            // `input_over_limit` is, and the difference is a bill. A body that says
+            // the *output reservation* did not fit (measured: a 35k transcript with
+            // a 160k `max_tokens`) matches the same markers, and the client already
+            // fixes that one for free by shrinking `max_tokens` on 9B's translated
+            // error. Escalating it pre-empts the free fix and buys a billed
+            // inference on a larger model. So: spend money only on positive
+            // evidence that the input itself is over the limit.
+            if failure.error.input_over_limit()
                 && let Some(next) = ladder.next_target()
             {
                 match prepare(&body, &next, translated) {
@@ -239,6 +244,29 @@ pub async fn forward(
                         );
                     }
                 }
+            }
+
+            // A hop's own answer replaces the rung below's only if it is at least as
+            // *final*. Measured: with the rung above answering 429, the client is
+            // handed a 429 in place of a terminal 400 it would have acted on once —
+            // so it retries with backoff, and every retry re-walks the whole ladder.
+            // Nothing here can bound that, because the loop is the client's, not the
+            // relay's: one hop turned a one-shot failure into unbounded request
+            // amplification and still lost the session.
+            //
+            // The rung below's answer is a context-limit 400 the client acts on and
+            // does not retry blindly, so it is strictly the better one to hand over.
+            // A hop that answers with a *terminal* status keeps its own answer even
+            // when that is less useful (a 404 for a retired `model_map` target, say):
+            // it is the truth about the model the ladder chose, it cannot amplify,
+            // and masking it would hide a misconfigured rung.
+            if client_retries(status)
+                && let Some(previous) = carried
+            {
+                // The hop happened and was paid for, so it keeps its own §9 line;
+                // the carried answer's line went out when its hop was decided.
+                log.emit(failure.upstream_bytes);
+                return previous.into_response(None);
             }
             return failure.into_response(Some(log));
         }
@@ -300,6 +328,18 @@ pub async fn forward(
 struct Prepared {
     body: Vec<u8>,
     stream: bool,
+}
+
+/// Whether a client will answer this status by retrying rather than by acting on
+/// it — Anthropic's own SDKs retry 408, 409, 429 and every 5xx, and Claude Code
+/// rides on one.
+///
+/// It is the line between "the hop reported something the client can use" and "the
+/// hop turned a terminal failure into a loop": each of those client retries is a
+/// fresh request that walks the ladder again, so a retryable hop answer multiplies
+/// upstream requests without bound (spec §7e).
+fn client_retries(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 409 | 429) || status.is_server_error()
 }
 
 /// The outgoing body for one target model: a whole wire-format translation for an

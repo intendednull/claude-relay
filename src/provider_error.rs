@@ -20,6 +20,10 @@ pub(crate) struct ContextLimit {
     /// `(prompt tokens, context limit)` when the provider's message named a
     /// usable pair. `None` rather than a guess: a wrong pair would make the
     /// client size its retry wrongly, which is worse than making it retry blind.
+    ///
+    /// It has a second consumer with a second cost: §7e escalation spends money
+    /// on it, so `None` also means "do not pay for a bigger model" — see
+    /// `ProviderError::input_over_limit`.
     pub(crate) counts: Option<(u64, u64)>,
 }
 
@@ -99,6 +103,48 @@ impl ProviderError {
             // the log, the client's user has only this.
             message: authored.map(clipped_message).or_else(|| snippet(body)),
         }
+    }
+
+    /// Whether the provider gave positive evidence that the **input itself**
+    /// exceeded the limit — the only condition §7e will spend money on.
+    ///
+    /// Detection firing is not that evidence, and the difference is a bill.
+    /// Measured, a vLLM-shaped body reads `This model's maximum context length is
+    /// 131072 tokens. However, you requested 195000 tokens (35000 in the messages,
+    /// 160000 in the completion).` The marker matches, but the transcript is 35k
+    /// and fits comfortably; only the 160k **output reservation** does not. The
+    /// cheap path already fixes that one for free — 9B's translated error makes
+    /// Claude Code shrink `max_tokens` with no extra upstream request — so
+    /// escalating pre-empts the free fix and buys a real billed inference on a
+    /// larger model, which then *succeeds* and reserves 160k output tokens at that
+    /// model's price.
+    ///
+    /// A parsed pair is the discriminator because `token_counts` only yields one
+    /// when a count of tokens sits *before* the matched wording and exceeds the
+    /// number after it — which is what an input-overflow sentence looks like and
+    /// what the reservation sentence above is not.
+    ///
+    /// Two costs taken knowingly, both the safe direction of the same asymmetry
+    /// that decided this module (a false negative costs what already happened
+    /// before any of this existed; a false positive costs money):
+    ///
+    /// - A genuine input overflow whose wording puts the limit first
+    ///   (`…maximum context length is 131072 tokens. However, your messages
+    ///   resulted in 170071 tokens.`) yields no pair, so it no longer escalates.
+    /// - So does a genuine overflow written with thousands separators, which the
+    ///   parser refuses whole (follow-up 20's cost is therefore no longer "a lost
+    ///   pair, not a lost session").
+    ///
+    /// And one residual, recorded rather than closed: a *reservation* wording that
+    /// happens to put a total count before the marker (`You requested 195000
+    /// tokens, which exceeds the maximum context length of 131072`) does yield a
+    /// pair, and would escalate. No captured body is shaped that way; narrowing it
+    /// further needs a second matcher for reservation wording, which is a guess at
+    /// wording nobody here has observed.
+    pub(crate) fn input_over_limit(&self) -> bool {
+        self.context_limit
+            .as_ref()
+            .is_some_and(|limit| limit.counts.is_some())
     }
 
     /// The Anthropic error envelope, ready to send. The status is the caller's
@@ -594,6 +640,77 @@ mod tests {
         assert!(error.context_limit.is_none());
         // Still surfaced, so the user is told the real reason.
         assert!(error.client_message().contains("Request too large"));
+    }
+
+    /// What §7e is allowed to spend money on, wording by wording. Detection firing
+    /// is *not* enough: the reservation case (row 2, measured by the reviewer
+    /// against a vLLM-shaped body) has a 35k transcript that fits the small model
+    /// comfortably, and escalating it buys a billed inference the client would have
+    /// fixed for free by shrinking `max_tokens`.
+    ///
+    /// The two `false` rows with `input=false` and a genuine overflow behind them
+    /// are the knowing cost, and the last row is the residual: a reservation wording
+    /// that puts a total before the marker still looks like input-over-limit. Both
+    /// are argued at `ProviderError::input_over_limit`.
+    #[test]
+    fn only_positive_evidence_of_an_input_overflow_may_spend_money() {
+        for (label, message, detected, input) in [
+            (
+                "Together's measured input overflow — the live provider's wording",
+                "The input (170071 tokens) is longer than the model's context length (131072 tokens).",
+                true,
+                true,
+            ),
+            (
+                "a vLLM-shaped output *reservation*, not an input overflow",
+                "This model's maximum context length is 131072 tokens. However, you requested 195000 tokens (35000 in the messages, 160000 in the completion).",
+                true,
+                false,
+            ),
+            (
+                "a genuine input overflow worded limit-first — no pair, so no hop",
+                "This model's maximum context length is 131072 tokens. However, your messages resulted in 170071 tokens.",
+                true,
+                false,
+            ),
+            (
+                "a genuine input overflow with thousands separators — refused whole",
+                "The input (170,071 tokens) is longer than the model's context length (131,072 tokens).",
+                true,
+                false,
+            ),
+            (
+                "the residual: a reservation total sitting before the marker",
+                "You requested 195000 tokens, which exceeds the maximum context length of 131072",
+                true,
+                true,
+            ),
+        ] {
+            let body =
+                format!(r#"{{"error":{{"message":"{message}","type":"invalid_request_error"}}}}"#);
+            let error = read(400, &body);
+            assert_eq!(
+                error.context_limit.is_some(),
+                detected,
+                "{label}: detection"
+            );
+            assert_eq!(
+                error.input_over_limit(),
+                input,
+                "{label}: whether §7e may spend money"
+            );
+            // Detected but unpaired still reaches the client with the phrase, so the
+            // cheap recovery is never what escalation's caution costs.
+            if detected {
+                assert!(
+                    error
+                        .client_message()
+                        .to_lowercase()
+                        .contains("prompt is too long"),
+                    "{label}: the client keeps its own recovery"
+                );
+            }
+        }
     }
 
     /// The unrecognised-shape path with a **measured** body rather than a plausible

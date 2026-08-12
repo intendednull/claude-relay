@@ -2793,11 +2793,26 @@ async fn start_laddered(
     error: &'static str,
     tune: impl FnOnce(&mut Config),
 ) -> Relay {
+    start_laddered_with(
+        model_map,
+        |recorder| laddered_upstream(recorder, overflows, error),
+        tune,
+    )
+    .await
+}
+
+/// Same, for a fallback mock whose answers are not "overflow or succeed" — the
+/// cases where the *rung above* fails in its own way.
+async fn start_laddered_with(
+    model_map: &[(&str, &str)],
+    fallback_router: impl FnOnce(Recorder) -> Router,
+    tune: impl FnOnce(&mut Config),
+) -> Relay {
     set_profile_keys();
     let anthropic = Recorder::default();
     let fallback = Recorder::default();
     let anthropic_addr = serve(anthropic_upstream(anthropic.clone(), false)).await;
-    let fallback_addr = serve(laddered_upstream(fallback.clone(), overflows, error)).await;
+    let fallback_addr = serve(fallback_router(fallback.clone())).await;
     let mut config = config(
         anthropic_addr,
         "all",
@@ -2811,6 +2826,32 @@ async fn start_laddered(
         anthropic,
         fallback,
     }
+}
+
+/// The bottom rung overflows; every rung above it answers `above` with
+/// `above_body`, so a test can ask what one hop's own failure does to the answer
+/// the client ends up with.
+fn overflow_then_upstream(
+    recorder: Recorder,
+    overflows: &'static [&'static str],
+    above: StatusCode,
+    above_body: &'static str,
+) -> Router {
+    Router::new().route(
+        "/v1/chat/completions",
+        any(move |request: Request| {
+            let recorder = recorder.clone();
+            async move {
+                let body = record(&recorder, request).await;
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                if overflows.contains(&model.as_str()) {
+                    json(StatusCode::BAD_REQUEST, TOGETHER_CONTEXT_LIMIT)
+                } else {
+                    json(above, above_body)
+                }
+            }
+        }),
+    )
 }
 
 fn order(slots: &[&str]) -> Vec<String> {
@@ -2862,15 +2903,36 @@ async fn a_context_limit_climbs_one_rung_and_succeeds_there() {
     assert_eq!(status(relay.addr).await["fallback_requests_served"], 2);
 }
 
-/// Detection is all escalation needs. The pair is 9B's business — a prompt that
-/// did not fit needs a bigger model whether or not the wording let it be sized.
+/// **The knowing cost of fix round 1's blocker 1, as behaviour.** This body is a
+/// genuine input overflow with no numbers in it at all, so nothing distinguishes it
+/// from a `max_tokens` reservation overflow — and a reservation overflow that
+/// escalates buys a billed inference the client would have fixed for free. So it
+/// does not climb.
+///
+/// **This test asserted the opposite one round ago, and the rule changed under it,
+/// not the other way around.** The addendum I built from said escalation should care
+/// only that detection fired; the reviewer measured what that costs and the lead
+/// retracted it. Recording the inversion rather than quietly deleting the test,
+/// because the case is still worth pinning: the client keeps 9B's recovery, so what
+/// the caution costs is a compaction rather than a hop — not the session.
 #[tokio::test]
-async fn a_context_limit_with_no_readable_pair_still_climbs() {
+async fn a_context_limit_with_no_readable_pair_does_not_climb() {
     let relay = start_laddered(&LIVE_LADDER, &[SMALL], CONTEXT_LIMIT_NO_PAIR, |_| {}).await;
 
     let (code, body) = ask(&relay, HAIKU).await;
-    assert_eq!(code, StatusCode::OK, "{body}");
-    assert_eq!(models_seen(&relay.fallback), [SMALL, MEDIUM]);
+    assert_eq!(
+        models_seen(&relay.fallback),
+        [SMALL],
+        "an unpairable overflow is indistinguishable from a reservation overflow"
+    );
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    let message = body["error"]["message"].as_str().expect("a message string");
+    assert!(
+        TOO_LONG_PHRASES
+            .iter()
+            .any(|phrase| message.to_lowercase().contains(phrase)),
+        "the client keeps the recovery escalation declined to pay for: {message:?}"
+    );
 }
 
 /// The walk starts above the rung the request landed on, not at the bottom of the
@@ -2886,6 +2948,137 @@ async fn the_walk_starts_above_the_rung_the_request_landed_on() {
         models_seen(&relay.fallback),
         [MEDIUM, LARGE],
         "the smaller model below this request's own rung must never be tried"
+    );
+}
+
+/// **A `max_tokens` reservation overflow must not walk the ladder** (fix round 1,
+/// blocker 1). Measured against a vLLM-shaped body: the transcript is 35k and fits
+/// the 131k model comfortably — only the 160k *output reservation* does not. The
+/// client fixes that for free by shrinking `max_tokens` on the translated error, so
+/// escalating pre-empts the free fix and buys a billed inference on a larger model,
+/// which then succeeds and reserves 160k output tokens at that model's price.
+///
+/// Detection still fires, and the client still gets its own recovery — the caution
+/// costs nothing the client was relying on.
+#[tokio::test]
+async fn a_max_tokens_reservation_overflow_never_walks_the_ladder() {
+    const RESERVATION: &str = concat!(
+        r#"{"object":"error","message":"This model's maximum context length is 131072 tokens. "#,
+        r#"However, you requested 195000 tokens (35000 in the messages, 160000 in the "#,
+        r#"completion).","type":"BadRequestError","param":null,"code":400}"#
+    );
+    let relay = start_laddered(&LIVE_LADDER, &[SMALL], RESERVATION, |_| {}).await;
+
+    let (code, body) = ask(&relay, HAIKU).await;
+    assert_eq!(
+        models_seen(&relay.fallback),
+        [SMALL],
+        "a reservation overflow bought a billed inference on a bigger model"
+    );
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(status(relay.addr).await["fallback_requests_served"], 1);
+
+    // The cheap recovery is intact: the phrase reaches the client, which is what
+    // makes it shrink `max_tokens` without any second upstream request.
+    let message = body["error"]["message"].as_str().expect("a message string");
+    assert!(
+        TOO_LONG_PHRASES
+            .iter()
+            .any(|phrase| message.to_lowercase().contains(phrase)),
+        "the client lost the recovery escalation declined to pay for: {message:?}"
+    );
+    assert!(
+        message.contains("160000 in the completion"),
+        "the provider's own sentence must survive: {message:?}"
+    );
+}
+
+/// **A hop the client would only retry keeps the terminal answer** (fix round 1,
+/// blocker 2). Measured: with the rung above answering 429, the client got a 429 in
+/// place of a terminal 400 it acts on once — so it retried with backoff, and every
+/// retry re-walked the whole ladder (4 upstream requests over 2 client attempts,
+/// unbounded in principle). The relay cannot bound that loop, because it is the
+/// client's.
+///
+/// So the rung below's answer — a context-limit 400 the client acts on and does not
+/// retry blindly — is what goes out. Both attempts still happened and are still
+/// counted, because both were paid for.
+#[tokio::test]
+async fn a_hop_the_client_would_only_retry_keeps_the_terminal_answer() {
+    const RETRYABLE: [(u16, &str); 2] = [
+        (
+            429,
+            r#"{"error":{"message":"Rate limit exceeded","type":"rate_limit_error"}}"#,
+        ),
+        (
+            503,
+            r#"{"error":{"message":"Service temporarily unavailable","type":"server_error"}}"#,
+        ),
+    ];
+
+    for (code, above_body) in RETRYABLE {
+        let above = StatusCode::from_u16(code).expect("a valid status");
+        let relay = start_laddered_with(
+            &LIVE_LADDER,
+            move |recorder| overflow_then_upstream(recorder, &[SMALL], above, above_body),
+            |_| {},
+        )
+        .await;
+
+        let (seen, body) = ask(&relay, HAIKU).await;
+        assert_eq!(
+            models_seen(&relay.fallback),
+            [SMALL, MEDIUM],
+            "{code}: the ladder is still walked once and only once"
+        );
+        assert_eq!(
+            seen,
+            StatusCode::BAD_REQUEST,
+            "{code}: a status the client retries replaced a terminal one it acts on: {body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("a message string")
+                .starts_with("prompt is too long: 170071 tokens > 131072"),
+            "{code}: {body}"
+        );
+        assert_eq!(
+            status(relay.addr).await["fallback_requests_served"],
+            2,
+            "{code}: both attempts were paid for, so both are counted"
+        );
+    }
+}
+
+/// The other half of that rule, and the reason "escalation can never make the
+/// answer worse" is **not** the invariant: a hop that fails *terminally* keeps its
+/// own answer, even when it is less useful than the rung below's.
+///
+/// A `model_map` rung pointing at a retired or mistyped model is the real case. The
+/// honest answer is that the model is not there — it cannot amplify (no client
+/// retries a 404), and masking it behind "prompt is too long" would hide the
+/// misconfiguration while the operator paid for the hop.
+#[tokio::test]
+async fn a_hop_that_fails_terminally_reports_its_own_failure() {
+    const RETIRED: &str = r#"{"error":{"message":"Unable to access model moonshotai/Kimi-K2.7-Code.","type":"invalid_request_error","code":"model_not_available"}}"#;
+    let relay = start_laddered_with(
+        &LIVE_LADDER,
+        |recorder| overflow_then_upstream(recorder, &[SMALL], StatusCode::NOT_FOUND, RETIRED),
+        |_| {},
+    )
+    .await;
+
+    let (code, body) = ask(&relay, HAIKU).await;
+    assert_eq!(models_seen(&relay.fallback), [SMALL, MEDIUM]);
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["type"], "not_found_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("a message string")
+            .contains("Unable to access model"),
+        "a misconfigured rung must be visible as itself: {body}"
     );
 }
 
