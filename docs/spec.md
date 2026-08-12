@@ -275,6 +275,73 @@ profile claims falls through to the active profile. A name the active profile's
 endpoint rejects surfaces as that provider's error — the proxy does not validate
 model names.
 
+**A provider's error surfaces in Anthropic's envelope, not the provider's own shape.**
+This rule replaces the original "passed through verbatim, untranslated". That rule was
+written when no provider's error shapes had been captured, and translating from a guess
+would have been worse; the shapes are captured now
+(`tests/fixtures/together/{F,H,I,J}*`), and verbatim pass-through turned out to cost the
+user a whole session in the one case that matters most. **Claude Code detects a
+context-overflow by lowercased substring match on the error message** — `prompt is too
+long`, `input is too long for requested model`, or ``input length and `max_tokens`
+exceed context limit`` — and extracts the two token counts with
+`prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)`. A provider that words the same
+failure differently (Together AI says "The input (170071 tokens) is longer than the
+model's context length (131072 tokens).") matches none of them, so none of the client's
+compact-and-retry fires and the session is unrecoverable in place.
+
+So the relay emits `{"type":"error","error":{"type":…,"message":…}}`, and:
+
+- **The provider's status is preserved.** The captures show 400, 401, 404 and 422 all
+  occur; normalising them would report a different failure than the one that happened.
+  `x-relay-route: fallback` is on every one, §9's claim unchanged.
+- **The provider's own message is preserved**, from whichever shape carried it:
+  `error.message` first, then a top-level `message` (vLLM and several
+  OpenAI-compatible servers put it there), then a bounded snippet of the body itself —
+  which is what keeps a `{"detail": …}` body or a `text/plain` 413 from arriving as a
+  sentence that says nothing. Only a body with nothing in it produces the relay's own
+  "no message" wording. Reading `error.message` alone would be a regression against the
+  verbatim pass-through this replaced, where a flat body still reached the client's SDK
+  and the user saw the real reason.
+- **The `error.type` is mapped onto Anthropic's name for the status**
+  (`invalid_request_error`, `authentication_error`, `rate_limit_error`, …). The status
+  decides wherever Anthropic documents a type for it, because a provider's type string is
+  not reliable — Together answers a 401 with `invalid_request_error`. Anything
+  unrecognised becomes Anthropic's generic `api_error` rather than an invented name.
+- **For a context-limit error, the message leads with Anthropic's wording and the pair**
+  — `prompt is too long: 170071 tokens > 131072` — with the provider's own sentence after
+  it, which is the only thing that reported the real limit. This is the recovery that
+  matters, because Claude Code sends `max_tokens: 64000` — on a 131k model most of the
+  overflow is the output reservation, not the transcript, so shrinking `max_tokens` alone
+  fixes it with no compaction.
+- **The pair is read from the provider's message, and the parser refuses rather than
+  guesses.** "Never invented" is not a strong enough claim to make about numbers taken
+  out of arbitrary text: digits that came from the provider can still be the *wrong*
+  digits. So the parse is anchored to the wording that matched — the last token count
+  before it and the first number after it — and it yields nothing unless the leading
+  number is a count of tokens, is a whole number rather than one group of a
+  separated one, and exceeds the trailing number. Those checks are each there for a
+  measured failure: unanchored, a `2026-08-12T…` prefix an intermediary added in front of
+  Together's own sentence reports a context limit of **8 tokens**; and a thousands
+  separator splits `170,071` into `170` and `071`, which on one real-shaped wording
+  yields `(71, 2)` — both of which drive the client's `max_tokens` toward zero without
+  ever converging. When no pair survives the checks the phrase goes *last* in the message
+  instead, so no digit the provider sent sits where the extraction regex could read it as
+  the pair. A wrong pair is worse than no pair.
+- **Not every 4xx is a context-limit error.** Detection needs a plausible status (400 or
+  413), matching wording, **and a message the provider itself authored** — the
+  `error.message` or top-level `message` field, never the raw body. That last condition is
+  not fussiness: a pydantic-shaped 400 echoes the rejected request back inside the body,
+  so reading the body let a *malformed* request whose own transcript mentioned a context
+  length become a too-long claim built from the user's own numbers, and the client would
+  shrink, retry the identical malformed request, and loop. Neither the status nor the
+  wording can catch that, because both are genuine. The cost is taken knowingly: a
+  `text/plain` body carrying a real context-limit sentence is surfaced to the user but not
+  detected. A false negative costs what happened before any of this existed; a false
+  positive is a loop that never ends. Only Together's wording is measured — the other
+  patterns matched are unverified guesses at other providers.
+- **The provider's raw body is logged**, capped and with the profile's own key redacted,
+  since the envelope necessarily reshapes what was sent.
+
 This makes deliberate mixed-backend use a client-side choice: `/model` (or
 `--model`, or `CLAUDE_CODE_SUBAGENT_MODEL`, or agent-view dispatch pickers) selects
 an open model by name and the proxy routes it, while `claude-*` selections continue

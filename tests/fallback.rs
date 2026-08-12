@@ -1649,10 +1649,18 @@ async fn a_fallback_limit_error_never_changes_anthropics_route_state() {
 
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(response.headers()["x-relay-route"], "fallback");
+    // Spec §7d: the provider's status and message surface, in Anthropic's
+    // envelope. This assertion used to pin byte-identity with `LIMIT_BODY`; that
+    // encoded the old verbatim-passthrough rule rather than anything this test
+    // is about, which is that a fallback's error moves no Anthropic route state.
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("error body must be JSON");
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "rate_limit_error");
     assert_eq!(
-        response.bytes().await.expect("failed to read body"),
-        LIMIT_BODY.as_bytes(),
-        "the provider's own error surfaces, untranslated"
+        body["error"]["message"],
+        "You have reached your Claude Pro usage limit. Your limit will reset at 6pm.",
+        "the provider's own message is what the client reads"
     );
 
     // Give the state applier and any fixture write a chance to happen, so this
@@ -2245,4 +2253,438 @@ async fn a_gzipped_limit_response_still_hands_the_request_to_the_fallback() {
     response.bytes().await.expect("failed to read body");
     assert_eq!(fallback.only().json()["model"], OPUS_TARGET);
     wait_for_limited(relay).await;
+}
+
+// --- Provider errors in Anthropic's envelope (spec §7d, Task 9B) ---
+//
+// Claude Code detects a context overflow by lowercased substring match on the
+// error message and extracts the two numbers with a regex — so a provider whose
+// wording differs gets none of the client's recovery, and the session is
+// unrecoverable in place. What the relay emits is therefore Anthropic's wording,
+// with the provider's own sentence kept after it (`docs/decisions.md`).
+
+/// Measured through the running Together AI service at 170,071 tokens against a
+/// 131k model (the Task 9B brief's capture). Deliberately a literal here rather
+/// than a file under `tests/fixtures/together/`: that directory's README is a
+/// ledger of two dated capture sessions this test was not part of.
+const TOGETHER_CONTEXT_LIMIT: &str = concat!(
+    r#"{"id":"ovq5abc-1kFHot-a29afb844e986e7d","error":{"message":"The input (170071 tokens) "#,
+    r#"is longer than the model's context length (131072 tokens).","#,
+    r#""type":"invalid_request_error","param":null,"code":null}}"#
+);
+
+/// Claude Code 2.1.220's two too-long predicates, read out of the installed
+/// binary. Both are `.includes()` on the lowercased message, so any one of them
+/// firing is enough for the client to start recovering.
+const TOO_LONG_PHRASES: [&str; 3] = [
+    "prompt is too long",
+    "input is too long for requested model",
+    "input length and `max_tokens` exceed context limit",
+];
+
+/// The number-extraction regex, also from the binary — `M7r` in 2.1.220, whose
+/// body is `e.match(/prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)/i)`
+/// followed by `actualTokens: t[1]`, `limitTokens: t[2]`. Those two lines are the
+/// evidence that `(tokens, limit)` is the right order and that the relay's
+/// input-over-limit guard matches the real client rather than an assumption.
+///
+/// **The `/i` flag is part of it**, so the client is case-insensitive here; a
+/// transcription without it would be stricter than reality and could fail on a
+/// casing difference the client would accept. No regex crate is in this tree
+/// (Global Constraint 3), so `token_pair` below is a hand transcription of exactly
+/// this pattern, flag included; the source stays here so a reader can check the
+/// transcription rather than take it on trust.
+const TOKEN_PAIR_REGEX: &str = r"prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)/i";
+
+/// `TOKEN_PAIR_REGEX` applied to `haystack`: the first match's two captures.
+///
+/// The pattern needs no backtracking to transcribe faithfully: `[^0-9]*` cannot
+/// cross a digit, so the digit run it stops at is forced, and shortening the
+/// greedy `(\d+)` can only leave a digit where `\s*tokens?` must match. `\s*` is
+/// `trim_start`, a superset of the regex's whitespace class.
+///
+/// `/i` is honoured by matching against a lowercased copy. Only numbers come back
+/// out, so nothing indexes into the original — which is what makes that safe, since
+/// `to_lowercase` can change a string's length.
+fn token_pair(haystack: &str) -> Option<(u64, u64)> {
+    const PHRASE: &str = "prompt is too long";
+    let lowered = haystack.to_lowercase();
+    let mut rest = lowered.as_str();
+    loop {
+        let at = rest.find(PHRASE)?;
+        if let Some(pair) = token_pair_after_phrase(&rest[at + PHRASE.len()..]) {
+            return Some(pair);
+        }
+        rest = &rest[at + 1..];
+    }
+}
+
+fn token_pair_after_phrase(tail: &str) -> Option<(u64, u64)> {
+    // `[^0-9]*(\d+)`
+    let (tokens, after) = leading_number(&tail[tail.find(|c: char| c.is_ascii_digit())?..])?;
+    // `\s*tokens?\s*>\s*`
+    let after = after.trim_start();
+    let after = after
+        .strip_prefix("tokens")
+        .or_else(|| after.strip_prefix("token"))?;
+    let after = after.trim_start().strip_prefix('>')?.trim_start();
+    // `(\d+)`
+    leading_number(after).map(|(limit, _)| (tokens, limit))
+}
+
+fn leading_number(text: &str) -> Option<(u64, &str)> {
+    let len = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let value: u64 = text[..len].parse().ok()?;
+    Some((value, &text[len..]))
+}
+
+/// A fallback profile whose only answer is one fixed error.
+fn erroring_openai_upstream(
+    status: StatusCode,
+    body: &'static str,
+    retry_after: Option<&'static str>,
+) -> Router {
+    Router::new().route(
+        "/v1/chat/completions",
+        any(move || async move {
+            let mut response = json(status, body);
+            if let Some(retry_after) = retry_after {
+                response.headers_mut().insert(
+                    "retry-after",
+                    axum::http::HeaderValue::from_static(retry_after),
+                );
+            }
+            response
+        }),
+    )
+}
+
+/// Name-routed (§7d) throughout, so Anthropic is never contacted and nothing but
+/// the fallback's own answer can be what these tests observe.
+async fn start_erroring(
+    status: StatusCode,
+    body: &'static str,
+    retry_after: Option<&'static str>,
+) -> SocketAddr {
+    set_profile_keys();
+    let anthropic_addr = serve(anthropic_upstream(Recorder::default(), false)).await;
+    let fallback_addr = serve(erroring_openai_upstream(status, body, retry_after)).await;
+    serve_relay_with(
+        config(
+            anthropic_addr,
+            "notify-only",
+            profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+        ),
+        None,
+    )
+    .await
+}
+
+async fn provider_error(relay: SocketAddr) -> (StatusCode, HeaderMap, Value) {
+    let response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .body(session_start(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("the error body must be JSON");
+    (status, headers, body)
+}
+
+/// The 170k reproduction: what the client used to receive here matched none of
+/// its three too-long phrases, so none of its recovery fired.
+#[tokio::test]
+async fn a_context_limit_error_reaches_the_client_in_anthropics_own_wording() {
+    let relay = start_erroring(StatusCode::BAD_REQUEST, TOGETHER_CONTEXT_LIMIT, None).await;
+    let (status, headers, body) = provider_error(relay).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the provider's own status");
+    assert_eq!(headers["x-relay-route"], "fallback");
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("the envelope carries a message string");
+
+    // The predicate: `.includes()` on the lowercased message.
+    let lowered = message.to_lowercase();
+    assert!(
+        TOO_LONG_PHRASES
+            .iter()
+            .any(|phrase| lowered.contains(phrase)),
+        "no too-long predicate fires on {message:?}"
+    );
+    // And the number extraction, so the client can shrink `max_tokens` instead of
+    // compacting blind. Claude Code sends `max_tokens: 64000`, so on a 131k model
+    // ~67k of this failure is the output reservation, not the transcript.
+    assert_eq!(
+        token_pair(message),
+        Some((170071, 131072)),
+        "{TOKEN_PAIR_REGEX} must match {message:?}"
+    );
+    // Debuggability: the provider's sentence is the only thing that reported the
+    // real limit, and appending it after the pair is free.
+    assert!(
+        message.contains("The input (170071 tokens) is longer than the model's context length"),
+        "the provider's own sentence must survive: {message:?}"
+    );
+}
+
+/// A malformed request must not be reshaped into a too-long claim — the client
+/// answers one of those by shrinking and retrying, forever. The body is
+/// `tests/fixtures/together/H_error_missing_messages.json`'s, a real 400.
+#[tokio::test]
+async fn a_malformed_request_is_not_reshaped_into_a_too_long_claim() {
+    const MISSING_MESSAGES: &str = r#"{"id":"ovq42ih-6Ng1vN-a29afb89ca1ab9f4","error":{"message":"Input required","type":"invalid_request_error","param":null,"code":null}}"#;
+    let relay = start_erroring(StatusCode::BAD_REQUEST, MISSING_MESSAGES, None).await;
+    let (status, _, body) = provider_error(relay).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["message"], "Input required");
+    let lowered = body["error"]["message"]
+        .as_str()
+        .expect("a message string")
+        .to_lowercase();
+    for phrase in TOO_LONG_PHRASES {
+        assert!(
+            !lowered.contains(phrase),
+            "an ordinary 400 became a {phrase:?} claim: {body}"
+        );
+    }
+    assert_eq!(token_pair(&lowered), None);
+}
+
+/// Spec §7d preserves the provider's status: the captures show 400, 401, 404 and
+/// 422 all occur, and normalising them would tell the client the wrong thing
+/// went wrong. Every one of them still carries the route marker, whose claim —
+/// absence means Anthropic answered — is what makes it worth having.
+#[tokio::test]
+async fn a_provider_error_keeps_its_status_and_carries_the_route_marker() {
+    // Bodies from the real captures, paired with Anthropic's type name for the
+    // status each was observed on.
+    const CASES: [(u16, &str, &str); 4] = [
+        (
+            400,
+            r#"{"error":{"message":"Input required","type":"invalid_request_error"}}"#,
+            "invalid_request_error",
+        ),
+        (
+            401,
+            r#"{"error":{"message":"Invalid API key provided.","type":"invalid_request_error","code":"invalid_api_key"}}"#,
+            "authentication_error",
+        ),
+        (
+            404,
+            r#"{"error":{"message":"Unable to access model totally-fake-model.","type":"invalid_request_error","code":"model_not_available"}}"#,
+            "not_found_error",
+        ),
+        (
+            422,
+            r#"{"error":{"message":"Input validation error","type":"invalid_request_error"}}"#,
+            "invalid_request_error",
+        ),
+    ];
+
+    for (code, provider_body, expected_type) in CASES {
+        let status = StatusCode::from_u16(code).expect("a valid status");
+        let relay = start_erroring(status, provider_body, None).await;
+        let (seen, headers, body) = provider_error(relay).await;
+
+        assert_eq!(seen, status, "{code} must not be normalised");
+        assert_eq!(headers["x-relay-route"], "fallback", "{code}");
+        assert_eq!(body["type"], "error", "{code}");
+        assert_eq!(body["error"]["type"], expected_type, "{code}");
+        assert!(
+            body["error"]["message"].is_string(),
+            "{code} lost its message: {body}"
+        );
+    }
+}
+
+/// The one upstream header the client acts on. Everything else is dropped: the
+/// body is the relay's now, so the provider's `content-length` described bytes
+/// that are no longer being sent.
+#[tokio::test]
+async fn a_provider_rate_limit_keeps_its_retry_after() {
+    let relay = start_erroring(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"message":"Rate limit exceeded","type":"rate_limit_error"}}"#,
+        Some("42"),
+    )
+    .await;
+    let (status, headers, body) = provider_error(relay).await;
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers["retry-after"], "42");
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(headers["content-type"], "application/json");
+}
+
+/// An error body the relay cannot read is still the provider saying no. Emitting
+/// the relay's own 502 in its place would report a different failure than the one
+/// that happened.
+#[tokio::test]
+async fn an_unreadable_error_body_keeps_the_providers_status() {
+    set_profile_keys();
+    let anthropic_addr = serve(anthropic_upstream(Recorder::default(), false)).await;
+    let fallback_addr = serve(Router::new().route(
+        "/v1/chat/completions",
+        any(|| async {
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("content-type", "application/json")
+                .body(truncated_body(r#"{"error":{"message":"Inp"#))
+                .expect("failed to build mock response")
+        }),
+    ))
+    .await;
+    let relay = serve_relay_with(
+        config(
+            anthropic_addr,
+            "notify-only",
+            profile(fallback_addr, "openai", OPENAI_KEY_ENV),
+        ),
+        None,
+    )
+    .await;
+
+    let (status, headers, body) = provider_error(relay).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(headers["x-relay-route"], "fallback");
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        body["error"]["message"],
+        "the fallback provider returned an error with no message"
+    );
+}
+
+/// Blocker 3 of fix round 1: the provider's error body has two sinks, and the
+/// client's is the one that lands in a session transcript. An authentication
+/// failure is exactly the error most likely to quote the offending key back, so
+/// the redaction has to cover the envelope and not only the log.
+#[tokio::test]
+async fn a_key_the_provider_quotes_back_never_reaches_the_client() {
+    // The profile's own key, echoed the way a provider reporting a bad credential
+    // plausibly would. `set_profile_keys` has already put `OPENAI_KEY` in the
+    // environment, so this is the real configured value, not a stand-in.
+    const ECHOED: &str = concat!(
+        r#"{"error":{"message":"Invalid API key provided: "#,
+        "together-key-for-the-openai-profile",
+        r#". Check your key at https://api.together.ai/settings/api-keys.","#,
+        r#""type":"invalid_request_error","code":"invalid_api_key"}}"#
+    );
+    // The literal above has to *be* the configured key for this test to mean
+    // anything; `concat!` cannot interpolate a const, so it is asserted instead.
+    assert!(
+        ECHOED.contains(OPENAI_KEY),
+        "the fixture must carry the configured key verbatim"
+    );
+
+    let relay = start_erroring(StatusCode::UNAUTHORIZED, ECHOED, None).await;
+    let (status, headers, body) = provider_error(relay).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers["x-relay-route"], "fallback");
+    assert_eq!(body["error"]["type"], "authentication_error");
+
+    let whole = body.to_string();
+    assert!(
+        !whole.contains(OPENAI_KEY),
+        "the profile's key reached the client: {whole}"
+    );
+    // Redacted, not merely dropped: the rest of the provider's sentence has to
+    // survive or the client is told nothing useful about why it failed.
+    let message = body["error"]["message"].as_str().expect("a message string");
+    assert!(
+        message.contains("[REDACTED]"),
+        "the key must be redacted in place: {message}"
+    );
+    assert!(
+        message.starts_with("Invalid API key provided:")
+            && message.contains("api.together.ai/settings/api-keys"),
+        "the provider's own sentence must survive around the redaction: {message}"
+    );
+}
+
+/// Blocker 5 of fix round 1: the flat top-level-`message` shape, which several
+/// OpenAI-compatible servers use. Reading only `error.message` lost the sentence
+/// entirely, and that was a *regression* — under the verbatim pass-through this
+/// replaced, the body reached the client's SDK, which prefers a top-level
+/// `message`, so the user saw the real reason. Here it also has to reach detection,
+/// because the sentence is a context-limit sentence.
+#[tokio::test]
+async fn a_flat_top_level_message_still_reaches_the_client_and_detection() {
+    const FLAT: &str = concat!(
+        r#"{"object":"error","message":"This model's maximum context length is 131072 tokens. "#,
+        r#"However, you requested 170071 tokens (39071 in the messages, 64000 in the completion)."#,
+        r#"","type":"BadRequestError","param":null,"code":400}"#
+    );
+    let relay = start_erroring(StatusCode::BAD_REQUEST, FLAT, None).await;
+    let (status, headers, body) = provider_error(relay).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(headers["x-relay-route"], "fallback");
+    let message = body["error"]["message"].as_str().expect("a message string");
+
+    assert!(
+        message.contains("This model's maximum context length is 131072 tokens"),
+        "the provider's own sentence must survive: {message:?}"
+    );
+    // Detection fires, so the client can act at all.
+    let lowered = message.to_lowercase();
+    assert!(
+        TOO_LONG_PHRASES
+            .iter()
+            .any(|phrase| lowered.contains(phrase)),
+        "no too-long predicate fires on {message:?}"
+    );
+    // But no pair: this wording puts the limit before the input, so the anchored
+    // parse refuses rather than reporting them backwards. The client compacts
+    // blind, which is the safe half of the recovery.
+    assert_eq!(
+        token_pair(message),
+        None,
+        "a limit-before-input wording must not yield a reversed pair: {message:?}"
+    );
+}
+
+/// The error path buffers the provider's body, so the cap on it is a choice worth
+/// pinning rather than inheriting. It is `ERROR_BODY_CAP` (1 MiB) — the bound this
+/// repo already argued for exactly this hazard on the Anthropic route — not
+/// `RESPONSE_CAP` (4 MiB), which is about a non-streaming 2xx that has to be whole
+/// before it can be translated.
+#[tokio::test]
+async fn an_error_body_between_the_two_caps_is_refused_but_keeps_the_status() {
+    // Between 1 MiB and 4 MiB: read under the error cap, accepted under the
+    // response cap. A `Box::leak` because the mock's body has to be `'static`.
+    let oversized: &'static str = Box::leak(
+        format!(
+            r#"{{"error":{{"message":"{}","type":"invalid_request_error"}}}}"#,
+            "z".repeat(2 * 1024 * 1024)
+        )
+        .into_boxed_str(),
+    );
+    assert!(
+        oversized.len() > 1024 * 1024 && oversized.len() < 4 * 1024 * 1024,
+        "the body has to sit between the two caps for this test to distinguish them"
+    );
+
+    let relay = start_erroring(StatusCode::BAD_REQUEST, oversized, None).await;
+    let (status, headers, body) = provider_error(relay).await;
+
+    // Refused, but the provider's status is still the honest answer.
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(headers["x-relay-route"], "fallback");
+    assert_eq!(
+        body["error"]["message"], "the fallback provider returned an error with no message",
+        "a body past the cap is not read at all"
+    );
 }

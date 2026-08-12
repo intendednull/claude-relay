@@ -22,7 +22,8 @@ use indexmap::IndexMap;
 use serde_json::{Value, json};
 
 use crate::config::ProfileConfig;
-use crate::proxy::{CountingStream, RequestLog, elapsed_ms, forwardable};
+use crate::provider_error::ProviderError;
+use crate::proxy::{CountingStream, ERROR_BODY_CAP, RequestLog, elapsed_ms, forwardable};
 use crate::state::AppState;
 use crate::translate::{self, BUFFER_CAP};
 
@@ -151,20 +152,7 @@ pub async fn forward(
     // fallback provider must not put the Anthropic route into `Limited`, and a
     // 200 from it must not recover the route out of it.
     if !status.is_success() {
-        // Spec §7d: the provider's own error is what surfaces, untranslated.
-        // The shape is captured now, not guessed: real Together AI error
-        // bodies (`tests/fixtures/together/{A,F,H,I,J}*`) are all
-        // OpenAI-style `{"error": {message, type, param, code}}` plus a
-        // harmless top-level `id`, pinned by
-        // `tests/translate_together_fixtures.rs`'s
-        // `every_real_error_capture_is_openai_shaped`. The decision to pass
-        // through rather than translate is unchanged and better supported
-        // than when it was a guess. Status codes are not uniform across
-        // those captures (400, 401, 404 — for an unknown model, unusually —
-        // and 422 were all observed): nothing here depends on that today
-        // since this branch only checks `!is_success()`, but a future change
-        // that assumes "provider errors are 400" would be wrong.
-        return passthrough_response(status, upstream, log);
+        return provider_error_response(profile, request.profile_name, status, upstream, log).await;
     }
 
     if !translated {
@@ -375,9 +363,155 @@ fn translated_headers(content_type: &'static str) -> HeaderMap {
     headers
 }
 
+/// Spec §7d: a provider's error reaches the client in Anthropic's envelope,
+/// with the provider's own status and message preserved. It used to pass through
+/// verbatim; the shapes were unknown when that rule was written and are captured
+/// now, and for a context-limit error the passthrough cost the user the whole
+/// session — Claude Code's compact-and-retry keys on Anthropic's wording, which
+/// no provider here uses (`docs/decisions.md`).
+async fn provider_error_response(
+    profile: &ProfileConfig,
+    profile_name: &str,
+    status: StatusCode,
+    upstream: reqwest::Response,
+    log: RequestLog,
+) -> Response {
+    let mut headers = translated_headers("application/json");
+    // An allowlist of one, not `forwardable`'s denylist: this body is the
+    // relay's, so the provider's `content-length` and `content-encoding`
+    // describe bytes that are no longer being sent. `retry-after` is the only
+    // header on an error the client acts on, so it is the only one kept.
+    if let Some(retry_after) = upstream.headers().get("retry-after").cloned() {
+        headers.insert("retry-after", retry_after);
+    }
+
+    // `ERROR_BODY_CAP`, not `RESPONSE_CAP`: the repo already has a cap argued for
+    // exactly this hazard — the Anthropic route's error accumulator, whose 1 MiB is
+    // there so "a broken or hostile upstream must not be able to turn an error
+    // response into unbounded allocation" (Global Constraint 3). `RESPONSE_CAP` is
+    // 4x that and is about a non-streaming 2xx that has to be complete before it can
+    // be translated, which is a different question; inheriting it here would have
+    // been 4x by accident rather than by choice.
+    //
+    // Note the change in resource profile this branch made: a provider error used to
+    // stream through at O(1) and is now buffered whole, so a burst of concurrent
+    // errors costs O(cap) each. Bounded per request, with no aggregate bound across
+    // them — the same property spec §12 already records for every other buffer here.
+    let raw = match read_capped(upstream, ERROR_BODY_CAP).await {
+        Ok(raw) => raw,
+        Err(reason) => {
+            tracing::warn!(
+                profile = profile_name,
+                reason,
+                "the fallback provider's error body was unreadable"
+            );
+            // Not a 502: the provider's status is the honest answer, and losing
+            // it would tell the client a different thing went wrong.
+            Vec::new()
+        }
+    };
+    // Redacted once, here, before anything reads it. This body has *two* sinks —
+    // the log line below and the message that goes into the client's envelope —
+    // and redacting at each of them is how one of them ends up forgotten. Doing it
+    // to the bytes both share is the only version that cannot diverge. It also has
+    // to happen before the log's clip: redacting a clipped body leaves a key that
+    // straddles the boundary partially present, so the literal match misses and
+    // the truncated key is logged in cleartext.
+    let raw = redact_profile_key(raw, &profile.api_key_env);
+
+    // The envelope necessarily reshapes what the provider sent, so the bytes have
+    // to stay findable by a human — the log is the place for that.
+    tracing::warn!(
+        profile = profile_name,
+        status = status.as_u16(),
+        // No `%` sigil: that renders through `format_args!` unescaped, and this
+        // value is provider-controlled, so a newline in it would forge a whole
+        // record (`log_safety`). A plain field gets `record_str`'s escaping.
+        body = clipped_for_log(&raw),
+        "the fallback provider returned an error"
+    );
+
+    let body = ProviderError::read(status, &raw).to_anthropic();
+    log.emit(body.len() as u64);
+
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+}
+
+/// How much of a provider's error body reaches the log. The real ones are a few
+/// hundred bytes; the cap is here because the body is provider-controlled and
+/// unbounded, and because a provider is free to echo request content into its
+/// error message — Together's context error carries only numbers, but that is an
+/// observation about one provider, not a guarantee. Counted in `char`s so the
+/// clip cannot split a multi-byte boundary.
+const LOGGED_ERROR_BODY_CHARS: usize = 512;
+
+fn clipped_for_log(body: &[u8]) -> String {
+    String::from_utf8_lossy(body)
+        .chars()
+        .take(LOGGED_ERROR_BODY_CHARS)
+        .collect()
+}
+
+/// The profile's own key is the one credential that ever reaches this provider
+/// (spec §7b builds the outgoing headers from nothing else), and a provider is
+/// free to quote it back in an error — an authentication failure is exactly the
+/// error most likely to. Redacted for the same reason `err.without_url()` is used
+/// above: neither the log nor the client's session transcript may be where a
+/// credential lands (Global Constraint 2).
+///
+/// Applied to the whole body rather than a clipped view of it, because the clip
+/// happens downstream of here in two different places and a key straddling either
+/// boundary must not survive.
+fn redact_profile_key(body: Vec<u8>, api_key_env: &str) -> Vec<u8> {
+    redact_key(body, std::env::var(api_key_env).ok().as_deref())
+}
+
+/// Split from the environment read so the floor can be tested without writing to
+/// the process environment.
+fn redact_key(body: Vec<u8>, key: Option<&str>) -> Vec<u8> {
+    match key {
+        Some(key) if key.len() >= MIN_REDACTABLE_KEY_LEN => {
+            replace_bytes(&body, key.as_bytes(), b"[REDACTED]")
+        }
+        _ => body,
+    }
+}
+
+/// A floor on what is treated as a key to redact. Not a guess at key formats — it
+/// is here because this redaction now runs *ahead of* the context-limit parse, so a
+/// placeholder value left in the environment (`=changeme`, `=token`, `=context`)
+/// would quietly eat words out of the provider's message and take the recovery with
+/// them: `context` alone stops detection firing at all, and `token` costs the token
+/// pair. Before the redaction moved in front of the parser a bad key could only
+/// mangle a log line. Real keys are far longer than this; anything shorter is a
+/// mistake, and a mistake should not be able to disable the recovery silently.
+const MIN_REDACTABLE_KEY_LEN: usize = 8;
+
+/// `str::replace` over bytes, because an error body need not be valid UTF-8 while
+/// the key always is. A redacted JSON body still parses in practice — `[REDACTED]`
+/// carries nothing JSON treats specially — but that is an observation about where a
+/// provider puts its key, not a property this can guarantee, and a body that stops
+/// parsing degrades to the snippet path rather than failing.
+fn replace_bytes(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while let Some(at) = rest
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        out.extend_from_slice(&rest[..at]);
+        out.extend_from_slice(with);
+        rest = &rest[at + needle.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
 /// Streams the upstream response through untouched. Used for a
-/// `format = "anthropic"` profile, which needs no translation, and for every
-/// non-2xx, whose body is the provider's own error.
+/// `format = "anthropic"` profile's 2xx, which needs no translation.
 fn passthrough_response(
     status: StatusCode,
     upstream: reqwest::Response,
@@ -528,6 +662,50 @@ mod tests {
         assert_eq!(
             endpoint(&profile, "/v1/messages", true),
             "https://api.example.com/v1/chat/completions"
+        );
+    }
+
+    /// Fix round 2. This redaction runs *ahead of* the context-limit parse, so a
+    /// placeholder value left in the environment would quietly eat words out of the
+    /// provider's message and take the recovery with it — `context` alone stops
+    /// detection firing, `token` costs the token pair. The floor is what keeps a
+    /// mistake in a config file from silently disabling the thing this route exists
+    /// for.
+    #[test]
+    fn a_placeholder_key_value_is_not_treated_as_a_key() {
+        const SENTENCE: &[u8] =
+            b"The input (170071 tokens) is longer than the model's context length (131072 tokens).";
+
+        for placeholder in ["context", "token", "70", "", "x"] {
+            assert_eq!(
+                redact_key(SENTENCE.to_vec(), Some(placeholder)),
+                SENTENCE.to_vec(),
+                "{placeholder:?} is a mistake, not a key, and must not touch the message"
+            );
+        }
+        assert_eq!(redact_key(SENTENCE.to_vec(), None), SENTENCE.to_vec());
+
+        // A real key still redacts, or the floor would have bought safety by doing
+        // nothing at all.
+        let key = "sk-together-0123456789abcdef";
+        let body = format!("Invalid API key provided: {key}.").into_bytes();
+        let redacted = redact_key(body, Some(key));
+        let text = String::from_utf8(redacted).expect("still UTF-8");
+        assert_eq!(text, "Invalid API key provided: [REDACTED].");
+    }
+
+    /// The reason the floor matters, stated as behaviour rather than as a comment:
+    /// with a placeholder key the provider's sentence survives intact, so detection
+    /// still fires and still reports the pair.
+    #[test]
+    fn a_placeholder_key_value_does_not_disable_context_limit_recovery() {
+        let body =
+            br#"{"error":{"message":"The input (170071 tokens) is longer than the model's context length (131072 tokens).","type":"invalid_request_error"}}"#;
+        let redacted = redact_key(body.to_vec(), Some("context"));
+        let error = ProviderError::read(StatusCode::BAD_REQUEST, &redacted);
+        assert_eq!(
+            error.context_limit.and_then(|limit| limit.counts),
+            Some((170071, 131072))
         );
     }
 

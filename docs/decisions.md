@@ -511,7 +511,8 @@ says a provider's error surfaces as that provider's error. Translating an error
 envelope would mean inventing an OpenAI→Anthropic error mapping from shapes this
 project has never captured. Claude Code will render an OpenAI-shaped error less
 gracefully than an Anthropic one; that is a known, cheap-to-fix gap, and fixing
-it on a guess is not.
+it on a guess is not. **(Superseded 2026-08-12, Task 9B — the gap turned out to
+cost a whole session, not just grace; see that entry.)**
 
 **Nothing a fallback returns touches Anthropic's route state or the capture
 fixtures.** A 429 from the fallback provider must not put the Anthropic route
@@ -1285,3 +1286,100 @@ arrived strictly before content in every capture (9 fragments then 5 on
 arriving *after* content opens a second thinking block rather than being dropped
 — a late fragment is still the user's content, which is the whole point of the
 task. A chunk carrying both fields emits the thinking first.
+
+## 2026-08-12 — Task 9B: a provider's error stops being the provider's error
+
+Spec §7d's original rule was verbatim pass-through, and the 2026-08-11 entry above
+defended it: translating an error envelope from shapes nobody had captured would
+have been inventing a mapping. That reasoning was right about the *shape* and
+wrong about the *consequence*, because of something not known then.
+
+**Claude Code detects a context overflow by lowercased substring match on the
+error message.** Read out of the installed 2.1.220 binary, the too-long predicate
+is `.includes("prompt is too long") || .includes("input is too long for requested
+model")`, a second one matches ``input length and `max_tokens` exceed context
+limit``, and the two numbers come out of
+`prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)`. Together AI, measured
+through the running service at 170,071 tokens against a 131k model, answers
+`400 {"error":{"message":"The input (170071 tokens) is longer than the model's
+context length (131072 tokens).","type":"invalid_request_error",…}}` — which
+matches **none** of the three phrases. So none of the client's compact-and-retry
+fires, and the session is unrecoverable in place rather than merely rendered
+badly. Anthropic's own gateway documentation names this exact failure: a gateway
+that enforces a smaller context than the model's native window and rewrites the
+upstream error stops the automatic compact-and-retry from firing.
+
+It matters more than it sounds because **Claude Code sends `max_tokens: 64000`**
+(verified in the captured request). On a 131k model roughly half the overflow is
+the output reservation and not the transcript, so shrinking `max_tokens` alone
+fixes those attempts with no compaction at all — recovery the client will do for
+itself, given wording it can read.
+
+**What lands.** `src/provider_error.rs` reads the provider's error once and
+re-emits `{"type":"error","error":{type,message}}` with the status preserved and
+the marker intact; §7d carries the full rule. Two shape decisions worth recording:
+
+- **The status decides `error.type` wherever Anthropic documents one for it.** The
+  provider's own type string is not a reliable signal —
+  `I_error_invalid_auth.json` is a 401 whose `error.type` is
+  `invalid_request_error`. Where Anthropic documents no type (Together's 422), a
+  recognised provider type passes through and anything else becomes `api_error`
+  rather than an invented name.
+- **The token pair leads the message, and is never invented.** The extraction
+  regex permits no digits between the phrase and the count, so
+  `prompt is too long: 170071 tokens > 131072` comes first and the provider's
+  sentence trails it — free, since the predicate is `.includes`, and the provider's
+  sentence is the only thing that reported the real limit. When no usable pair can
+  be parsed the phrase moves to the *end*, so digits the provider happened to send
+  cannot be read as the pair; a wrong pair would make the client size its retry
+  wrongly, which is worse than making it retry blind. "Usable" also means the first
+  count exceeds the second: a reversed pair is not this failure's pair.
+
+**Detection is a small Rust matcher, not `[detect]`-style config data.** The
+earlier draft of the task called for following `[detect]`'s config-as-data
+precedent. Rejected: `[detect]`'s rules are config because Anthropic's 429 body is
+the load-bearing input to the entire product — if that wording changes the relay
+stops working at all, and an operator must be able to fix it without a rebuild.
+This is one provider's 400 wording on a recovery path, and the failure mode of a
+wrong rule is asymmetric in the other direction. A false negative costs what
+already happens today (the client cannot self-rescue); a false positive sends the
+client into a pointless shrink-and-retry loop, which config-as-data makes *easier*
+for an operator to cause by hand. The matcher is a `const` array of markers plus a
+status gate, shaped so moving it into `[detect]` later is a mechanical change if a
+second provider's wording ever makes it worth a knob. No new config key: MVP first.
+
+**Runner-up rejected: leave errors verbatim and have the operator set
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW`** to the mapped model's window, so the client
+compacts before it ever overflows. Rejected as *the* answer on two counts: it is
+per-operator manual setup a relay user has to know to perform, and it clamps to
+`min(assumed_window, configured)`, so it does nothing at all unless the operator
+*also* selects a `[1m]` model ID. It is complementary, not wrong — an operator who
+sets both gets pre-emptive compaction and a readable error when it is not enough.
+Both knobs, and the fact that `CLAUDE_CODE_MAX_CONTEXT_TOKENS` does nothing on the
+failover path, are now in the README rather than left as folklore.
+
+**This is not the whole answer, and should not be recorded as one.** Handing the
+client wording it can act on only helps where the client's own recovery can
+succeed. Shrinking `max_tokens` fixes the case where the output reservation is what
+overflowed; compaction fixes the case where the transcript can be summarised. When
+the transcript *alone* exceeds the target's window, neither can — Anthropic
+documents `Error during compaction: Conversation too long` as a real terminal state
+whose only recovery is `/clear`. Escalating one rung up the model ladder (Task 9A)
+is what covers that, and it keys on the same `context_limit` seam this task put in
+`src/provider_error.rs`, which is why the seam is public to the crate rather than
+private to the error path.
+
+**Coverage is one provider, stated rather than implied.** Only Together's wording
+is measured; the other markers are guesses at wording no provider here has been
+observed using, kept narrow because a false positive is the expensive direction.
+Two follow-ups logged, not done:
+
+- **`J_error_max_tokens_exceeds_context.json` is not detected.** It is Together's
+  own `inputs` + `max_new_tokens` validation error — genuinely the third phrase's
+  condition (``input length and `max_tokens` exceed context limit``) — but its
+  three integers do not map onto (prompt tokens, limit), so emitting a pair from it
+  would be emitting a wrong one. Handling it wants that third phrase and its own
+  parse, not this one stretched.
+- **`error.code` is not consulted.** OpenAI-compatible providers commonly return
+  `code: "context_length_exceeded"`, which would be a cheap second signal. No
+  capture in this tree carries it, so it stays a guess unmade.
