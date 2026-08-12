@@ -883,7 +883,7 @@ async fn post_control_profile_returns_promptly_while_a_switch_hook_is_running() 
     let b = serve(upstream_ok(BODY_B)).await;
     let mut cfg = config(anthropic, a, b);
     cfg.notify = NotifyConfig {
-        command: Some(format!(r#"sleep 0.4; printf 'ran' >> {}"#, log.display())),
+        command: Some(format!(r#"sleep 0.8; printf 'ran' >> {}"#, log.display())),
         timeout_secs: 5,
     };
     let relay = serve_relay_with(cfg, None).await;
@@ -891,8 +891,15 @@ async fn post_control_profile_returns_promptly_while_a_switch_hook_is_running() 
     let (status, _) = post_json(relay, "/control/profile", json!({"name": "profile-b"})).await;
     assert_eq!(status, StatusCode::OK);
 
-    // Give the worker time to pick the switch up and be mid-`sleep`.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The notifier's own idle-poll interval is 500ms (`src/notify.rs`'s
+    // `SWITCH_CHECK_INTERVAL`, not visible from this crate): the worker's
+    // very first slot-check can lose the race against this POST arriving
+    // (a real possibility right after the relay starts serving), in which
+    // case it commits to a full ~500ms wait before ever picking the switch
+    // up at all. 600ms clears that regardless of which side of the race the
+    // worker landed on, and the hook's own 800ms then guarantees it is still
+    // running whenever the pickup actually happened.
+    tokio::time::sleep(Duration::from_millis(600)).await;
 
     let started = Instant::now();
     let (status, _) = post_json(relay, "/control/profile", json!({"name": "profile-a"})).await;
