@@ -15,7 +15,7 @@ use futures_core::Stream;
 use serde_json::{Value, json};
 
 use super::BUFFER_CAP;
-use super::openai::{ChatCompletionChunk, TextContent, ToolCallDelta, Usage};
+use super::openai::{ChatCompletionChunk, TextContent, ToolCallDelta, Usage, reasoning_text};
 use super::response::stop_reason;
 
 /// What the client is told when the upstream connection itself fails. The
@@ -204,12 +204,10 @@ impl SseTranslator {
         // Before the `content` branch, so a chunk carrying both — which is not
         // the observed shape, but is a shape a provider is free to send — still
         // gets its reasoning out ahead of the answer.
-        let reasoning = choice
-            .delta
-            .reasoning_content
-            .filter(|_| self.surface_reasoning)
-            .map(TextContent::into_text)
-            .filter(|reasoning| !reasoning.is_empty());
+        let reasoning = self
+            .surface_reasoning
+            .then(|| reasoning_text(choice.delta.reasoning, choice.delta.reasoning_content))
+            .flatten();
         if let Some(reasoning) = reasoning {
             let Some(index) = self.open_thinking(out) else {
                 return;
@@ -837,14 +835,26 @@ mod tests {
         }))
     }
 
-    fn reasoning_chunk(reasoning: &str) -> String {
+    /// The two keys providers use for the reasoning. Every reasoning test below
+    /// runs against both: a fixture for only one is exactly how a translator that
+    /// silently drops the other ships.
+    const REASONING_KEYS: [&str; 2] = ["reasoning", "reasoning_content"];
+
+    /// A chunk carrying `reasoning` under `key`, plus the `token_id` the
+    /// providers that spell it `reasoning` send alongside — which nothing reads,
+    /// and which must not upset the deserializer.
+    fn reasoning_chunk_keyed(key: &str, reasoning: &str) -> String {
         frame(json!({
             "id": "chatcmpl-1",
             "object": "chat.completion.chunk",
             "model": "target/Model",
-            "choices": [{"index": 0, "delta": {"reasoning_content": reasoning},
+            "choices": [{"index": 0, "delta": {key: reasoning, "token_id": 12345},
                          "finish_reason": Value::Null}],
         }))
+    }
+
+    fn reasoning_chunk(reasoning: &str) -> String {
+        reasoning_chunk_keyed("reasoning_content", reasoning)
     }
 
     /// `(event name, index, block type or delta type)` — enough to assert both
@@ -940,71 +950,123 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_fragments_become_a_thinking_block_that_closes_before_the_text_block() {
-        let events = synthesize(&[
-            &reasoning_chunk("This"),
-            &reasoning_chunk(" is a riddle."),
-            &text_chunk("9 sheep."),
-            &finish_chunk("stop"),
-            "data: [DONE]\n\n",
-        ]);
+    fn either_spelling_of_reasoning_becomes_a_thinking_block_before_the_text_block() {
+        for key in REASONING_KEYS {
+            let events = synthesize(&[
+                &reasoning_chunk_keyed(key, "This"),
+                &reasoning_chunk_keyed(key, " is a riddle."),
+                &text_chunk("9 sheep."),
+                &finish_chunk("stop"),
+                "data: [DONE]\n\n",
+            ]);
 
-        assert_eq!(
-            shape(&events),
-            vec![
-                ("content_block_start".into(), 0, "thinking".into()),
-                ("content_block_delta".into(), 0, "thinking_delta".into()),
-                ("content_block_delta".into(), 0, "thinking_delta".into()),
-                ("content_block_stop".into(), 0, String::new()),
-                ("content_block_start".into(), 1, "text".into()),
-                ("content_block_delta".into(), 1, "text_delta".into()),
-                ("content_block_stop".into(), 1, String::new()),
-            ]
-        );
-        assert_eq!(
-            events[1].1,
-            json!({"type": "content_block_start", "index": 0,
-                   "content_block": {"type": "thinking", "thinking": ""}}),
-            "no signature on a block this relay synthesized"
-        );
-        assert_eq!(
-            events[2].1,
-            json!({"type": "content_block_delta", "index": 0,
-                   "delta": {"type": "thinking_delta", "thinking": "This"}})
-        );
+            assert_eq!(
+                shape(&events),
+                vec![
+                    ("content_block_start".into(), 0, "thinking".into()),
+                    ("content_block_delta".into(), 0, "thinking_delta".into()),
+                    ("content_block_delta".into(), 0, "thinking_delta".into()),
+                    ("content_block_stop".into(), 0, String::new()),
+                    ("content_block_start".into(), 1, "text".into()),
+                    ("content_block_delta".into(), 1, "text_delta".into()),
+                    ("content_block_stop".into(), 1, String::new()),
+                ],
+                "spelled {key:?}"
+            );
+            assert_eq!(
+                events[1].1,
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "thinking", "thinking": ""}}),
+                "no signature on a block this relay synthesized"
+            );
+            assert_eq!(
+                events[2].1,
+                json!({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "thinking_delta", "thinking": "This"}})
+            );
+        }
+    }
+
+    /// Both keys in one delta: whichever is non-empty wins, and it is never a
+    /// failure — the streaming counterpart of the non-streaming case in
+    /// `super::super::response`.
+    #[test]
+    fn both_spellings_in_one_delta_pick_the_non_empty_one_rather_than_failing() {
+        for (reasoning, reasoning_content, expected) in [
+            ("streamed reasoning", "", "streamed reasoning"),
+            (
+                "",
+                "streamed reasoning_content",
+                "streamed reasoning_content",
+            ),
+            ("both set", "also set", "both set"),
+        ] {
+            let events = synthesize(&[
+                &frame(json!({
+                    "id": "chatcmpl-1",
+                    "model": "target/Model",
+                    "choices": [{"index": 0, "delta": {
+                        "reasoning": reasoning, "reasoning_content": reasoning_content,
+                    }}],
+                })),
+                &text_chunk("answer"),
+                &finish_chunk("stop"),
+                "data: [DONE]\n\n",
+            ]);
+
+            assert_eq!(
+                events[2].1,
+                json!({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "thinking_delta", "thinking": expected}})
+            );
+            assert_eq!(
+                shape(&events),
+                vec![
+                    ("content_block_start".into(), 0, "thinking".into()),
+                    ("content_block_delta".into(), 0, "thinking_delta".into()),
+                    ("content_block_stop".into(), 0, String::new()),
+                    ("content_block_start".into(), 1, "text".into()),
+                    ("content_block_delta".into(), 1, "text_delta".into()),
+                    ("content_block_stop".into(), 1, String::new()),
+                ]
+            );
+        }
     }
 
     /// The case most likely to produce wrong block indices: `content` arriving
     /// while the thinking block is still open, then more reasoning after it.
     #[test]
     fn interleaved_reasoning_and_content_keep_contiguous_ordered_indices() {
-        let events = synthesize(&[
-            &reasoning_chunk("first thought"),
-            &text_chunk("partial answer"),
-            &reasoning_chunk("second thought"),
-            &text_chunk(" rest"),
-            &finish_chunk("stop"),
-            "data: [DONE]\n\n",
-        ]);
+        for key in REASONING_KEYS {
+            let events = synthesize(&[
+                &reasoning_chunk_keyed(key, "first thought"),
+                &text_chunk("partial answer"),
+                &reasoning_chunk_keyed(key, "second thought"),
+                &text_chunk(" rest"),
+                &finish_chunk("stop"),
+                "data: [DONE]\n\n",
+            ]);
 
-        assert_eq!(
-            shape(&events),
-            vec![
-                ("content_block_start".into(), 0, "thinking".into()),
-                ("content_block_delta".into(), 0, "thinking_delta".into()),
-                ("content_block_stop".into(), 0, String::new()),
-                ("content_block_start".into(), 1, "text".into()),
-                ("content_block_delta".into(), 1, "text_delta".into()),
-                ("content_block_stop".into(), 1, String::new()),
-                ("content_block_start".into(), 2, "thinking".into()),
-                ("content_block_delta".into(), 2, "thinking_delta".into()),
-                ("content_block_stop".into(), 2, String::new()),
-                ("content_block_start".into(), 3, "text".into()),
-                ("content_block_delta".into(), 3, "text_delta".into()),
-                ("content_block_stop".into(), 3, String::new()),
-            ],
-            "a late reasoning fragment gets a block of its own rather than being dropped"
-        );
+            assert_eq!(
+                shape(&events),
+                vec![
+                    ("content_block_start".into(), 0, "thinking".into()),
+                    ("content_block_delta".into(), 0, "thinking_delta".into()),
+                    ("content_block_stop".into(), 0, String::new()),
+                    ("content_block_start".into(), 1, "text".into()),
+                    ("content_block_delta".into(), 1, "text_delta".into()),
+                    ("content_block_stop".into(), 1, String::new()),
+                    ("content_block_start".into(), 2, "thinking".into()),
+                    ("content_block_delta".into(), 2, "thinking_delta".into()),
+                    ("content_block_stop".into(), 2, String::new()),
+                    ("content_block_start".into(), 3, "text".into()),
+                    ("content_block_delta".into(), 3, "text_delta".into()),
+                    ("content_block_stop".into(), 3, String::new()),
+                ],
+                "a late reasoning fragment gets a block of its own rather than being dropped: \
+             spelled {key:?}"
+            );
+        }
     }
 
     /// Both fields in one chunk: the reasoning still precedes the answer, and
@@ -1038,77 +1100,103 @@ mod tests {
 
     #[test]
     fn reasoning_fragments_are_dropped_when_the_policy_switch_is_off() {
-        let events = synthesize_with(
-            &[
-                &reasoning_chunk("secret thoughts"),
-                &text_chunk("answer"),
-                &finish_chunk("stop"),
-                "data: [DONE]\n\n",
-            ],
-            false,
-        );
+        for key in REASONING_KEYS {
+            let events = synthesize_with(
+                &[
+                    &reasoning_chunk_keyed(key, "secret thoughts"),
+                    &text_chunk("answer"),
+                    &finish_chunk("stop"),
+                    "data: [DONE]\n\n",
+                ],
+                false,
+            );
 
-        assert_eq!(
-            shape(&events),
-            vec![
-                ("content_block_start".into(), 0, "text".into()),
-                ("content_block_delta".into(), 0, "text_delta".into()),
-                ("content_block_stop".into(), 0, String::new()),
-            ],
-            "the text block takes index 0: no gap where the thinking block would have been"
-        );
+            assert_eq!(
+                shape(&events),
+                vec![
+                    ("content_block_start".into(), 0, "text".into()),
+                    ("content_block_delta".into(), 0, "text_delta".into()),
+                    ("content_block_stop".into(), 0, String::new()),
+                ],
+                "spelled {key:?}: the text block takes index 0, with no gap where the \
+                 thinking block would have been"
+            );
+        }
     }
 
     #[test]
     fn empty_reasoning_fragments_open_no_thinking_block() {
-        let events = synthesize(&[
-            &reasoning_chunk(""),
-            &frame(json!({
-                "id": "chatcmpl-1",
-                "model": "target/Model",
-                "choices": [{"index": 0, "delta": {"reasoning_content": Value::Null}}],
-            })),
-            &text_chunk("answer"),
-            &finish_chunk("stop"),
-            "data: [DONE]\n\n",
-        ]);
+        for key in REASONING_KEYS {
+            let events = synthesize(&[
+                &reasoning_chunk_keyed(key, ""),
+                &frame(json!({
+                    "id": "chatcmpl-1",
+                    "model": "target/Model",
+                    "choices": [{"index": 0, "delta": {key: Value::Null}}],
+                })),
+                &text_chunk("answer"),
+                &finish_chunk("stop"),
+                "data: [DONE]\n\n",
+            ]);
 
-        assert_eq!(
-            shape(&events),
-            vec![
-                ("content_block_start".into(), 0, "text".into()),
-                ("content_block_delta".into(), 0, "text_delta".into()),
-                ("content_block_stop".into(), 0, String::new()),
-            ]
-        );
+            assert_eq!(
+                shape(&events),
+                vec![
+                    ("content_block_start".into(), 0, "text".into()),
+                    ("content_block_delta".into(), 0, "text_delta".into()),
+                    ("content_block_stop".into(), 0, String::new()),
+                ],
+                "spelled {key:?}"
+            );
+        }
     }
 
     /// A turn that reasons and then calls a tool. The `tool_use` block must not
-    /// end up ahead of the thinking that led to it, nor share its index.
+    /// end up ahead of the thinking that led to it, nor share its index — and
+    /// that has to hold whether the two arrive in separate chunks (the observed
+    /// shape) or batched into one, where the order the translator reads the
+    /// delta's fields in is what decides.
     #[test]
     fn reasoning_before_a_tool_call_gets_its_own_earlier_block() {
-        let events = synthesize(&[
-            &reasoning_chunk("I should list the directory"),
-            &tool_chunk(json!({
-                "index": 0, "id": "call_1", "type": "function",
-                "function": {"name": "Bash", "arguments": "{\"command\":\"ls\"}"},
-            })),
-            &finish_chunk("tool_calls"),
-            "data: [DONE]\n\n",
-        ]);
+        let call = json!({
+            "index": 0, "id": "call_1", "type": "function",
+            "function": {"name": "Bash", "arguments": "{\"command\":\"ls\"}"},
+        });
+        let batched = frame(json!({
+            "id": "chatcmpl-1",
+            "model": "target/Model",
+            "choices": [{"index": 0, "delta": {
+                "reasoning_content": "I should list the directory",
+                "tool_calls": [call.clone()],
+            }}],
+        }));
+        let reasoning = reasoning_chunk("I should list the directory");
+        let tool = tool_chunk(call);
+        let finish = finish_chunk("tool_calls");
 
-        assert_eq!(
-            shape(&events),
+        for chunks in [
+            vec![batched.as_str(), finish.as_str(), "data: [DONE]\n\n"],
             vec![
-                ("content_block_start".into(), 0, "thinking".into()),
-                ("content_block_delta".into(), 0, "thinking_delta".into()),
-                ("content_block_stop".into(), 0, String::new()),
-                ("content_block_start".into(), 1, "tool_use".into()),
-                ("content_block_delta".into(), 1, "input_json_delta".into()),
-                ("content_block_stop".into(), 1, String::new()),
-            ]
-        );
-        assert_eq!(arguments_for(&events, 1), "{\"command\":\"ls\"}");
+                reasoning.as_str(),
+                tool.as_str(),
+                finish.as_str(),
+                "data: [DONE]\n\n",
+            ],
+        ] {
+            let events = synthesize(&chunks);
+            assert_eq!(
+                shape(&events),
+                vec![
+                    ("content_block_start".into(), 0, "thinking".into()),
+                    ("content_block_delta".into(), 0, "thinking_delta".into()),
+                    ("content_block_stop".into(), 0, String::new()),
+                    ("content_block_start".into(), 1, "tool_use".into()),
+                    ("content_block_delta".into(), 1, "input_json_delta".into()),
+                    ("content_block_stop".into(), 1, String::new()),
+                ]
+            );
+            assert_eq!(arguments_for(&events, 1), "{\"command\":\"ls\"}");
+        }
     }
 
     /// A stream that is nothing but reasoning still closes its block properly,

@@ -791,37 +791,46 @@ async fn a_streamed_fallback_response_is_translated_back_into_anthropic_events()
     assert!(relay.fallback.only().json()["stream"] == Value::Bool(true));
 }
 
-/// A provider that reasons: `reasoning_content` alongside `content`, in both
-/// response shapes. Modelled on real `moonshotai/Kimi-K3` traffic — reasoning
-/// fragments arrive first, then the answer.
-const REASONING_COMPLETION: &str = concat!(
-    r#"{"id":"chatcmpl-2","object":"chat.completion","model":"target/Big-Model","#,
-    r#""choices":[{"index":0,"message":{"role":"assistant","#,
-    r#""reasoning_content":"All but 9 run away, so 9 remain.","content":"9 sheep."},"#,
-    r#""finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5}}"#
-);
+/// A provider that reasons, in both response shapes. Modelled on real Together
+/// AI traffic: the reasoning arrives before the answer, and the key it arrives
+/// under depends on the model — `reasoning` on most (`Kimi-K2.7-Code`,
+/// `DeepSeek-V4-*`, `GLM-5.2`, …), `reasoning_content` on `Kimi-K3`. Both are
+/// driven through the route, because a route that only handles one spelling
+/// silently drops the reasoning on every other model.
+fn reasoning_completion(key: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"id":"chatcmpl-2","object":"chat.completion","model":"target/Big-Model","#,
+            r#""choices":[{{"index":0,"message":{{"role":"assistant","#,
+            r#""{key}":"All but 9 run away, so 9 remain.","content":"9 sheep."}},"#,
+            r#""finish_reason":"stop"}}],"usage":{{"prompt_tokens":3,"completion_tokens":5}}}}"#
+        ),
+        key = key
+    )
+}
 
-const REASONING_CHUNKS: [&str; 4] = [
-    concat!(
-        r#"data: {"id":"chatcmpl-2","object":"chat.completion.chunk","model":"target/Big-Model","#,
-        r#""choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"All but 9"},"#,
-        r#""finish_reason":null}]}"#,
-        "\n\n"
-    ),
-    concat!(
-        r#"data: {"id":"chatcmpl-2","object":"chat.completion.chunk","model":"target/Big-Model","#,
-        r#""choices":[{"index":0,"delta":{"content":"9 sheep."},"finish_reason":null}]}"#,
-        "\n\n"
-    ),
-    concat!(
-        r#"data: {"id":"chatcmpl-2","object":"chat.completion.chunk","model":"target/Big-Model","#,
-        r#""choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
-        "\n\n"
-    ),
-    "data: [DONE]\n\n",
-];
+/// `token_id` rides along on the providers that spell the key `reasoning`;
+/// included so the route is exercised against the real delta shape.
+fn reasoning_chunks(key: &str) -> String {
+    format!(
+        concat!(
+            r#"data: {{"id":"chatcmpl-2","object":"chat.completion.chunk","model":"target/Big-Model","#,
+            r#""choices":[{{"index":0,"delta":{{"role":"assistant","token_id":7,"#,
+            r#""{key}":"All but 9"}},"finish_reason":null}}]}}"#,
+            "\n\n",
+            r#"data: {{"id":"chatcmpl-2","object":"chat.completion.chunk","model":"target/Big-Model","#,
+            r#""choices":[{{"index":0,"delta":{{"content":"9 sheep."}},"finish_reason":null}}]}}"#,
+            "\n\n",
+            r#"data: {{"id":"chatcmpl-2","object":"chat.completion.chunk","model":"target/Big-Model","#,
+            r#""choices":[{{"index":0,"delta":{{}},"finish_reason":"stop"}}]}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        ),
+        key = key
+    )
+}
 
-fn reasoning_upstream(recorder: Recorder) -> Router {
+fn reasoning_upstream(recorder: Recorder, key: &'static str) -> Router {
     Router::new().route(
         "/v1/chat/completions",
         any(move |request: Request| {
@@ -829,11 +838,15 @@ fn reasoning_upstream(recorder: Recorder) -> Router {
             async move {
                 let body = record(&recorder, request).await;
                 if body["stream"] != Value::Bool(true) {
-                    return json(StatusCode::OK, REASONING_COMPLETION);
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(Body::from(reasoning_completion(key)))
+                        .expect("failed to build mock response");
                 }
                 Response::builder()
                     .header("content-type", "text/event-stream")
-                    .body(Body::from(REASONING_CHUNKS.concat()))
+                    .body(Body::from(reasoning_chunks(key)))
                     .expect("failed to build mock response")
             }
         }),
@@ -844,12 +857,12 @@ fn reasoning_upstream(recorder: Recorder) -> Router {
 /// rather than a parameter on `start`: every other test in this file wants the
 /// default, and threading a flag through all of them to serve two would be
 /// noise.
-async fn start_reasoning(surface: bool) -> Relay {
+async fn start_reasoning(surface: bool, key: &'static str) -> Relay {
     set_profile_keys();
     let anthropic = Recorder::default();
     let fallback = Recorder::default();
     let anthropic_addr = serve(anthropic_upstream(anthropic.clone(), true)).await;
-    let fallback_addr = serve(reasoning_upstream(fallback.clone())).await;
+    let fallback_addr = serve(reasoning_upstream(fallback.clone(), key)).await;
     let mut config = config(
         anthropic_addr,
         "all",
@@ -890,49 +903,56 @@ async fn fallback_content(relay: &Relay, stream: bool) -> Value {
     )
 }
 
-/// The config knob, end to end through the route rather than through the
-/// translator alone: nothing else proves `policy.surface_fallback_reasoning`
-/// is actually read on the request path.
+/// Both reasoning spellings, end to end through the route rather than through
+/// the translator alone: nothing else proves `policy.surface_fallback_reasoning`
+/// is actually read on the request path, and nothing else proves the route
+/// handles the common spelling as well as `Kimi-K3`'s.
 #[tokio::test]
 async fn the_fallbacks_reasoning_reaches_the_client_as_a_thinking_block() {
-    let relay = start_reasoning(true).await;
-    drive_to_limited(relay.addr).await;
+    for key in ["reasoning", "reasoning_content"] {
+        let relay = start_reasoning(true, key).await;
+        drive_to_limited(relay.addr).await;
+        assert_eq!(
+            fallback_content(&relay, false).await,
+            serde_json::json!([
+                {"type": "thinking", "thinking": "All but 9 run away, so 9 remain."},
+                {"type": "text", "text": "9 sheep."},
+            ]),
+            "spelled {key:?}"
+        );
 
-    assert_eq!(
-        fallback_content(&relay, false).await,
-        serde_json::json!([
-            {"type": "thinking", "thinking": "All but 9 run away, so 9 remain."},
-            {"type": "text", "text": "9 sheep."},
-        ])
-    );
-
-    let relay = start_reasoning(true).await;
-    drive_to_limited(relay.addr).await;
-    assert_eq!(
-        fallback_content(&relay, true).await,
-        serde_json::json!([
-            {"type": "thinking", "thinking": ""},
-            {"type": "text", "text": ""},
-        ])
-    );
+        let relay = start_reasoning(true, key).await;
+        drive_to_limited(relay.addr).await;
+        assert_eq!(
+            fallback_content(&relay, true).await,
+            serde_json::json!([
+                {"type": "thinking", "thinking": ""},
+                {"type": "text", "text": ""},
+            ]),
+            "spelled {key:?}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn surface_fallback_reasoning_false_restores_the_dropped_reasoning() {
-    let relay = start_reasoning(false).await;
-    drive_to_limited(relay.addr).await;
+    for key in ["reasoning", "reasoning_content"] {
+        let relay = start_reasoning(false, key).await;
+        drive_to_limited(relay.addr).await;
+        assert_eq!(
+            fallback_content(&relay, false).await,
+            serde_json::json!([{"type": "text", "text": "9 sheep."}]),
+            "spelled {key:?}"
+        );
 
-    assert_eq!(
-        fallback_content(&relay, false).await,
-        serde_json::json!([{"type": "text", "text": "9 sheep."}])
-    );
-
-    let relay = start_reasoning(false).await;
-    drive_to_limited(relay.addr).await;
-    assert_eq!(
-        fallback_content(&relay, true).await,
-        serde_json::json!([{"type": "text", "text": ""}])
-    );
+        let relay = start_reasoning(false, key).await;
+        drive_to_limited(relay.addr).await;
+        assert_eq!(
+            fallback_content(&relay, true).await,
+            serde_json::json!([{"type": "text", "text": ""}]),
+            "spelled {key:?}"
+        );
+    }
 }
 
 /// Global Constraint 6. The eligibility decision happened before any byte

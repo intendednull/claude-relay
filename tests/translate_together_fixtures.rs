@@ -7,6 +7,10 @@
 //! *vindicate* the translator's hand-built fixtures rather than finding bugs
 //! in it — nothing here changes translator behavior.
 //!
+//! Four more (`L_`–`O_`) were captured 2026-08-12 for Task 8's reasoning
+//! translation, against two models that spell the reasoning key differently; see
+//! the reasoning section at the bottom of this file.
+//!
 //! Every fixture is `include_bytes!`'d straight from `tests/fixtures/together/`
 //! rather than retyped into a Rust literal, so what each test asserts against
 //! is provably the bytes Together actually sent (`docs/spec.md` §7c's point
@@ -304,4 +308,209 @@ fn every_real_error_capture_is_openai_shaped() {
             "missing error.code (even if null): {value}"
         );
     }
+}
+
+// --- Reasoning (captured 2026-08-12; Task 8) ---
+//
+// Four more captures, later than the twelve above and against two reasoning
+// models. Same endpoint, same day's account in `docs/decisions.md`. They exist
+// because the reasoning field is not in OpenAI's schema at all *and* providers
+// did not converge on one name for it, so both shapes were worth pinning to real
+// bytes rather than to a hand-built guess:
+//
+// - `L_`/`M_` — `moonshotai/Kimi-K3`, which spells it `reasoning_content`.
+// - `N_`/`O_` — `moonshotai/Kimi-K2.7-Code`, which spells it `reasoning`, the
+//   common spelling (six other Together models measured the same day agree), and
+//   whose streamed deltas also carry a `token_id` nothing reads.
+//
+// One fixture per spelling per direction, deliberately: a golden file for only
+// one name is exactly how a translator that silently drops the other ships.
+
+/// Non-streaming: `reasoning_content` sits beside `content` in `message`, and
+/// becomes a `thinking` block ahead of the `text` block.
+#[test]
+fn a_real_reasoning_completion_becomes_a_thinking_block_then_a_text_block() {
+    let out = translate_response(include_bytes!(
+        "fixtures/together/L_nonstream_reasoning.json"
+    ));
+    assert_eq!(out["stop_reason"], "end_turn");
+    assert_eq!(
+        out["content"],
+        serde_json::json!([
+            {"type": "thinking",
+             "thinking": "The classic riddle: \"all but 9 run away\" means all except 9 run away, \
+                          so 9 remain."},
+            {"type": "text",
+             "text": "9 sheep remain, since \"all but 9\" means all except 9 ran away."},
+        ])
+    );
+}
+
+/// Streaming: `delta.reasoning_content` arrives in fragments *before* the first
+/// `delta.content` fragment — 9 then 5 in this capture — so the thinking block
+/// opens and closes as block 0 and the text block is block 1. The assertion is
+/// on the block structure rather than the fragment count, which is a property of
+/// this one generation.
+#[test]
+fn a_real_reasoning_stream_closes_its_thinking_block_before_opening_the_text_block() {
+    let events = replay_stream(include_bytes!(
+        "fixtures/together/M_stream_reasoning.raw.txt"
+    ));
+
+    let blocks: Vec<(&str, i64, &str)> = events
+        .iter()
+        .filter(|(name, _)| name.starts_with("content_block"))
+        .map(|(name, data)| {
+            (
+                name.as_str(),
+                data["index"]
+                    .as_i64()
+                    .expect("every block event has an index"),
+                data["content_block"]["type"]
+                    .as_str()
+                    .or_else(|| data["delta"]["type"].as_str())
+                    .unwrap_or(""),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        blocks.first(),
+        Some(&("content_block_start", 0, "thinking"))
+    );
+    assert_eq!(blocks.last(), Some(&("content_block_stop", 1, "")));
+    assert!(
+        blocks.iter().any(
+            |b| *b == ("content_block_stop", 0, "") || *b == ("content_block_start", 1, "text")
+        ),
+        "the thinking block must close before the text block opens: {blocks:?}"
+    );
+    // No third block, and no signature anywhere in the synthesized stream.
+    assert!(
+        blocks.iter().all(|(_, index, _)| *index < 2),
+        "unexpected extra blocks: {blocks:?}"
+    );
+    let thinking: String = events
+        .iter()
+        .filter(|(name, data)| name == "content_block_delta" && data["index"] == 0)
+        .map(|(_, data)| {
+            assert_eq!(data["delta"]["type"], "thinking_delta");
+            data["delta"]["thinking"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(
+        thinking,
+        "The classic riddle: \"all but 9 run away\" means all except 9 run away, so 9 remain.",
+        "the reassembled thinking text must match the non-streaming capture's reasoning"
+    );
+    let start = events
+        .iter()
+        .find(|(name, data)| name == "content_block_start" && data["index"] == 0)
+        .expect("a thinking block opened");
+    assert!(
+        start.1["content_block"].get("signature").is_none(),
+        "no signature on a block this relay synthesized: {}",
+        start.1
+    );
+}
+
+/// The other spelling, non-streaming: `reasoning` rather than `reasoning_content`,
+/// and the same `thinking`-then-`text` result.
+#[test]
+fn a_real_alt_key_reasoning_completion_becomes_a_thinking_block_then_a_text_block() {
+    let raw = include_bytes!("fixtures/together/N_nonstream_reasoning_alt_key.json");
+    // The capture really does use the other key — asserted rather than trusted,
+    // because the whole point of this fixture is which name arrived.
+    let captured: Value = serde_json::from_slice(raw).expect("capture is not valid JSON");
+    let message = &captured["choices"][0]["message"];
+    assert!(
+        message["reasoning"].is_string() && message.get("reasoning_content").is_none(),
+        "fixture must carry `reasoning` and not `reasoning_content`: {message}"
+    );
+
+    let out = translate_response(raw);
+    assert_eq!(out["stop_reason"], "end_turn");
+    assert_eq!(out["content"][0]["type"], "thinking");
+    assert_eq!(
+        out["content"][0]["thinking"], message["reasoning"],
+        "the thinking block carries the capture's reasoning verbatim"
+    );
+    assert!(
+        out["content"][0].get("signature").is_none(),
+        "no signature on a block this relay synthesized: {}",
+        out["content"][0]
+    );
+    assert_eq!(
+        out["content"][1],
+        serde_json::json!({"type": "text", "text": "Nine sheep remain."})
+    );
+    assert_eq!(out["content"].as_array().expect("an array").len(), 2);
+}
+
+/// The other spelling, streaming — and the one capture whose deltas carry
+/// `token_id`, an unmodelled key that must be ignored rather than rejected.
+#[test]
+fn a_real_alt_key_reasoning_stream_closes_its_thinking_block_before_the_text_block() {
+    let raw = include_bytes!("fixtures/together/O_stream_reasoning_alt_key.raw.txt");
+    let text = std::str::from_utf8(raw).expect("capture must be UTF-8");
+    assert!(
+        text.contains("\"reasoning\"") && !text.contains("\"reasoning_content\""),
+        "fixture must carry `reasoning` and not `reasoning_content`"
+    );
+    assert!(
+        text.contains("\"token_id\""),
+        "fixture must carry the token_id key this translator ignores"
+    );
+
+    let events = replay_stream(raw);
+    let blocks: Vec<(&str, i64, &str)> = events
+        .iter()
+        .filter(|(name, _)| name.starts_with("content_block"))
+        .map(|(name, data)| {
+            (
+                name.as_str(),
+                data["index"]
+                    .as_i64()
+                    .expect("every block event has an index"),
+                data["content_block"]["type"]
+                    .as_str()
+                    .or_else(|| data["delta"]["type"].as_str())
+                    .unwrap_or(""),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        blocks.first(),
+        Some(&("content_block_start", 0, "thinking"))
+    );
+    assert_eq!(blocks.last(), Some(&("content_block_stop", 1, "")));
+    assert!(
+        blocks.iter().all(|(_, index, _)| *index < 2),
+        "exactly two blocks, thinking then text: {blocks:?}"
+    );
+    // Reassembling the streamed thinking must give the same reasoning the
+    // non-streaming capture of the same model returned in one piece — modulo
+    // being a different generation, so only the shape is compared here.
+    let thinking: String = events
+        .iter()
+        .filter(|(name, data)| name == "content_block_delta" && data["index"] == 0)
+        .map(|(_, data)| {
+            assert_eq!(data["delta"]["type"], "thinking_delta");
+            data["delta"]["thinking"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert!(
+        thinking.len() > 40,
+        "the reasoning must survive reassembly, not arrive empty: {thinking:?}"
+    );
+    let answer: String = events
+        .iter()
+        .filter(|(name, data)| name == "content_block_delta" && data["index"] == 1)
+        .map(|(_, data)| data["delta"]["text"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        answer.contains("ine") && !answer.is_empty(),
+        "the answer must be the text block, not swallowed by the thinking one: {answer:?}"
+    );
 }

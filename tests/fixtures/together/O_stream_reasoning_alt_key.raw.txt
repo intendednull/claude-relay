@@ -1,0 +1,96 @@
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":""}}],"model":"moonshotai/Kimi-K2.7-Code"}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":"We"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" need"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" answer"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" the puzzle"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":":"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" farmer"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" has 17 sheep"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":", all but "}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":"9 run away."}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" How many remain?"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" Answer: 9"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":". Need one"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" short sentence. User"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" asked"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" think"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" step by step but"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" answer in one short"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" sentence. We"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" can include"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" reasoning?"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" They"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" said answer"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" in one short sentence"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":". Maybe"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" final"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" must"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" be one short sentence"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":". We"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" can just"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" provide"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" answer"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" with"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" brief"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" reasoning. Keep"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" final"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":" one"}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"","reasoning":"sentence."}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"Nine","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"Nine","reasoning":null}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":" sheep","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":" sheep","reasoning":null}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":" remain, because “","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":" remain, because “","reasoning":null}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"all but 9","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"all but 9","reasoning":null}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"” means exactly","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"” means exactly","reasoning":null}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":" ","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":" ","reasoning":null}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"9 stayed.","logprobs":null,"finish_reason":null,"delta":{"token_id":null,"role":"assistant","content":"9 stayed.","reasoning":null}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":"stop","delta":{"token_id":null,"role":"assistant","content":"","reasoning":null}}],"model":"moonshotai/Kimi-K2.7-Code","usage":null}
+
+data: {"id":"ovtS38F-2byqsH-a29ea135484eb9a6","object":"chat.completion.chunk","created":1786528791,"choices":[],"model":"moonshotai/Kimi-K2.7-Code","usage":{"prompt_tokens":37,"completion_tokens":100,"total_tokens":137,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":81}}}
+
+data: [DONE]
+

@@ -1,0 +1,32 @@
+{
+  "id": "ovtS2st-2byqsH-a29ea1302ab576d6",
+  "object": "chat.completion",
+  "created": 1786528791,
+  "model": "moonshotai/Kimi-K2.7-Code",
+  "system_fingerprint": "default",
+  "prompt": [],
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Nine sheep remain.",
+        "tool_calls": [],
+        "reasoning": "We need answer user's riddle. \"Think step by step\" requested but answer in one short sentence. We need perhaps include a brief reasoning? They ask think step by step. We can do step reasoning internally (this is analysis) and final answer one short sentence. Final: Nine sheep remain because all but nine ran away. That's one short sentence."
+      },
+      "finish_reason": "stop",
+      "seed": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 37,
+    "completion_tokens": 77,
+    "total_tokens": 114,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 71
+    }
+  }
+}
