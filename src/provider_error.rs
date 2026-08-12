@@ -60,10 +60,13 @@ const CONTEXT_LIMIT_MARKERS: [&str; 3] = [
     "context window",
 ];
 
-/// How much of an unrecognised body reaches the client as the message. Bounded
-/// because it is provider-controlled and unbounded, and counted in `char`s so the
-/// clip cannot split a multi-byte boundary. Independent of the log's own cap: this
-/// one is about what a client should be asked to render, that one about log volume.
+/// How much of a provider's message reaches the client. Every shape goes through
+/// this — an `error.message` is as provider-controlled and as unbounded as a raw
+/// body, and clipping only the snippet would leave a provider able to put a
+/// megabyte in the user's session transcript by choosing the ordinary field.
+/// Counted in `char`s so the clip cannot split a multi-byte boundary. Independent of
+/// the log's own cap: this one is about what a client should be asked to render,
+/// that one about log volume.
 const MESSAGE_SNIPPET_CHARS: usize = 512;
 
 impl ProviderError {
@@ -72,33 +75,29 @@ impl ProviderError {
         let error = parsed.as_ref().and_then(|value| value.get("error"));
         let field = |name: &str| error.and_then(|error| error.get(name))?.as_str();
 
-        // Three shapes, in order of how much they tell us. Reading only the first
-        // lost the provider's message entirely for the other two — a regression
-        // against the verbatim pass-through this replaced, where a flat body still
-        // reached the client's SDK, which prefers a top-level `message`.
-        let message = field("message")
-            .map(str::to_string)
-            // vLLM and several OpenAI-compatible servers put the sentence at the
-            // top level: `{"object":"error","message":…,"type":"BadRequestError"}`.
-            .or_else(|| {
-                parsed
-                    .as_ref()?
-                    .get("message")?
-                    .as_str()
-                    .map(str::to_string)
-            })
-            // Anything else — `{"detail":…}`, a `text/plain` 413, an HTML page from
-            // an intermediary. A bounded snippet of what arrived beats a sentence
-            // that says nothing: the operator has the log, the client's user has
-            // only this. Detection reads it too, so a plain-text "the input is
-            // longer than the model's context length" still rescues the session.
-            .or_else(|| snippet(body));
+        // The two shapes a provider *authored as a message*: the OpenAI/Anthropic
+        // `error.message`, and the top level, where vLLM and several
+        // OpenAI-compatible servers put it
+        // (`{"object":"error","message":…,"type":"BadRequestError"}`).
+        let authored = field("message").or_else(|| parsed.as_ref()?.get("message")?.as_str());
+
         Self {
             kind: anthropic_type(status, field("type")),
-            context_limit: message
-                .as_deref()
-                .and_then(|message| context_limit(status, message)),
-            message,
+            // **Detection reads only an authored message**, never the raw body.
+            // Reading the body meant deciding "the prompt did not fit" from bytes
+            // the provider never wrote as a message — and a pydantic-shaped 400
+            // echoes the rejected request back under `input`, so a *malformed*
+            // request whose own chat text mentions a context length was reshaped
+            // into a too-long claim built from the user's own numbers. The client
+            // then shrinks, retries the same malformed request, and loops. Neither
+            // the status gate nor the marker list can defend that: the status
+            // really is 400, and the marker arrives inside content the client sent.
+            context_limit: authored.and_then(|message| context_limit(status, message)),
+            // The client, though, still sees whatever arrived — an unrecognised
+            // shape included. A bounded snippet of a `{"detail":…}` body or a
+            // `text/plain` 413 beats a sentence that says nothing: the operator has
+            // the log, the client's user has only this.
+            message: authored.map(clipped_message).or_else(|| snippet(body)),
         }
     }
 
@@ -143,16 +142,18 @@ impl ProviderError {
     }
 }
 
+/// The single clip every client-visible message passes through.
+fn clipped_message(text: &str) -> String {
+    text.chars().take(MESSAGE_SNIPPET_CHARS).collect()
+}
+
 /// A clipped view of a body no recognised field could be read out of. `None` for
 /// one with nothing in it, which is the only case where the relay genuinely has
 /// nothing to report — a read that failed its cap, or an empty body.
 fn snippet(body: &[u8]) -> Option<String> {
-    let text: String = String::from_utf8_lossy(body)
-        .chars()
-        .take(MESSAGE_SNIPPET_CHARS)
-        .collect();
+    let text = String::from_utf8_lossy(body);
     let trimmed = text.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    (!trimmed.is_empty()).then(|| clipped_message(trimmed))
 }
 
 fn anthropic_type(status: StatusCode, provider_type: Option<&str>) -> &'static str {
@@ -546,6 +547,55 @@ mod tests {
         assert_eq!(counts(message), Some((170071, 131072)));
     }
 
+    /// Fix round 2's blocker, and the sharpest version of "not every 400 is a
+    /// context-limit error". A pydantic/FastAPI-shaped 400 echoes the rejected
+    /// request back under `input`, so the body carries the *client's own* chat text.
+    /// When detection read the raw body, a **malformed** request whose transcript
+    /// happened to mention a context length became a too-long claim built from the
+    /// user's own numbers — the client shrinks, retries the same malformed request,
+    /// fails identically, and loops. Neither guard can catch it: the status really is
+    /// 400, and the marker arrives inside content the client sent.
+    ///
+    /// So detection reads only a message the *provider* authored.
+    #[test]
+    fn a_body_that_echoes_the_request_back_is_not_read_as_a_context_limit() {
+        let body = concat!(
+            r#"{"detail":[{"type":"missing","loc":["body","messages",3,"content"],"#,
+            r#""msg":"Field required","input":{"messages":[{"role":"user","content":"#,
+            r#""my last run said 170071 tokens which is over the maximum context "#,
+            r#"length of 131072 - why?"}]}}]}"#
+        );
+        let error = read(400, body);
+        assert!(
+            error.context_limit.is_none(),
+            "the client's own words became a too-long claim"
+        );
+
+        // The user still sees what the provider said — blocker 5's fix is intact —
+        // but with none of Anthropic's recovery wording bolted onto it.
+        let message = error.client_message();
+        assert!(message.contains("Field required"), "{message}");
+        assert!(
+            !message.to_lowercase().contains("prompt is too long"),
+            "a malformed-request error must not carry the phrase: {message}"
+        );
+    }
+
+    /// The cost of that fix, taken knowingly: a `text/plain` body carrying a genuine
+    /// context-limit sentence is no longer detected, because nothing authored it as a
+    /// message. The asymmetry decides it — a false negative costs what already
+    /// happened before this task, a false positive is a loop that never terminates.
+    #[test]
+    fn an_unauthored_body_is_not_detected_even_when_its_wording_is_genuine() {
+        let error = read(
+            413,
+            "Request too large: the input is longer than the model's context length",
+        );
+        assert!(error.context_limit.is_none());
+        // Still surfaced, so the user is told the real reason.
+        assert!(error.client_message().contains("Request too large"));
+    }
+
     /// The failure this exists to prevent: a malformed request reshaped into a
     /// too-long claim, which the client answers by shrinking and retrying.
     #[test]
@@ -688,13 +738,29 @@ mod tests {
         }
     }
 
-    /// A snippet is bounded: an unrecognised body is provider-controlled and
-    /// unbounded, and it now reaches the client rather than only the log.
+    /// Every shape is bounded, not just the snippet. An `error.message` is as
+    /// provider-controlled as a raw body, so clipping only the snippet left a
+    /// provider able to put a megabyte in the user's session transcript by choosing
+    /// the ordinary field — measured at 900,000 chars before this was fixed.
     #[test]
-    fn an_unrecognised_body_is_clipped_before_it_reaches_the_client() {
+    fn every_shape_of_message_is_clipped_before_it_reaches_the_client() {
         let huge = "z".repeat(MESSAGE_SNIPPET_CHARS * 4);
-        let message = read(400, &huge).client_message();
-        assert_eq!(message.chars().count(), MESSAGE_SNIPPET_CHARS);
+        for body in [
+            // `error.message`
+            format!(r#"{{"error":{{"message":"{huge}","type":"invalid_request_error"}}}}"#),
+            // top-level `message`
+            format!(r#"{{"object":"error","message":"{huge}"}}"#),
+            // neither: the snippet path
+            huge.clone(),
+        ] {
+            let message = read(400, &body).client_message();
+            assert_eq!(
+                message.chars().count(),
+                MESSAGE_SNIPPET_CHARS,
+                "an unbounded message reached the client: {} chars",
+                message.chars().count()
+            );
+        }
     }
 
     /// The message is a JSON string, so a provider that puts quotes and newlines

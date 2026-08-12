@@ -327,10 +327,18 @@ So the relay emits `{"type":"error","error":{"type":…,"message":…}}`, and:
   ever converging. When no pair survives the checks the phrase goes *last* in the message
   instead, so no digit the provider sent sits where the extraction regex could read it as
   the pair. A wrong pair is worse than no pair.
-- **Not every 4xx is a context-limit error.** Detection needs both a plausible status
-  (400 or 413) and matching wording; reshaping a malformed request into a too-long claim
-  would send the client shrinking and retrying forever. Only Together's wording is
-  measured — the other patterns matched are unverified guesses at other providers.
+- **Not every 4xx is a context-limit error.** Detection needs a plausible status (400 or
+  413), matching wording, **and a message the provider itself authored** — the
+  `error.message` or top-level `message` field, never the raw body. That last condition is
+  not fussiness: a pydantic-shaped 400 echoes the rejected request back inside the body,
+  so reading the body let a *malformed* request whose own transcript mentioned a context
+  length become a too-long claim built from the user's own numbers, and the client would
+  shrink, retry the identical malformed request, and loop. Neither the status nor the
+  wording can catch that, because both are genuine. The cost is taken knowingly: a
+  `text/plain` body carrying a real context-limit sentence is surfaced to the user but not
+  detected. A false negative costs what happened before any of this existed; a false
+  positive is a loop that never ends. Only Together's wording is measured — the other
+  patterns matched are unverified guesses at other providers.
 - **The provider's raw body is logged**, capped and with the profile's own key redacted,
   since the envelope necessarily reshapes what was sent.
 

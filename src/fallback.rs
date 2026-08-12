@@ -462,21 +462,39 @@ fn clipped_for_log(body: &[u8]) -> String {
 /// above: neither the log nor the client's session transcript may be where a
 /// credential lands (Global Constraint 2).
 ///
-/// Uncapped, and applied to the whole body: the client-visible message is not
-/// clipped, so a cap here would only decide how much of the key survives.
+/// Applied to the whole body rather than a clipped view of it, because the clip
+/// happens downstream of here in two different places and a key straddling either
+/// boundary must not survive.
 fn redact_profile_key(body: Vec<u8>, api_key_env: &str) -> Vec<u8> {
-    match std::env::var(api_key_env) {
-        // A one-character value would redact every occurrence of that character
-        // and cannot be a real key.
-        Ok(key) if key.len() > 1 => replace_bytes(&body, key.as_bytes(), b"[REDACTED]"),
+    redact_key(body, std::env::var(api_key_env).ok().as_deref())
+}
+
+/// Split from the environment read so the floor can be tested without writing to
+/// the process environment.
+fn redact_key(body: Vec<u8>, key: Option<&str>) -> Vec<u8> {
+    match key {
+        Some(key) if key.len() >= MIN_REDACTABLE_KEY_LEN => {
+            replace_bytes(&body, key.as_bytes(), b"[REDACTED]")
+        }
         _ => body,
     }
 }
 
+/// A floor on what is treated as a key to redact. Not a guess at key formats — it
+/// is here because this redaction now runs *ahead of* the context-limit parse, so a
+/// placeholder value left in the environment (`=changeme`, `=token`, `=context`)
+/// would quietly eat words out of the provider's message and take the recovery with
+/// them: `context` alone stops detection firing at all, and `token` costs the token
+/// pair. Before the redaction moved in front of the parser a bad key could only
+/// mangle a log line. Real keys are far longer than this; anything shorter is a
+/// mistake, and a mistake should not be able to disable the recovery silently.
+const MIN_REDACTABLE_KEY_LEN: usize = 8;
+
 /// `str::replace` over bytes, because an error body need not be valid UTF-8 while
-/// the key always is. The replacement only ever lands inside a JSON string value,
-/// and `[REDACTED]` carries nothing JSON treats specially, so a redacted body still
-/// parses as whatever it was.
+/// the key always is. A redacted JSON body still parses in practice — `[REDACTED]`
+/// carries nothing JSON treats specially — but that is an observation about where a
+/// provider puts its key, not a property this can guarantee, and a body that stops
+/// parsing degrades to the snippet path rather than failing.
 fn replace_bytes(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(haystack.len());
     let mut rest = haystack;
@@ -644,6 +662,50 @@ mod tests {
         assert_eq!(
             endpoint(&profile, "/v1/messages", true),
             "https://api.example.com/v1/chat/completions"
+        );
+    }
+
+    /// Fix round 2. This redaction runs *ahead of* the context-limit parse, so a
+    /// placeholder value left in the environment would quietly eat words out of the
+    /// provider's message and take the recovery with it — `context` alone stops
+    /// detection firing, `token` costs the token pair. The floor is what keeps a
+    /// mistake in a config file from silently disabling the thing this route exists
+    /// for.
+    #[test]
+    fn a_placeholder_key_value_is_not_treated_as_a_key() {
+        const SENTENCE: &[u8] =
+            b"The input (170071 tokens) is longer than the model's context length (131072 tokens).";
+
+        for placeholder in ["context", "token", "70", "", "x"] {
+            assert_eq!(
+                redact_key(SENTENCE.to_vec(), Some(placeholder)),
+                SENTENCE.to_vec(),
+                "{placeholder:?} is a mistake, not a key, and must not touch the message"
+            );
+        }
+        assert_eq!(redact_key(SENTENCE.to_vec(), None), SENTENCE.to_vec());
+
+        // A real key still redacts, or the floor would have bought safety by doing
+        // nothing at all.
+        let key = "sk-together-0123456789abcdef";
+        let body = format!("Invalid API key provided: {key}.").into_bytes();
+        let redacted = redact_key(body, Some(key));
+        let text = String::from_utf8(redacted).expect("still UTF-8");
+        assert_eq!(text, "Invalid API key provided: [REDACTED].");
+    }
+
+    /// The reason the floor matters, stated as behaviour rather than as a comment:
+    /// with a placeholder key the provider's sentence survives intact, so detection
+    /// still fires and still reports the pair.
+    #[test]
+    fn a_placeholder_key_value_does_not_disable_context_limit_recovery() {
+        let body =
+            br#"{"error":{"message":"The input (170071 tokens) is longer than the model's context length (131072 tokens).","type":"invalid_request_error"}}"#;
+        let redacted = redact_key(body.to_vec(), Some("context"));
+        let error = ProviderError::read(StatusCode::BAD_REQUEST, &redacted);
+        assert_eq!(
+            error.context_limit.and_then(|limit| limit.counts),
+            Some((170071, 131072))
         );
     }
 
