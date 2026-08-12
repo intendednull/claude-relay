@@ -1,7 +1,7 @@
 pub mod capture;
 pub mod cli;
 pub mod config;
-pub mod control;
+pub(crate) mod control;
 pub mod detect;
 pub mod fallback;
 pub mod notify;
@@ -19,18 +19,19 @@ use axum::routing::{any, get};
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
-    // `control::routes` owns its own gating (spec §8b: loopback bind and
-    // loopback `Host`) and returns an empty router when disabled, so merging
-    // it in unconditionally is what keeps that gate reachable-by-construction
-    // rather than a condition this function has to remember to check.
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/status", get(status::status))
         .route("/v1/messages", any(proxy::forward))
         .route("/v1/messages/count_tokens", any(proxy::forward))
         .route("/v1/{*rest}", any(proxy::forward))
-        .merge(control::routes(&state.config))
-        .with_state(state)
+        .merge(control::routes());
+    // Applied last, over the whole router by request path — not scoped to
+    // `control::routes()`'s own sub-router — so a `/control/*` route
+    // registered anywhere, including one added here later, inherits the
+    // gate automatically instead of depending on being registered through
+    // `control::routes()` specifically (`control.rs`'s module doc).
+    control::install_gate(router, &state.config).with_state(state)
 }
 
 async fn healthz() -> &'static str {

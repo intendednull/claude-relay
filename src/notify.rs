@@ -2,6 +2,7 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -11,6 +12,14 @@ use crate::route_state::{RouteState, RouteTransition, rfc3339};
 /// How often a running hook is checked against its deadline. The notifier is
 /// out of band, so latency here costs nothing.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How long the worker blocks waiting on a queued transition before checking
+/// whether a `profile_switched` is pending (below). Short enough that a
+/// switch notification is never meaningfully delayed by an idle relay, long
+/// enough not to spin: `mpsc::Receiver::recv_timeout` wakes immediately on an
+/// actual send regardless of this value, so this only bounds how promptly an
+/// *idle* period is noticed.
+const SWITCH_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// A transition worth announcing (spec §4), plus `ProfileSwitched` for
 /// `POST /control/profile` (spec §8b) — not a route transition at all, which
@@ -88,27 +97,61 @@ fn env_vars(event: &NotifyEvent) -> [(&'static str, String); 3] {
 /// Handing the event over a channel keeps spawning, waiting and killing over
 /// here, where the only thing a slow hook can delay is the next notification.
 ///
+/// `events` and `pending_switch` are deliberately separate, not one queue:
+/// `failover_engaged`/`recovered` must never be dropped or reordered, and
+/// there is no plausible flood of them (route state only transitions on
+/// Anthropic's own responses). `profile_switched` can flood — any loopback
+/// caller can fire `POST /control/profile` as fast as it can send HTTP
+/// requests — so it gets a single coalescing slot instead of a queue: any
+/// number of switches in a row collapse to "the most recent one", which
+/// bounds how much they can delay a queued transition to at most one hook's
+/// `timeout_secs`, not N hooks run in series (`docs/decisions.md`'s R3
+/// entry has the measurements).
+///
 /// `Clone`: `AppState` hands one end to `RouteUpdates` and keeps another for
-/// `/control/profile` to fire `profile_switched` directly — both are the same
-/// underlying channel, so either can send without the other's cooperation.
+/// `/control/profile` to fire `profile_switched` directly — both point at the
+/// same channel and the same slot, so either can send without the other's
+/// cooperation.
 #[derive(Clone)]
 pub struct Notifier {
     /// `None` when no command is configured: no thread, no work, no error.
     events: Option<Sender<NotifyEvent>>,
+    /// `None` alongside `events`. Always `Some(ProfileSwitched { .. })` or
+    /// `None` when `events` is `Some` — nothing else is ever stored here.
+    pending_switch: Option<Arc<Mutex<Option<NotifyEvent>>>>,
 }
 
 impl Notifier {
     pub fn spawn(config: &NotifyConfig) -> Self {
         let Some(command) = config.command.clone() else {
-            return Self { events: None };
+            return Self {
+                events: None,
+                pending_switch: None,
+            };
         };
         let timeout = Duration::from_secs(config.timeout_secs);
         let (events, inbox) = mpsc::channel::<NotifyEvent>();
+        let pending_switch = Arc::new(Mutex::new(None::<NotifyEvent>));
+        let worker_switch = pending_switch.clone();
         thread::spawn(move || {
             // Ends when every clone of this `Notifier` is dropped — `AppState`
             // holds one directly and hands another to `RouteUpdates`, both the
             // same underlying `Sender`, so this outlives either alone.
-            while let Ok(event) = inbox.recv() {
+            loop {
+                let event = match inbox.recv_timeout(SWITCH_CHECK_INTERVAL) {
+                    // A transition is always handled the moment it's seen —
+                    // `recv_timeout` returns as soon as one is sent, it does
+                    // not wait out `SWITCH_CHECK_INTERVAL` — so a switch
+                    // sitting in `worker_switch` never runs ahead of one.
+                    Ok(event) => event,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let Some(event) = worker_switch.lock().expect("poisoned").take() else {
+                            continue;
+                        };
+                        event
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 // A panic here would otherwise end the thread, and every later
                 // event would vanish into a channel nobody reads.
                 if catch_unwind(AssertUnwindSafe(|| run(&command, timeout, event))).is_err() {
@@ -118,6 +161,7 @@ impl Notifier {
         });
         Self {
             events: Some(events),
+            pending_switch: Some(pending_switch),
         }
     }
 
@@ -133,12 +177,29 @@ impl Notifier {
     /// Same guarantee as `notify`, for an event that is not itself a route
     /// transition — `profile_switched` (spec §8b), fired directly by the
     /// `/control/profile` handler rather than derived from `RouteTransition`.
+    ///
+    /// Routes by variant, not by caller: a `ProfileSwitched` always lands in
+    /// the coalescing slot and everything else always lands on the FIFO
+    /// queue, so this is the one place that distinction has to be kept
+    /// straight, rather than every call site remembering which is which.
     pub fn notify_event(&self, event: NotifyEvent) {
-        let Some(events) = &self.events else {
-            return;
-        };
-        if events.send(event).is_err() {
-            tracing::warn!("notifier thread is gone; state changes are no longer announced");
+        match &event {
+            NotifyEvent::ProfileSwitched { .. } => {
+                let Some(pending_switch) = &self.pending_switch else {
+                    return;
+                };
+                *pending_switch.lock().expect("poisoned") = Some(event);
+            }
+            NotifyEvent::FailoverEngaged { .. } | NotifyEvent::Recovered => {
+                let Some(events) = &self.events else {
+                    return;
+                };
+                if events.send(event).is_err() {
+                    tracing::warn!(
+                        "notifier thread is gone; state changes are no longer announced"
+                    );
+                }
+            }
         }
     }
 }
@@ -468,6 +529,59 @@ mod tests {
             wait_for_file(&log, Duration::from_secs(10)).trim(),
             "recovered"
         );
+        let _ = fs::remove_file(&log);
+    }
+
+    /// R3: a flood of `profile_switched` must not delay a queued transition
+    /// proportionally to the flood's size. Each hook run sleeps, so a version
+    /// without the coalescing slot (a single FIFO queue instead) would run
+    /// every one of the 200 switches, in order, before ever reaching the
+    /// transition — this asserts that does not happen, with a real clock.
+    #[test]
+    fn a_flood_of_profile_switches_does_not_delay_a_queued_transition() {
+        let log = temp_path("flood");
+        let hook_delay = Duration::from_millis(150);
+        let notifier = Notifier::spawn(&NotifyConfig {
+            command: Some(format!(
+                r#"sleep {}; printf '%s\n' "$RELAY_EVENT" >> {}"#,
+                hook_delay.as_secs_f64(),
+                log.display()
+            )),
+            timeout_secs: 5,
+        });
+
+        for _ in 0..200 {
+            notifier.notify_event(NotifyEvent::ProfileSwitched {
+                name: "flood".to_string(),
+            });
+        }
+
+        let started = Instant::now();
+        notifier.notify(transition(RouteState::Active, limited(3600)));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let contents = fs::read_to_string(&log).unwrap_or_default();
+            if contents.lines().any(|line| line == "failover_engaged") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failover_engaged never arrived: {contents:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let elapsed = started.elapsed();
+
+        // A bound of a small constant number of hook executions, not 200:
+        // at most one switch could already be mid-run when the transition
+        // was sent, plus the transition's own run.
+        assert!(
+            elapsed < hook_delay * 4,
+            "200 queued profile_switched events must not delay failover_engaged \
+             by more than a couple of hook executions; took {elapsed:?}"
+        );
+
         let _ = fs::remove_file(&log);
     }
 }

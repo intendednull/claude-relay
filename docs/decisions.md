@@ -624,9 +624,20 @@ flagged and deferred — a second reviewer surfaced it, and the orchestrator
 ruled to fix it anyway, since the cost (one `Authority`-parse comparison) is
 far below the payoff (silent redirection of the user's LLM traffic to an
 attacker-chosen profile, from a page the user never knowingly gave this port
-to). `control::routes` applies it as middleware over both endpoints, in the
-same function that owns the bind gate, so a route added to this module later
-inherits both automatically rather than needing to remember either.
+to). `control::routes` applied it as middleware over both endpoints, in the
+same function that owns the bind gate.
+
+**Correction, fix round 2 (see that entry below): the previous paragraph's
+last clause was false, and a reviewer proved it two ways.** "A route added to
+this module later inherits both automatically" only held for a route added
+*inside* `control::routes()`'s own chain, and only *before* its `.layer()`
+call — a route appended after that `.layer()` escaped the `Host` check
+entirely (`Router::layer` wraps only what was registered before it), and a
+control route registered anywhere else in the crate (`lib.rs`, a future
+module) never went through this module at all, so it inherited nothing.
+Fixed by moving both gates to `install_gate`, applied once by *path* over the
+fully composed router — see the fix round 2 entry for what that actually
+guarantees, which is narrower than "automatically, unconditionally."
 
 **`profile_switched`'s `RELAY_DETAIL` packing (recorded above) stands, with
 one addendum:** a Milestone 4 `relay ctl` CLI wrapper parsing hook output
@@ -644,3 +655,135 @@ switch notified unconditionally, which meant a rapid run of no-op switches
 (the same name, or a client retrying a typo'd one) could queue ahead of a
 real `failover_engaged` on the notifier's single FIFO queue and delay it by
 the timeout of every wedged hook in front of it.
+
+## 2026-08-11 — Task 4 fix round 2: closing what round 1 left open
+
+A second adversarial pass on `4f0a3fb` found three things round 1's own fixes
+had opened or half-closed. None of these are new attack surface Task 4
+invented from nothing — R1 is a regression from round 1's own M2 item, R2 is
+round 1's I4 not actually landing, R3 is round 1's I2 only half-closing its
+own amplification — recorded here rather than folded silently into the round
+1 entries above, since a reader tracing *why* the code looks the way it does
+needs both what round 1 tried and why it wasn't enough.
+
+**R1 — the M2 fix (switch `switch_profile` off axum's `Json` extractor for a
+consistent error envelope) removed a CSRF defense nobody had named.** `Json`
+was doing double duty: besides parsing, it required `content-type:
+application/json`, which is not one of the three CORS-simple content types —
+so requiring it was *also* forcing a browser to preflight, and the
+preflight's own failure (no CORS headers on this API, ever) was blocking a
+cross-origin write before Task 4's own `Host` check ever had to. Replacing
+`Json` with `Bytes` + `serde_json::from_slice` kept the parsing behavior and
+silently dropped the content-type requirement, which reopened exactly the
+same class of hole the `Host` check exists to close — except this one needs
+no DNS rebinding at all: a page loaded directly at `http://127.0.0.1:<port>`
+has an honestly loopback `Host`, so the fix has to be a second, independent
+check, not a stronger version of the first.
+
+Fixed with two checks that defend different things, not one hardened check:
+`switch_profile` requires `content-type: application/json` explicitly (415,
+same JSON envelope, restoring the preflight); and `install_gate` (below)
+independently rejects a `Sec-Fetch-Site` that isn't `same-origin`/`none` or
+an `Origin` that isn't loopback, when either header is present.
+`Sec-Fetch-Site`/`Origin` are attached by the browser and cannot be
+overridden by page script, so — unlike `Host` — no rebinding-shaped trick
+gets around them; a request carrying neither is simply not a browser request
+and passes through unaffected (`curl`, `relay ctl`, this project's own
+tests). The lesson generalized rather than just patched: replacing one
+extractor for a cosmetic reason can silently remove whatever behavior rode
+along with it, and that is worth checking for deliberately when a fix touches
+a request-parsing path on a security-relevant route, not just verifying the
+requested change in isolation.
+
+**R2 — the `Host` gate was a property of `control::routes()`, not of the
+path `/control/*`, and a reviewer proved those are different things.**
+Two demonstrated bypasses, not a hypothetical: (a) `Router::layer` wraps only
+routes registered *before* it in the same chain, so a route appended after
+`routes()`'s `.layer()` call skipped the check entirely; (b) a control route
+registered anywhere *else* — `lib.rs`, a different module, which is
+precisely what Milestone 4's own `POST /control/mode` will be — never went
+through `control::routes()` at all, so "the gate" was never in its path to
+begin with. The reviewer reproduced both against a live probe route with
+`cargo test` green throughout, which is the sharpest possible demonstration
+that route-registration-scoped gating cannot be the right shape: passing
+tests say nothing about a route the tests never registered.
+
+Fixed by moving both checks (bind-loopback and `Host`-loopback, plus R1's
+origin checks) into `install_gate`, a middleware applied once, last, to the
+*fully composed* application router in `build_router`, matched on
+`request.uri().path().starts_with("/control")`. This is keyed on the
+request, not on which function built the route, so it does not matter where
+or in what order a `/control/*` route was registered — `routes()` itself no
+longer even calls `enabled()` or attaches a layer; it just registers paths.
+
+**What this guarantees is narrower than "any control route, ever, forever",
+and that narrower claim is the honest one.** `install_gate` still has to be
+the *last* operation `build_router` performs on the router before
+`.with_state` — a route chained on after that call would, once again, never
+pass through it. The improvement is that this is now **one call site** to
+get right (`build_router`, a single function, reviewed once) instead of
+**every future control-route addition anywhere in the crate** each needing
+to remember to opt in. `control.rs`'s own module doc and this round's tests
+(`a_control_route_registered_outside_routes_still_inherits_the_gate`,
+`install_gate_does_not_touch_paths_outside_control`) say exactly this, not
+more.
+
+**Verified rather than assumed: no path spelling reaches a control handler
+while evading the `/control` string-prefix check.** Percent-encoding
+(`/%63ontrol/profiles`), doubled slashes (leading, internal), a trailing
+slash, case variation, and a trailing NUL were all tried against a live,
+control-enabled relay. All 404 — axum's router (`matchit`) matches route
+segments literally, with no percent-decoding, case-folding, or slash
+collapsing before matching, so anything that would evade the prefix check
+also fails to reach *any* handler through axum's own routing, gate or no
+gate. This was checked empirically (`tests/control.rs`), not concluded from
+reading `matchit`'s source, since the fix's correctness rests on it.
+
+**Two hardening-only `Host` parser laxities, closed alongside, neither
+independently exploitable:** `Authority::from_str` accepts (and discards)
+userinfo, so `evil.tld@localhost` previously read as loopback via
+`.host()`; no compliant client sends `@` in a `Host` value, so its mere
+presence is now rejected outright. And more than one `Host` header, previously
+resolved by taking the first, is now rejected per RFC 9112's "exactly one" —
+picking a "winner" between two `Host` values is the kind of ambiguity
+request-smuggling attacks are built from, even though nothing here is
+reachable that way today.
+
+**R3 — comparing values (round 1's I2 fix) closed the no-op case, not the
+flood.** A switch to a *different* profile every time is a real change by
+that comparison's own logic, so alternating `POST /control/profile` between
+two valid names was never a no-op and queued every time, same as before I2.
+Measured against the fix from round 1: 60 alternating switches (hook
+sleeping 3s, `timeout_secs = 60`) queued 60 hook invocations in 21ms and
+reproduced the original serial drain — 100 of them reproduce the full
+~100-minute delay to the next real `failover_engaged`. R1's fix removes the
+purely browser-driven version of this flood, but a local process (or a
+`relay ctl` script bug) should not be able to delay the operator's
+rate-limit notification by an hour either way.
+
+**Fixed by giving `profile_switched` a coalescing slot instead of a place in
+the same FIFO queue `failover_engaged`/`recovered` use** (`Notifier`,
+`src/notify.rs`): `notify_event` routes by variant, a route-state event
+always goes on the `mpsc` channel (unbounded, FIFO, never dropped — there is
+no plausible flood of these, since they only fire on Anthropic's own
+responses), and `ProfileSwitched` always overwrites a single `Mutex<Option<
+NotifyEvent>>` slot instead. The worker thread blocks on the channel with a
+short (`50ms`) timeout; a transition arriving wakes it immediately regardless
+of that value (`recv_timeout` does not wait out the timeout once something is
+sent), and only on an *idle* tick does it check the slot. Any number of
+switches in a row collapse to "the most recent one," so the worst case a
+flood can add ahead of a queued transition is one already-in-flight switch
+hook's run time (bounded by `timeout_secs`, ≤60s) — not N hooks run in
+series. This is the "priority (transitions ahead of switches)" shape the fix
+round's own text offered as an acceptable alternative to bounding the queue,
+chosen over a bounded/dropping channel because `std::sync::mpsc` has no
+built-in way to reorder or peek a FIFO queue, so two channels (or a channel
+plus a slot) was the option available without a new dependency — explicitly
+out of scope for this fix.
+
+**Both an isolated unit test (`notify.rs`, 200 queued switches, no HTTP
+involved) and the reviewer's exact alternating-`POST` shape at the HTTP
+surface (`tests/control.rs`, 60 alternating switches driving a real
+`failover_engaged` through limit detection) demonstrate the bound, with real
+elapsed time asserted in each** — not just the no-op case R3's own text
+warned was insufficient this round.

@@ -118,10 +118,11 @@ reset_jitter_secs = [15, 60]
 # The command runs through `sh -c`, so it can be a whole shell line rather than
 # only a path to a script. It receives the event in its environment:
 #
-#   RELAY_EVENT     failover_engaged | recovered
+#   RELAY_EVENT     failover_engaged | recovered | profile_switched
 #   RELAY_RESET_AT  RFC3339 window end for failover_engaged, empty otherwise
 #                   (the same value /status reports as `limited_until`)
-#   RELAY_DETAIL    a one-line human-readable summary
+#   RELAY_DETAIL    a one-line human-readable summary — for profile_switched,
+#                   this is the only place the switched-to name appears
 #
 # It is fire-and-forget: nothing about a request waits on it, its output is
 # whatever it writes to the relay's own stdout/stderr, and a command that has

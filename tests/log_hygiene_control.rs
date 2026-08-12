@@ -51,7 +51,9 @@ async fn get(relay: std::net::SocketAddr, path: &str) -> (StatusCode, String) {
 
 async fn post(relay: std::net::SocketAddr, path: &str, body: Value) -> (StatusCode, String) {
     // `reqwest`'s `json` feature isn't enabled here (see `Cargo.toml`), and
-    // axum's `Json` extractor requires the content-type header regardless.
+    // `switch_profile` itself now requires this header explicitly (R1: a
+    // wrong or missing content type is a CORS-preflight-defeating CSRF
+    // vector, not just an inconvenience).
     let response = reqwest::Client::new()
         .post(format!("http://{relay}{path}"))
         .header("content-type", "application/json")

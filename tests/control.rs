@@ -591,3 +591,276 @@ async fn control_routes_are_absent_on_a_non_loopback_configured_listen() {
         .expect("request failed");
     assert_eq!(healthz.status(), StatusCode::OK);
 }
+
+/// R1: last round's fix for the malformed-body error envelope (M2) dropped
+/// axum's `Json` extractor, which was also enforcing `content-type:
+/// application/json` — a content type that is not CORS-simple, so its
+/// absence removed the CORS preflight a browser would otherwise be forced
+/// into. Restoring the requirement explicitly (415 in this endpoint's own
+/// envelope) is half the fix; `control_rejects_cross_origin_fetch_metadata`
+/// below is the other half.
+#[tokio::test]
+async fn post_control_profile_requires_json_content_type() {
+    let relay = two_profile_relay().await;
+
+    // The three content types a plain HTML <form> can send without a
+    // preflight, plus no content-type at all.
+    for content_type in [
+        Some("text/plain"),
+        Some("text/plain;charset=UTF-8"),
+        Some("application/x-www-form-urlencoded"),
+        Some("multipart/form-data; boundary=x"),
+        None,
+    ] {
+        let mut request = client()
+            .post(format!("http://{relay}/control/profile"))
+            .body(r#"{"name":"profile-b"}"#);
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        let response = request.send().await.expect("request failed");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{content_type:?}"
+        );
+        let body: Value =
+            serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+                .expect("error body must be JSON");
+        assert_eq!(body["error"], "unsupported_content_type");
+    }
+
+    // None of the above may have applied.
+    let listed = get_json(relay, "/control/profiles").await;
+    assert_eq!(
+        by_name(listed["profiles"].as_array().expect("array"), "profile-a")["active"],
+        true
+    );
+}
+
+/// R1's second half: `Sec-Fetch-Site`/`Origin` are attached by the browser
+/// itself and cannot be forged from page script, unlike `Host` — so unlike
+/// the DNS-rebinding case, no rebinding trick is available here, and a plain
+/// content-type check alone would still miss a request a browser bug or a
+/// non-preflight-respecting client could produce.
+#[tokio::test]
+async fn control_rejects_cross_origin_fetch_metadata_and_origin() {
+    let relay = two_profile_relay().await;
+
+    let cross_site = client()
+        .post(format!("http://{relay}/control/profile"))
+        .header("content-type", "application/json")
+        .header("sec-fetch-site", "cross-site")
+        .body(r#"{"name":"profile-b"}"#)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(cross_site.status(), StatusCode::NOT_FOUND);
+
+    let foreign_origin = client()
+        .post(format!("http://{relay}/control/profile"))
+        .header("content-type", "application/json")
+        .header("origin", "http://evil.example")
+        .body(r#"{"name":"profile-b"}"#)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(foreign_origin.status(), StatusCode::NOT_FOUND);
+
+    // Neither header present at all: not a browser request (curl, `relay
+    // ctl`, this test's own earlier requests) and must not be rejected on
+    // that basis alone.
+    let (status, _) = post_json(relay, "/control/profile", json!({"name": "profile-b"})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A genuinely same-origin browser request is unaffected.
+    let same_origin = client()
+        .post(format!("http://{relay}/control/profile"))
+        .header("content-type", "application/json")
+        .header("sec-fetch-site", "same-origin")
+        .header("origin", "http://127.0.0.1")
+        .body(r#"{"name":"profile-a"}"#)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(same_origin.status(), StatusCode::OK);
+}
+
+/// The exact browser `no-cors` shape the reviewer demonstrated live against
+/// the pre-fix code (`text/plain` content type, cross-site fetch metadata,
+/// hitting the loopback bind directly — no DNS rebinding involved at all).
+/// Rejected at the gate (404), before `switch_profile`'s own content-type
+/// check ever runs, which is also why this is 404 and not 415.
+#[tokio::test]
+async fn the_reported_csrf_shape_is_rejected() {
+    let relay = two_profile_relay().await;
+
+    let response = client()
+        .post(format!("http://{relay}/control/profile"))
+        .header("origin", "http://evil.example")
+        .header("sec-fetch-site", "cross-site")
+        .header("sec-fetch-mode", "no-cors")
+        .header("content-type", "text/plain;charset=UTF-8")
+        .body(r#"{"name":"profile-b"}"#)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let listed = get_json(relay, "/control/profiles").await;
+    assert_eq!(
+        by_name(listed["profiles"].as_array().expect("array"), "profile-a")["active"],
+        true,
+        "the switch must not have applied"
+    );
+}
+
+/// R2's first "verify rather than assume": no path spelling should both
+/// reach a control handler *and* evade the `/control` prefix the gate
+/// matches on. Run against an enabled (loopback) relay, so a bypass would
+/// show up as a 200 rather than being masked by the bind already being
+/// disabled.
+#[tokio::test]
+async fn no_path_spelling_reaches_a_control_handler_while_evading_the_gate() {
+    let relay = two_profile_relay().await;
+    for path in [
+        "/%63ontrol/profiles",  // percent-encoded 'c'
+        "//control/profiles",   // doubled leading slash
+        "/control/profiles/",   // trailing slash
+        "/CONTROL/profiles",    // case variation
+        "/Control/Profiles",    // mixed case
+        "/control%2Fprofiles",  // encoded slash instead of a real one
+        "/control/profiles%00", // trailing NUL
+        "/control//profiles",   // doubled internal slash
+    ] {
+        let response = client()
+            .get(format!("http://{relay}{path}"))
+            .header("host", "localhost")
+            .send()
+            .await
+            .unwrap_or_else(|err| panic!("{path}: request failed: {err}"));
+        assert_ne!(
+            response.status(),
+            StatusCode::OK,
+            "{path} must not reach a control handler (got {})",
+            response.status()
+        );
+    }
+}
+
+/// R2's second "verify rather than assume": the path-based gate must not
+/// sweep up `/status`, on a bind where `/control/*` is disabled *and* with a
+/// forged `Host` — the strongest version of "this route is unaffected".
+#[tokio::test]
+async fn status_remains_ungated_by_the_control_gate() {
+    let anthropic = common::closed_port().await;
+    let a = serve(upstream_ok(BODY_A)).await;
+    let b = serve(upstream_ok(BODY_B)).await;
+    let mut cfg = config(anthropic, a, b);
+    cfg.listen = "0.0.0.0:8484".to_string();
+    let state = AppState::new(Arc::new(cfg), None, "digest".to_string()).expect("should build");
+    let relay = serve(build_router(state)).await;
+
+    let response = client()
+        .get(format!("http://{relay}/status"))
+        .header("host", "evil.example")
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "/status must not be gated by the control-only Host/bind check"
+    );
+}
+
+const LIMIT_BODY: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"You have reached your Claude Pro usage limit. Your limit will reset at 6pm."}}"#;
+
+fn anthropic_limit_upstream() -> Router {
+    Router::new().route(
+        "/v1/limit",
+        any(|| async {
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("content-type", "application/json")
+                .header("retry-after", "3600")
+                .body(Body::from(LIMIT_BODY))
+                .expect("failed to build mock response")
+        }),
+    )
+}
+
+async fn drive_to_limited(relay: SocketAddr) {
+    let response = client()
+        .get(format!("http://{relay}/v1/limit"))
+        .send()
+        .await
+        .expect("limit request failed");
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    response.bytes().await.expect("failed to read limit body");
+    for _ in 0..200 {
+        if get_json(relay, "/status").await["state"] == "LIMITED" {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the relay never reached LIMITED");
+}
+
+/// R3, demonstrated at the HTTP surface with the exact shape the reviewer
+/// measured: alternating `POST /control/profile` switches, not the no-op
+/// case I2 already closed (switching A/B/A/B... is a real change every
+/// time). Each hook run sleeps, so the pre-fix single-FIFO-queue design
+/// would have run every one of the 60 switches, in order, before ever
+/// reaching `failover_engaged` — the reviewer measured the 100-switch
+/// version of this at roughly 100 minutes. This asserts it does not
+/// reproduce, with the actual elapsed time in the failure message.
+#[tokio::test]
+async fn a_flood_of_alternating_profile_switches_does_not_delay_failover_engaged() {
+    let log = unique_temp_dir("control-flood").with_extension("log");
+    let anthropic = serve(anthropic_limit_upstream()).await;
+    let a = serve(upstream_ok(BODY_A)).await;
+    let b = serve(upstream_ok(BODY_B)).await;
+    let mut cfg = config(anthropic, a, b);
+    let hook_delay_secs = 0.15;
+    cfg.notify = NotifyConfig {
+        command: Some(format!(
+            r#"sleep {hook_delay_secs}; printf '%s\n' "$RELAY_EVENT" >> {}"#,
+            log.display()
+        )),
+        timeout_secs: 5,
+    };
+    let relay = serve_relay_with(cfg, None).await;
+
+    for i in 0..60 {
+        let name = if i % 2 == 0 { "profile-a" } else { "profile-b" };
+        let (status, _) = post_json(relay, "/control/profile", json!({"name": name})).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let started = Instant::now();
+    drive_to_limited(relay).await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let contents = std::fs::read_to_string(&log).unwrap_or_default();
+        if contents.lines().any(|line| line == "failover_engaged") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "failover_engaged never arrived: {contents:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "60 alternating profile switches (each hook sleeping {hook_delay_secs}s) \
+         must not delay failover_engaged by anywhere near 60 hook executions; \
+         took {elapsed:?}"
+    );
+
+    let _ = std::fs::remove_file(&log);
+}

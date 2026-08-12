@@ -124,8 +124,13 @@ file or restarting:
 
 ```
 curl http://127.0.0.1:8484/control/profiles
-curl -X POST http://127.0.0.1:8484/control/profile -d '{"name":"deepseek"}'
+curl -X POST http://127.0.0.1:8484/control/profile \
+  -H 'content-type: application/json' -d '{"name":"deepseek"}'
 ```
+
+`content-type: application/json` is required on the `POST` — see below for
+why; a plain `curl -d` without `-H` defaults to a different content type and
+gets rejected.
 
 `GET /control/profiles` lists every configured profile's `name`, `format`,
 `serves`, `model_map` and `api_key_env` (the env var *name*, never its
@@ -138,12 +143,20 @@ when it does.
   want a change to stick.
 - **Applies to new requests only.** A request already in flight finishes on
   the profile it started with, even if a switch lands mid-response.
-- **Loopback-only, code-enforced.** Disabled outright if `listen` is ever
-  non-loopback. Independently of that, every request must also carry a
-  loopback (or `localhost`) `Host` header — otherwise DNS rebinding (an
-  attacker's own domain resolving to 127.0.0.1) could reach this from a
-  browser tab despite the bind being loopback. Either check failing looks
-  like the route was never registered (404), not a permission error.
+- **Loopback-only, code-enforced, on three separate axes.** Disabled
+  outright if `listen` is ever non-loopback. Independently of that, every
+  request must also carry a loopback (or `localhost`) `Host` header —
+  otherwise DNS rebinding (an attacker's own domain resolving to
+  `127.0.0.1`) could reach this from a browser tab despite the bind being
+  loopback. And independently of *that*, a browser-originated request must
+  look same-origin (`Sec-Fetch-Site`/`Origin`, when either is present) and
+  `POST /control/profile` requires `content-type: application/json` — a page
+  loaded directly from `http://127.0.0.1:<port>` has an honestly loopback
+  `Host` with no rebinding involved, so a state-changing request from a
+  cross-origin tab needs its own check. All three failing look like the
+  route was never registered (404) — a plain wrong content type is the one
+  exception, which is a `415` naming the problem, since by that point the
+  request already passed the other checks.
 - Fires the notifier's `profile_switched` event (below) — but only when the
   switch is a real change; switching to the profile that is already active,
   or a rejected switch, notifies nothing.
