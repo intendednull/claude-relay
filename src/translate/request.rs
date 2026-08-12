@@ -46,6 +46,7 @@ fn convert(request: MessagesRequest, target_model: &str, stream: bool) -> Result
         let converted = match message.role.as_str() {
             "user" => user_messages(&message.content),
             "assistant" => assistant_message(&message.content).map(|m| vec![m]),
+            "system" => system_messages(&message.content),
             other => bail!("unsupported message role {other:?}"),
         };
         messages.extend(converted.with_context(|| format!("in messages[{position}]"))?);
@@ -89,6 +90,40 @@ fn system_text(system: &SystemPrompt) -> Result<Option<String>> {
         }
     };
     Ok((!text.is_empty()).then_some(text))
+}
+
+/// A real Claude Code request carries a `role: "system"` entry *inside*
+/// `messages` as well as the top-level `system` prompt, so refusing the role
+/// made the whole fallback route unusable from the actual client (observed
+/// end to end: every request 502'd as `fallback_request_untranslatable`).
+/// OpenAI has a native `system` role, so this translates rather than drops.
+///
+/// Positional order is preserved instead of merging into the leading system
+/// message: the two carry different content, and hoisting would silently
+/// reorder instructions relative to the user turn between them.
+fn system_messages(content: &MessageContent) -> Result<Vec<Message>> {
+    let text = match content {
+        MessageContent::Text(text) => text.clone(),
+        MessageContent::Blocks(blocks) => {
+            let mut texts = Vec::new();
+            for block in blocks {
+                match block {
+                    Block::Known(KnownBlock::Text { text }) => texts.push(text.clone()),
+                    Block::Known(KnownBlock::Thinking {} | KnownBlock::RedactedThinking {}) => {
+                        note_dropped_thinking(block)
+                    }
+                    other if other.is_unmappable() => texts.push(dropped_block_note(other)),
+                    other => bail!("{} block in a system message", other.problem()),
+                }
+            }
+            texts.join(BLOCK_JOIN)
+        }
+    };
+    Ok(if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![Message::new("system", Content::Text(text))]
+    })
 }
 
 /// One Anthropic user turn can become several OpenAI messages: each
@@ -1110,12 +1145,39 @@ mod tests {
         );
     }
 
+    /// Regression, found by running a real `claude -p` session through the
+    /// relay rather than by any fixture: Claude Code sends a `role: "system"`
+    /// entry *inside* `messages` as well as the top-level `system` prompt, so
+    /// refusing the role made every fallback request fail as
+    /// `fallback_request_untranslatable`. No hand-built fixture caught it
+    /// because none was shaped like the real client's request.
     #[test]
-    fn an_unsupported_role_fails_loudly() {
-        let message = error(json!({
-            "messages": [{"role": "system", "content": "no"}],
+    fn a_system_role_inside_messages_is_translated_in_place() {
+        let out = translate(json!({
+            "system": "You are Claude Code.",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": [{"type": "text", "text": "Session context."}]},
+            ],
         }));
-        assert!(message.contains("system"), "unexpected error: {message}");
+
+        assert_eq!(
+            out["messages"],
+            json!([
+                {"role": "system", "content": "You are Claude Code."},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Session context."},
+            ]),
+            "the in-messages system turn must survive translation, in position"
+        );
+    }
+
+    #[test]
+    fn a_genuinely_unsupported_role_still_fails_loudly() {
+        let message = error(json!({
+            "messages": [{"role": "developer", "content": "no"}],
+        }));
+        assert!(message.contains("developer"), "unexpected error: {message}");
     }
 
     #[test]
