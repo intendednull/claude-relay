@@ -59,7 +59,10 @@ format = "unix-seconds"
 # profile, whatever Anthropic path the client called, and the client's own path
 # for an "anthropic" one. It must be https unless the host is loopback: this is
 # where the profile's own API key travels, and plaintext off this machine is
-# refused at startup rather than leaked once per request.
+# refused at startup rather than leaked once per request. It must also not carry
+# userinfo (`https://user:secret@host`) — a credential there is silently
+# discarded rather than sent, so it is refused at startup instead of sitting in
+# this file doing nothing; the key goes in the env var `api_key_env` names.
 #
 # `api_key_env` names an environment variable the relay reads at request time.
 # The key is sent as `Authorization: Bearer <key>`, and to an "anthropic"

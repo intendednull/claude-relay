@@ -965,3 +965,153 @@ reason (an operator picking a `model_map` target needs both):**
 with a price but return `400 Unable to access non-serverless model … create
 and start a new dedicated endpoint`. Listed with a price does not mean
 reachable.
+
+## 2026-08-12 — Fix wave A: the whole-branch review findings that block a public `main`
+
+Two whole-branch reviews (security and correctness lenses) produced five
+items to land before this branch merges. Every one was **demonstrated live**
+against a local mock — nothing here is inferred, and no probe or test in this
+wave contacted a real provider.
+
+**F1 — a cross-origin web page could make the relay spend a profile's API
+key, and it needed nothing but a model name.** `install_gate` returned early
+for every path outside `/control`, so `/v1/messages` had no fetch-metadata
+check, no content-type check, and no other CSRF defense. `RoutingView::parse`
+reads the route out of the JSON body regardless of the request's
+`content-type`, and `text/plain` is CORS-safelisted — so a page could send a
+body-carrying POST with **no preflight at all**, name a model matching a
+profile's `serves` prefix (or just let it fall through to `active_profile`,
+which is the first-request path — no route state, no `Limited`, no
+`policy.mode` needed), and the mock upstream received
+`authorization: Bearer <the value of api_key_env>`. Blind CSRF: the page
+cannot read the response and cannot move the client's OAuth token anywhere.
+The cost is the operator's provider budget, their rate limit, and log
+integrity via F2.
+
+Why it belongs to *this* branch even though `/v1/messages` predates it:
+before Milestone 3 the worst a web page could do was cause unauthenticated
+401s. This branch added a second credential that the relay itself attaches,
+which converts the same reachability into "an attacker page spends the
+operator's provider budget".
+
+**Fixed by hoisting the `Sec-Fetch-Site`/`Origin` half of the gate above the
+`/control` path check**, so it applies to every path. It costs the real
+client nothing — Claude Code is not a browser and sends neither header, which
+`header_is_trustworthy` already treats as acceptable — and the test that
+pins *that* half matters as much as the one that pins the refusal, since
+breaking the real client is the realistic way to get this fix wrong.
+Deliberately **not** extended to `/v1/*`: the `content-type:
+application/json` requirement, which would change behavior for real clients
+on the proxy path. The origin check is sufficient on its own.
+
+A `/control` refusal stays a bare 404 (indistinguishable from a nonexistent
+route). Off `/control` it is a `403 {"error": "cross_origin_request_refused"}`
+instead: `/v1/messages` is the relay's whole public purpose, its existence is
+not a secret, and a 404 there would lie to a legitimate client debugging its
+own setup. Rejected alternative: one uniform 404 everywhere, marginally
+smaller, and dishonest on the path that matters most.
+
+**F1's amplifier — `proxy::forwardable` forwarded upstream CORS headers
+verbatim.** A mock answering `access-control-allow-origin: *` had it copied
+straight to the client, on every path that uses `forwardable` for the
+response (the whole Anthropic route, and the fallback route's non-2xx and
+`format="anthropic"` responses). A CORS-permissive upstream would have turned
+the blind CSRF above into a readable one. Not exploitable through Anthropic
+today, and the translated 2xx fallback path is immune by construction, but
+now stripped anyway — the whole `access-control-*` family, in both
+directions, the same way `x-relay-route` already is. Whether the relay's
+client may read a response is the relay's decision, not an upstream's.
+Rejected alternative: naming only the two headers that matter today, which
+leaves a list to keep in sync with the CORS spec.
+
+**F2 — a request could forge log lines, because `%` does not escape.**
+`tracing`'s `%` sigil records a `DisplayValue`, rendered through
+`format_args!` **unescaped**; a `&str` field goes through `record_str` →
+`{:?}` and *is* escaped, which is why `RequestLog::emit` was already safe.
+`proxy.rs`'s `model = %model` was the one site that missed it: a body whose
+`model` embedded a newline plus a synthetic record produced **two** log lines,
+the second a syntactically complete forged `proxied request` entry reading
+`model_in="FORGED-BY-CLIENT"`. Spec §9's per-request log is the relay's only
+after-the-fact record of which route and which credential served a request,
+so this is an audit-integrity failure, plus an unbounded-log-volume lever.
+
+Fixed with the mechanism this codebase already had for exactly this rule —
+`safe_identifier`, written because "block types and tool names are
+client-controlled and unbounded, and these reach a log line" — **promoted out
+of `translate::request` into its own `log_safety` module**, since two
+unrelated layers need it now and "the proxy imports the translator to log a
+model name" is the wrong dependency to teach the next reader. Rejected
+alternative: dropping the sigil (`model = model.as_str()`), which restores
+escaping but keeps the volume lever.
+
+`/` and `:` were added to the permitted set. Real model names carry both
+(`deepseek-ai/DeepSeek-V4`), neither can break a line or escape a quoted
+field, and that log line's entire purpose is telling an operator which model
+name had no route — a mangled name sends them hunting a typo that isn't
+there.
+
+**And a second half of F2 the review had ruled safe, found by the new test
+failing for an unexpected reason.** `error = %err` on that same line is
+indeed unforgeable (the message interpolates `{model:?}`, which escapes) —
+but `router::route`'s message embedded the *entire raw* name, so the line
+whose `model` field had just been bounded still carried up to
+`ROUTING_BODY_CAP` of client text beside it. Clipped there too. Left open and
+recorded rather than fixed: `RequestLog::emit`'s `model_in`/`model_out` are
+escaped but unclipped on the success path.
+
+**Userinfo in a profile's `base_url` is now refused — and the framing that
+had it deferred three times was wrong.** The ledger called it "a second place
+a real credential travels". Probed on the wire, it is not: reqwest strips
+userinfo at request-build time and only synthesizes a `Basic` header when
+`Authorization` is unset, which `fallback::outgoing_headers` always sets, and
+it does not surface through a `reqwest::Error` either (the three
+`without_url()` calls are correct hygiene but are *not* what protects this).
+So this closes no disclosure. What it removes is a config field that accepts a
+secret, silently discards it, and leaves it in the config file, where the only
+thing between it and a log line is every future log line remembering not to
+print `base_url`. **Refusing it cannot break a working deployment precisely
+because the feature provably never worked** — which is the piece three
+earlier deferrals were missing.
+
+Scoped to `profiles.*.base_url` on purpose. On `anthropic.base_url` the same
+userinfo is **not** inert: that route forwards the client's own headers and
+does not set `Authorization` itself, so reqwest *would* synthesize `Basic`
+for a request that arrived without one. That makes it both potentially
+load-bearing for an operator proxying through an authenticated gateway and a
+genuine second credential channel — the opposite of the argument above, and a
+decision of its own rather than a copy of this one.
+
+**D-2 — "is this host loopback" had two answers in two modules, and now has
+one.** `control.rs` and `config.rs` disagreed in *both* directions:
+`::ffff:127.0.0.1` was loopback to the first and not the second,
+`foo.localhost` the reverse. The cause is recorded in `control.rs`'s own test
+name — a review fixed the v4-mapped case there ("M5") and the fix was never
+propagated. Now one `config::host_str_is_loopback` (plus the `is_loopback_ip`
+primitive `enabled` needs for a parsed bind), called by both. It lives in
+`config.rs` rather than a new `net` module because `config.rs` already owns
+the other question that asks it and `control.rs` already depends on `config`;
+the reverse would invert the layering.
+
+"Keep the more conservative answer" does not resolve this, because
+conservative points opposite ways per caller (loopback *allows* plaintext
+`http` in one and *allows* the control surface in the other). Decided per row
+instead:
+
+- `::ffff:127.0.0.1` **is** loopback. `config.rs`'s old answer was factually
+  wrong rather than conservative — the key does not leave the host — and a
+  local mock reachable only under that spelling cannot serve https.
+- `foo.localhost` is **not** loopback. The `.localhost` suffix arm was the
+  only one of the four rows that erred *open*: RFC 6761 says a resolver
+  *should* map it to loopback, and under one that does not, a profile's API
+  key would travel cleartext off-host. It also contradicted the same
+  function's own documented rule that "a name that merely *resolves* to
+  loopback is still refused".
+
+**This changes no config's control surface.** `enabled` classifies `listen`
+as a parsed `SocketAddr`, so only IP literals ever reach it (`listen =
+"localhost:8484"` already failed to parse and disabled `/control`), and the
+`Host`/`Origin` gate never had a `.localhost` arm to lose. The only behavior
+changes are on `profiles.*.base_url`: `http://[::ffff:127.0.0.1]:<port>` now
+validates, and `http://foo.localhost` no longer does. Dropping the v4-mapped
+arm fails four tests across *both* modules, which is the evidence the
+unification is real rather than two copies that happen to agree.

@@ -34,6 +34,16 @@ your Claude Code `settings.json`:
 }
 ```
 
+**Every path, not just `/control`, refuses a cross-origin browser request**
+(`Sec-Fetch-Site`/`Origin`, when the browser attaches them — a page cannot
+forge either from script). Claude Code is not a browser and sends neither, so
+this costs a real client nothing; `curl` and any other non-browser client are
+unaffected too. It is here because `/v1/messages` picks its route from the
+request *body* whatever the content type, and `text/plain` needs no CORS
+preflight — so without it, a web page you happened to have open could make the
+relay spend a fallback profile's API key. A refused request gets `403
+{"error": "cross_origin_request_refused"}`, or a bare 404 under `/control`.
+
 Byte-for-byte fidelity — a real Claude Code session (tool calls, subagents,
 streaming, images) being indistinguishable from a direct connection to
 Anthropic (spec §10 item 1) — is verified by hand with a live session, not by
