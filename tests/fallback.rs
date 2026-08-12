@@ -3742,33 +3742,48 @@ async fn k_consecutive_successes_re_arm_the_event_and_a_later_failure_fires_agai
     let _ = std::fs::remove_file(&log);
 }
 
-/// The half the test above cannot show without a second relay: an
-/// **intermittently** failing route notifies once, not once per failure. Alternating
-/// success and failure never strings `RE_ARM_SUCCESSES` successes together, so the
-/// outage never ends and the operator is told about it exactly once — which is the
-/// whole point of the specification change.
+/// The half the test above cannot show: an **intermittently** failing route
+/// notifies once, not once per failure. Alternating success and failure never
+/// strings `RE_ARM_SUCCESSES` successes together, so the outage never ends and the
+/// operator is told about it exactly once — which is the whole point of the
+/// specification change fix round 1 made.
+///
+/// **Why this test sleeps, when nothing else here does.** The event has a
+/// coalescing slot, so several events sent inside one drain window collapse into a
+/// single hook run — which means a fast loop over alternating requests produces one
+/// hook line whether the re-arm rule is right or wrong, and the test would be blind
+/// to exactly the defect it is named for. This was found by mutating
+/// `RE_ARM_SUCCESSES` to 1 and watching the fast version pass. So each failure gets
+/// its own drain window: `SWITCH_CHECK_INTERVAL` is 500ms (`src/notify.rs`), and
+/// this waits longer than that before provoking the next one.
+///
+/// Flake direction, deliberately: the gap can only be too *short*, never too long.
+/// A short gap means a wrongly-fired event coalesces away and the assertion still
+/// holds, so this can go falsely green under load but never falsely red.
 #[tokio::test]
 async fn an_intermittent_failure_notifies_once_not_once_per_failure() {
     const ALTERNATING: &[(StatusCode, &str)] = &[
         (StatusCode::OK, OPENAI_COMPLETION),
         (StatusCode::UNAUTHORIZED, UNAUTHORIZED),
     ];
+    const DRAIN_WINDOW: Duration = Duration::from_millis(600);
     let log = hook_log_path("fallback-error-intermittent");
     let relay = start_scripted(ALTERNATING, &log).await;
 
     let mut failures = 0;
-    for _ in 0..12 {
-        if one_request(relay).await == StatusCode::UNAUTHORIZED {
-            failures += 1;
-        }
+    for _ in 0..3 {
+        assert_eq!(one_request(relay).await, StatusCode::OK);
+        assert_eq!(one_request(relay).await, StatusCode::UNAUTHORIZED);
+        failures += 1;
+        tokio::time::sleep(DRAIN_WINDOW).await;
     }
-    assert_eq!(failures, 6, "the mock must really have failed six times");
 
     let lines = fallback_error_lines(&log, 1).await;
     assert_eq!(
         lines.len(),
         1,
-        "{failures} failures of one intermittent outage must notify once: {lines:?}"
+        "{failures} failures of one intermittent outage must notify once, and each had \
+         its own drain window: {lines:?}"
     );
 
     let _ = std::fs::remove_file(&log);
