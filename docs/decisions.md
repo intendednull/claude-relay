@@ -1115,3 +1115,30 @@ changes are on `profiles.*.base_url`: `http://[::ffff:127.0.0.1]:<port>` now
 validates, and `http://foo.localhost` no longer does. Dropping the v4-mapped
 arm fails four tests across *both* modules, which is the evidence the
 unification is real rather than two copies that happen to agree.
+
+## 2026-08-12 — Fix wave B: two documents that had stopped being true
+
+**Spec §12's "no buffering of bodies" mitigation is corrected in place, not
+superseded.** The risk row for "proxy becomes bottleneck under parallel
+subagents" still claimed pure streaming passthrough with no body buffering. Task
+3 ended that for a routable request (the `model` deciding the route is inside
+the body — see the 2026-08-11 "Failover wiring" entry above), and the fallback
+route buffers a non-streaming response to translate it. §12 now states what
+actually happens, including the part that entry named and did not resolve:
+**every buffer is capped per request and none is bounded in aggregate across
+concurrent requests.** That is the branch's one memory bound with no ceiling of
+any kind, in contrast to `BUFFER_CAP`, `MAX_TOOL_SLOTS`, `ERROR_BODY_CAP` and
+`RESPONSE_CAP`, which all have one. Left unresolved deliberately: the realistic
+trigger is a runaway local client rather than an attacker, since the listener is
+loopback and single-user. Recorded here so the correction is journalled and the
+two documents no longer disagree — the mitigation text was the thing that was
+wrong, not the tradeoff.
+
+**Golden files are evidence about the traffic they contain.** Every Together
+capture delivered a tool call's complete `arguments` in one fragment, so the
+translator's multi-fragment reassembly has no real-traffic backing — only
+`src/translate/sse.rs`'s hand-built fixtures. That was already stated in
+`tests/translate_together_fixtures.rs`'s module doc, which the reader of the
+*test* sees; it is now also in `tests/fixtures/together/README.md`, which the
+reader of the *directory* sees. Two audiences, and the directory's was the one
+being left to infer coverage from the presence of files.
