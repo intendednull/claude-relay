@@ -107,6 +107,16 @@ mode = "new-sessions"
 # for new requests only and does not persist here. Must name a configured
 # profile — unset (the default) means no fallback until one is set.
 # active_profile = "deepseek"
+# Whether the request that *trips* the limit is handed to the fallback rather
+# than answered with Anthropic's limit error. Claude Code treats a
+# subscription-limit 429 as terminal and does not retry, so passing that one
+# through costs a visible hard failure — and a manual re-run — once per limit
+# window. The response is classified before anything reaches the client, so
+# nothing about this is a mid-stream switch. `false` restores the older
+# behavior: the limit error goes to the client, the route still becomes
+# LIMITED, and only later requests fail over. Same eligibility as every other
+# failover — `mode`, `active_profile` and the `count_tokens` pin all apply.
+failover_on_detect = true
 # Without a marker, the reset must be further out than this to count as the
 # subscription limit rather than an ordinary per-minute burst 429. It is also
 # the floor under every window detection produces, so a stale reset time can't

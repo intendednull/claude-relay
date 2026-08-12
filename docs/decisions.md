@@ -1142,3 +1142,71 @@ translator's multi-fragment reassembly has no real-traffic backing — only
 *test* sees; it is now also in `tests/fixtures/together/README.md`, which the
 reader of the *directory* sees. Two audiences, and the directory's was the one
 being left to infer coverage from the presence of files.
+
+## 2026-08-12 — Task 6: the request that trips the limit is handed to the fallback
+
+**Found by running a real `claude -p` session through the relay, not by any
+test.** A tool-heavy session against a mock Anthropic that always reports the
+subscription limit died on its very first request: the relay detected the 429,
+moved `ACTIVE → LIMITED`, and returned that 429 to the client. **Claude Code
+treats a subscription-limit 429 as terminal** — no retry — so it printed
+`API Error: ... usage limit` and aborted, and the failover the next request
+would have gotten never happened. One visible hard failure and one manual re-run
+per limit window, before the relay's entire reason for existing engaged.
+
+This was not a bug against the spec. §6's modes applied "only while the Anthropic
+route is `LIMITED`", so the request that *causes* the transition was excluded by
+construction; the spec simply did not anticipate the client's behavior. Nor did
+the suite miss a defect it was positioned to catch — no test asserted this case
+at all, because every failover test drives the route to `LIMITED` first. §6 and
+§9 are amended rather than left contradicted.
+
+**Rejected runner-up: leave the behavior alone and document the retry in the
+README.** It costs no code and it works — the user re-runs the command and the
+second request fails over. Rejected because it makes the product's central
+promise conditional on the user knowing to retry: a relay whose stated job is to
+survive the limit window would hand the user a hard error at the exact moment it
+is supposed to earn its keep. A default that needs a footnote to be correct is
+the wrong default.
+
+**Why it was not a five-line change.** Detection ran inside the response-body
+wrapper (`CountingStream`'s `ErrorObservation`), which fires as the body streams
+past — by which time the response head is already on its way to the client and
+cannot be retracted. So a response whose status `[detect]` could match is now
+read whole *before* anything is handed to axum, classified there, and either
+answered by the fallback or returned exactly as it stands. Constraints kept:
+only a candidate status is buffered (a 2xx, SSE or not, keeps streaming;
+`detect.status` is validated 4xx/5xx, and `ErrorObservation` independently
+refuses to exist for a 2xx, so there are two guards); the read is bounded by the
+existing `ERROR_BODY_CAP`; and an interrupted read — past the cap or a failed
+stream — classifies nothing and hands the bytes it read back in front of the
+rest of the response, *including the error that ended it*, so a truncated body
+never arrives looking complete.
+
+**Eligibility is one decision, not two.** `failover` now returns
+`Failover::Now | OnDetect | Never` instead of `Option<String>`, so the mode, the
+session-start heuristic and the existence of an `active_profile` are evaluated
+exactly once and both failover forms read the same answer. A second copy of that
+logic was the obvious way to write this and the one thing that could quietly
+defeat `notify-only`, whose whole purpose is not switching models.
+`ErrorObservation::finish` returns the classified window instead of only
+recording it, which keeps one `classify` call site and one
+`record(LimitDetected)` call site for both paths. `count_tokens` keeps its
+Anthropic pin structurally: the arm that can arm the re-route is the one arm it
+never reaches.
+
+**Not in tension with the mid-stream prohibition**, though it sits next to it:
+the decision is made while the whole response, head included, is still in the
+relay's hands. Said so in §6, where a reader would otherwise think the two
+conflict.
+
+**Gated by `policy.failover_on_detect`, default `true`.** `false` restores the
+old behavior exactly. The default is the new behavior because the old one is
+wrong for the only client this relay serves — and the flag exists because
+"never switch models on a request I did not see fail" is a legitimate
+preference, distinct from `notify-only`'s "never switch at all".
+
+One cost, accepted and documented: a request that fails over this way emits two
+§9 log lines (the Anthropic attempt, then the fallback). The alternative —
+suppressing the attempt's line — would hide an upstream request that really
+happened from the audit trail.

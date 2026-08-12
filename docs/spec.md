@@ -132,7 +132,8 @@ the body or a reset horizon above a configurable threshold (e.g. > 5 minutes).
 
 ## 6. Failover policy
 
-Config `mode`, applied only while the Anthropic route is `LIMITED`:
+Config `mode`, applied while the Anthropic route is `LIMITED` **and to the request whose
+own response puts it there** (see "The triggering request" below):
 
 | mode | Behavior |
 |---|---|
@@ -147,10 +148,41 @@ session starts, and those harmlessly hit the fallback. Document the imperfection
 don't over-engineer. If false positives matter later, refine with request metadata,
 but ship the simple heuristic first.
 
+**The triggering request** (`policy.failover_on_detect`, default `true`). A request whose
+response is what classifies as the subscription limit is handed to the fallback too,
+instead of being answered with that limit error. It is subject to every rule above
+without exception — the same `mode`, the same session-start heuristic, the same
+requirement that an `active_profile` exist, the same `count_tokens` pin — because it is
+the same decision, evaluated once per request.
+
+The default changed from the original design, which applied `mode` only while the route
+was already `LIMITED`, leaving the request that *caused* the transition out by
+construction. Claude Code treats a subscription-limit 429 as terminal: it does not retry.
+So passing that response through cost a hard, user-visible failure and a manual re-run
+once per limit window, before the fallback this relay exists for engaged at all. Found by
+running a real `claude -p` session, not by a test. `failover_on_detect = false` restores
+the older behavior exactly: the limit error reaches the client, the route still
+transitions, and only later requests fail over.
+
+This does not weaken §5. Classification is unchanged and still conservative — anything
+that does not match the signature (a burst 429 with `retry-after: 12`) reaches the client
+with its status, headers and body intact, and changes no state. What changed is only
+*when* the classification happens: for a response carrying `detect.status`, the body is
+read whole before the response head is handed to the client, so the verdict is available
+while the response can still be replaced. Nothing else is buffered: a 2xx, streamed or
+not, is untouched (`detect.status` is validated to be a 4xx or 5xx), the read is bounded,
+and a read that is interrupted — past the cap, or a failed stream — classifies nothing and
+delivers the response exactly as a streamed pass-through would have.
+
 Failing over mid-stream is prohibited: once any SSE bytes have been sent to the
 client, an upstream failure terminates that stream with an error event. Only requests
 that have not yet produced client-visible bytes are retried on the fallback (and only
-when policy allows).
+when policy allows). The triggering-request re-route above is not in tension with this,
+though it looks adjacent to it: the decision is made while the whole response — head
+included — is still in the relay's hands, so nothing client-visible has been sent.
+
+One request that fails over this way emits **two** §9 log lines: the Anthropic attempt
+that produced the limit response, and the fallback request that answered the client.
 
 `count_tokens` requests always go to Anthropic regardless of state; on failure, pass
 the error through. (Token counts against the wrong tokenizer are worse than an error.)
@@ -266,6 +298,7 @@ model_map = { "*" = "moonshotai/Kimi-K3" }
 [policy]
 mode = "new-sessions"                  # new-sessions | all | notify-only
 active_profile = "deepseek"            # startup default; runtime switches via /control
+failover_on_detect = true              # §6: the request that trips the limit fails over too
 min_reset_horizon_secs = 300           # below this, a 429 is a burst, not the limit
 reset_jitter_secs = [15, 60]
 
@@ -314,7 +347,9 @@ benchmarks don't capture; every switch is an explicit, instantly-revertible comm
 
 - `GET /status` → `{state, limited_until, fallback_requests_served, config_digest}`.
 - Structured logs (`tracing`): one line per request — route chosen, model in/out,
-  status, latency, stream bytes. **Never bodies, never auth headers.**
+  status, latency, stream bytes. **Never bodies, never auth headers.** (One line per
+  *upstream* request, strictly: a client request that fails over on detection, §6, logs
+  the Anthropic attempt and the fallback request that replaced it.)
 - A visible marker for fallback responses: inject a response header
   (`x-relay-route: fallback`) so a session can be audited after the fact. (Claude Code
   ignores unknown headers.)

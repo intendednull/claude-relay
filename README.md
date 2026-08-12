@@ -80,8 +80,9 @@ ways:
   `claude-*` one. This happens whatever Anthropic's state, notifies nothing and
   changes no state. It is ordinary routing, not failover.
 - **By failover** (spec §6) — a `claude-*` request arrives while the route is
-  `LIMITED` and `[policy] mode` allows it. Only this path is failover, and only
-  this path remaps the model.
+  `LIMITED`, or is itself the request whose limit response puts it there, and
+  `[policy] mode` allows it. Only this path is failover, and only this path
+  remaps the model.
 
 A minimal working config — against Together AI's OpenAI-compatible endpoint, the
 provider this project has real captured traffic for — saved as `relay.toml`:
@@ -135,8 +136,8 @@ a billed inference call.
 
 ### Failover, and `[policy] mode`
 
-`mode` decides which `claude-*` requests leave for `active_profile` while the
-route is `LIMITED`:
+`mode` decides which `claude-*` requests leave for `active_profile` once the
+limit is known — the request that trips it included:
 
 | `mode` | Effect while `LIMITED` |
 |---|---|
@@ -150,6 +151,17 @@ consulted only if nothing else matched, and a name no entry claims is sent on
 unchanged. `count_tokens` never fails over in any mode, and a stream already
 being delivered is never failed over mid-response — the decision is made before
 the first byte reaches the client.
+
+**The request that trips the limit fails over too**, rather than receiving the
+limit error: Claude Code treats a subscription-limit 429 as terminal and does not
+retry it, so passing that one through means a visible hard failure and a manual
+re-run once per limit window. The response is classified before its head reaches
+the client, so this is still not a mid-response switch. It obeys `mode` and every
+other failover rule identically — under `notify-only`, or with no
+`active_profile`, the limit error passes through as before. Set `[policy]
+failover_on_detect = false` to restore the older behavior, where only requests
+*after* the transition fail over. Such a request logs two lines: the Anthropic
+attempt, then the fallback that answered it.
 
 Nothing the client sent reaches a profile: the outgoing request's headers are
 *built*, not filtered, so no client credential can leak by being missing from a
@@ -268,7 +280,9 @@ live under `[policy]`, not `[detect]` — see `relay.example.toml`.
 - **What a match changes.** With no profile configured, or `mode =
   "notify-only"`, the client still receives the upstream's own response byte for
   byte whatever it classified as. Otherwise an eligible `claude-*` request goes
-  to the fallback for as long as the window lasts (see **Fallback providers**).
+  to the fallback for as long as the window lasts — including the request that
+  produced the match, whose response is classified before any of it reaches the
+  client (see **Fallback providers**).
 - **Non-matches never move state.** A per-minute burst 429 needs either an
   explicit subscription marker in the message or a reset further out than
   `policy.min_reset_horizon_secs` (default 5 minutes) before it counts.
