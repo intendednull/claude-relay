@@ -10,12 +10,24 @@ or extend it: [`docs/decisions.md`](docs/decisions.md).
 
 ## Status
 
-Pre-alpha. Milestone 1 (transparent passthrough proxy, `/status`,
-`--capture-errors`) is complete — see [`docs/plans/`](docs/plans/). Milestone
-2 is in progress: limit detection, the route state machine and the notifier
-are in. There is still no fallback routing (Milestone 3), so every request
-goes to Anthropic, and a detected limit only changes what `/status` reports
-and fires a notification.
+Pre-alpha. Milestones 1-3 are complete — see [`docs/plans/`](docs/plans/):
+
+- **1** — transparent passthrough, `/status`, `--capture-errors`.
+- **2** — limit detection, the route state machine, state persistence, the
+  notifier.
+- **3** — name-based routing, failover to a fallback profile (model remap,
+  header hygiene), the Anthropic↔OpenAI translator including streaming, all
+  three `[policy] mode` values, the `x-relay-route` response marker, and the
+  control API.
+
+Not built yet: hot config reload, `/control/mode`, a `relay ctl` CLI wrapper.
+
+**Milestone 3 is not accepted.** Spec §10 item 5 — the end-to-end drill, a real
+Claude Code task run to completion on the fallback path against a mock-limited
+Anthropic — has not been run. What is below is verified by the test suite, and
+the translator additionally against real Together AI traffic captured into
+`tests/fixtures/together/`; none of it has yet been driven by a live Claude Code
+session.
 
 ## Running it
 
@@ -59,6 +71,158 @@ session simply working:
   API answered both framings identically when checked by hand, but it is a
   real wire-level difference from a direct connection.
 
+## Fallback providers
+
+A **profile** is one third-party provider. Requests reach it two independent
+ways:
+
+- **By name** (spec §7d) — the client asked for a model that is not a
+  `claude-*` one. This happens whatever Anthropic's state, notifies nothing and
+  changes no state. It is ordinary routing, not failover.
+- **By failover** (spec §6) — a `claude-*` request arrives while the route is
+  `LIMITED` and `[policy] mode` allows it. Only this path is failover, and only
+  this path remaps the model.
+
+A minimal working config — against Together AI's OpenAI-compatible endpoint, the
+provider this project has real captured traffic for — saved as `relay.toml`:
+
+```toml
+listen = "127.0.0.1:8484"
+
+[anthropic]
+base_url = "https://api.anthropic.com"
+
+[profiles.together]
+base_url = "https://api.together.xyz"   # the API *root*, not an endpoint path
+api_key_env = "RELAY_TOGETHER_KEY"      # the variable's name; the key itself never goes in this file
+format = "openai"                       # enables the wire-format translator
+serves = ["meta-llama/", "deepseek-ai/", "Qwen/"]                # §7d: prefixes this profile claims
+model_map = { "*" = "meta-llama/Llama-3.3-70B-Instruct-Turbo" }   # §7a: failover only
+
+[policy]
+mode = "new-sessions"
+active_profile = "together"
+```
+
+```
+export RELAY_TOGETHER_KEY=...
+cargo run -- --config relay.toml
+```
+
+`base_url` must be `https` unless the host is loopback, and must not carry
+userinfo (`https://user:secret@host`) — both are refused at startup rather than
+leaked or silently dropped per request. `relay.example.toml` documents every
+key, including the ones with defaults the config above leaves out. Read
+**Choosing a fallback model** below before committing to a `model_map` target:
+not every model in a provider's catalogue is reachable, and not every one can
+serve a forced `tool_choice`.
+
+### Name-based routing
+
+Any `model` that does not start with `claude-` is resolved against the profiles:
+the first profile with a `serves` prefix that matches wins, **in config order**;
+a name no profile claims falls through to `policy.active_profile`; with neither
+a match nor an active profile the relay answers `400 {"error":
+"no_route_for_model"}` rather than sending an open-model name to Anthropic to be
+rejected there. A name-routed request is passed through **unremapped** —
+`model_map` is failover's, not this path's — so the name you type is the name the
+provider sees, and a name it rejects surfaces as that provider's own error.
+
+`/v1/messages/count_tokens` is the exception: it stays on Anthropic unless the
+profile that claims the name is a `format = "anthropic"` one, since an `openai`
+profile has no counting endpoint and routing there would turn a token count into
+a billed inference call.
+
+### Failover, and `[policy] mode`
+
+`mode` decides which `claude-*` requests leave for `active_profile` while the
+route is `LIMITED`:
+
+| `mode` | Effect while `LIMITED` |
+|---|---|
+| `new-sessions` (default) | Only requests whose message list has no `assistant` turn yet — a conversation with no thought to switch models in the middle of. Claude Code's own title-generation and summarization requests look like session starts too and land on the fallback harmlessly. |
+| `all` | Every eligible request, mid-conversation ones included. |
+| `notify-only` | None. Anthropic's own limit error passes through to the client, and the notifier still fires. |
+
+A failed-over request **is** remapped through `model_map` (spec §7a): longest
+matching prefix wins, ties go to whichever was declared first, `"*"` is
+consulted only if nothing else matched, and a name no entry claims is sent on
+unchanged. `count_tokens` never fails over in any mode, and a stream already
+being delivered is never failed over mid-response — the decision is made before
+the first byte reaches the client.
+
+Nothing the client sent reaches a profile: the outgoing request's headers are
+*built*, not filtered, so no client credential can leak by being missing from a
+denylist (spec §7b, and the invariant is a test). Anthropic's prompt-caching
+`cache_control` directives are stripped on the way out, since a fallback
+provider either rejects them or ignores them.
+
+### Confirming it works, without waiting for a limit
+
+Name-based routing needs no limit state, so it is the cheap end-to-end check
+that a profile is configured correctly:
+
+```
+curl -sD- http://127.0.0.1:8484/v1/messages -H 'content-type: application/json' \
+  -d '{"model":"meta-llama/Llama-3.3-70B-Instruct-Turbo","max_tokens":64,
+       "messages":[{"role":"user","content":"say hi"}]}'
+```
+
+- The response carries **`x-relay-route: fallback`**. Only the relay ever sets
+  that header (it is stripped from anything an upstream sends), and only the
+  fallback route sets it — so its absence means the answer came from Anthropic.
+- `curl http://127.0.0.1:8484/status` shows `fallback_requests_served`
+  incremented, and `active_profile` naming the profile that served it.
+- A relay-generated failure on this path is a `502` that names its cause and
+  carries the marker too: `fallback_key_missing` or `fallback_key_unusable` (the
+  variable `api_key_env` names is unset, or holds something unsendable),
+  `upstream_unreachable`, `fallback_request_untranslatable`,
+  `fallback_response_unreadable` (past the 4 MiB buffer cap, or the response
+  stream failed), `fallback_response_untranslatable`. Anything else — the
+  provider's own 4xx/5xx — is passed through untranslated, with its own status.
+
+To exercise the *failover* path instead, a mock-limited Anthropic is the
+supported route (see `tests/fallback.rs`); with `[policy] mode = "all"` and a
+real limit in effect, `/status` reports `LIMITED` and every subsequent
+`claude-*` request answers with the marker.
+
+### Selecting an open model from Claude Code
+
+Exposing the name in the client is Claude Code's configuration, not the relay's
+(spec §7d) — the relay routes whatever `model` string arrives. Because
+`ANTHROPIC_BASE_URL` points at a custom endpoint, Claude Code passes any model
+string through without validating it, so all of these work:
+
+- **Type it.** `/model meta-llama/Llama-3.3-70B-Instruct-Turbo`, `--model
+  <name>`, or `ANTHROPIC_MODEL` in the same `env` block as
+  `ANTHROPIC_BASE_URL`.
+- **Add a `/model` picker entry** — the recommended combo, since it survives
+  restarts and needs no typing: `ANTHROPIC_CUSTOM_MODEL_OPTION` (the model ID
+  the relay will route on) plus `ANTHROPIC_CUSTOM_MODEL_OPTION_NAME` (what the
+  picker shows). `..._DESCRIPTION` and `..._SUPPORTED_CAPABILITIES` are
+  optional.
+- **`availableModels`** in Claude Code's `settings.json` lists the selectable
+  models, and `enforceAvailableModels` makes that list a restriction.
+- **`CLAUDE_CODE_SUBAGENT_MODEL`** puts subagents on a model of their own —
+  a cheap open model for subagents while the main thread stays on subscription
+  is exactly the mixed-backend use §7d exists for.
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8484",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Llama 3.3 70B (via relay)"
+  }
+}
+```
+
+Whatever you pick, the profile's `serves` list has to claim its prefix (or the
+profile has to be `active_profile`), or the relay answers
+`no_route_for_model`. These variable names are Claude Code's own, taken from its
+env-var and model-configuration docs; this project has not driven them through a
+live session (see Status).
+
 ## Capturing error responses
 
 ```
@@ -101,8 +265,10 @@ moves it to `PROBING`; the next successful response moves it back to
 `min_reset_horizon_secs`, `max_reset_horizon_secs` and `reset_jitter_secs`
 live under `[policy]`, not `[detect]` — see `relay.example.toml`.
 
-- **Nothing else changes yet.** The client always receives the upstream's own
-  response, byte for byte, whether or not it classified as a limit.
+- **What a match changes.** With no profile configured, or `mode =
+  "notify-only"`, the client still receives the upstream's own response byte for
+  byte whatever it classified as. Otherwise an eligible `claude-*` request goes
+  to the fallback for as long as the window lasts (see **Fallback providers**).
 - **Non-matches never move state.** A per-minute burst 429 needs either an
   explicit subscription marker in the message or a reset further out than
   `policy.min_reset_horizon_secs` (default 5 minutes) before it counts.
@@ -247,5 +413,18 @@ pinned versions — not a property to keep betting on across upgrades.
 ```
 nix develop
 cargo build
+```
+
+There is no CI. The check command is these three, and **all three must be clean
+before a change lands** — a warning is a failure here:
+
+```
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+Run them before opening a pull request; nothing else will. A great deal of this
+project's assurance rests on that suite by design — the header-hygiene
+invariant of spec §7b is a *test*, not a convention, and so are the control
+surface's three loopback axes.
