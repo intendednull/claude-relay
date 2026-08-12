@@ -2895,13 +2895,15 @@ async fn an_ordinary_400_never_walks_the_ladder() {
     let relay = start_laddered(&LIVE_LADDER, &[SMALL], MISSING_MESSAGES, |_| {}).await;
 
     let (code, body) = ask(&relay, HAIKU).await;
-    assert_eq!(code, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["message"], "Input required");
+    // The walk first, so a regression here names the defect rather than its
+    // downstream symptom.
     assert_eq!(
         models_seen(&relay.fallback),
         [SMALL],
         "an ordinary 400 bought a second upstream request"
     );
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["message"], "Input required");
     assert_eq!(status(relay.addr).await["fallback_requests_served"], 1);
 }
 
@@ -3094,6 +3096,14 @@ async fn a_context_limit_that_arrives_mid_stream_is_never_escalated() {
         .await
         .expect("request failed");
 
+    // The subject first: the profile was asked exactly once. Every attempt is
+    // recorded before the response it produces reaches the client, so a hop would
+    // already be visible here.
+    assert_eq!(
+        models_seen(&fallback),
+        [SMALL],
+        "a context limit that arrived mid-stream was escalated"
+    );
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "text/event-stream");
     let bytes = response.bytes().await.expect("failed to read body");
@@ -3115,11 +3125,6 @@ async fn a_context_limit_that_arrives_mid_stream_is_never_escalated() {
             .expect("a message string")
             .contains("longer than the model's context length"),
         "the provider's own message is what the client gets: {data}"
-    );
-    assert_eq!(
-        models_seen(&fallback),
-        [SMALL],
-        "a context limit that arrived mid-stream was escalated"
     );
 }
 
