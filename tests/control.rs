@@ -2,6 +2,9 @@
 //! one, the 404 on an unknown name, the notifier event it fires, and the two
 //! properties that get their own review regardless of this task's assurance
 //! level — the mid-stream isolation guarantee and the loopback-only bind.
+//! Also `install_gate`'s cross-origin half, which is not `/control`-specific:
+//! the last two tests here aim F1's shape at `/v1/messages`, and this is the
+//! file with the profile fixtures that make "did it spend the key" observable.
 //! (API-key hygiene on this surface has its own dedicated file,
 //! `tests/log_hygiene_control.rs`, matching `log_hygiene.rs`/
 //! `log_hygiene_fallback.rs`'s one-subscriber-per-binary pattern.)
@@ -10,7 +13,7 @@ mod common;
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
@@ -77,6 +80,25 @@ fn upstream_ok(body: &'static str) -> Router {
                 .header("content-type", "application/json")
                 .body(Body::from(body))
                 .expect("failed to build mock response")
+        }),
+    )
+}
+
+/// The same mock, counting the requests that actually reached it — the only
+/// direct evidence that a refused request did not still spend the profile's
+/// API key on the way out (F1's tests below).
+fn counting_upstream(body: &'static str, hits: Arc<AtomicUsize>) -> Router {
+    Router::new().route(
+        "/v1/messages",
+        any(move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Response::builder()
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("failed to build mock response")
+            }
         }),
     )
 }
@@ -714,6 +736,72 @@ async fn the_reported_csrf_shape_is_rejected() {
         by_name(listed["profiles"].as_array().expect("array"), "profile-a")["active"],
         true,
         "the switch must not have applied"
+    );
+}
+
+/// F1: the same `no-cors` shape aimed at `/v1/messages` instead of
+/// `/control/*`. It needs no route state, no `Limited` window and no control
+/// request at all — `OPEN_MODEL` falls through to `active_profile` on the very
+/// first request (spec §7d) — and `/v1/messages` decides that from the JSON
+/// *body* whatever the content type, while `text/plain` is CORS-safelisted, so
+/// a cross-origin page can send this with no preflight. The cost is the
+/// operator's provider budget, which is why the assertion that matters is the
+/// upstream hit count and not the status code: a refusal that still forwarded
+/// the request would spend the key just the same.
+#[tokio::test]
+async fn a_cross_site_post_to_v1_messages_never_spends_a_profiles_api_key() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let relay = two_profile_relay_with(counting_upstream(BODY_A, hits.clone())).await;
+
+    let response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .header("origin", "https://evil.example")
+        .header("sec-fetch-site", "cross-site")
+        .header("sec-fetch-mode", "no-cors")
+        .header("content-type", "text/plain;charset=UTF-8")
+        .body(session(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("error body must be JSON");
+    assert_eq!(body["error"], "cross_origin_request_refused");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the profile upstream must never have been reached, so its API key was never spent"
+    );
+}
+
+/// The other half of F1's fix, and the one that catches a fix which breaks the
+/// real client: Claude Code is not a browser and sends neither
+/// `Sec-Fetch-Site` nor `Origin`, so a request carrying neither must still be
+/// served. Same relay, same body, same profile as the test above — only the
+/// browser-attached headers differ — so between the two, "rejected" cannot be
+/// "rejects everything".
+#[tokio::test]
+async fn a_post_to_v1_messages_with_neither_fetch_metadata_header_still_succeeds() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let relay = two_profile_relay_with(counting_upstream(BODY_A, hits.clone())).await;
+
+    let response = client()
+        .post(format!("http://{relay}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(session(OPEN_MODEL))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(&response.bytes().await.expect("failed to read body"))
+        .expect("response must be JSON");
+    assert_eq!(body["id"], "from-profile-a");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the request must have reached the profile upstream exactly once"
     );
 }
 

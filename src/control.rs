@@ -16,6 +16,10 @@
 //!   profile's `api_key_env` *name* is ever touched here), and never return
 //!   `base_url` at all, since that can carry a credential of its own.
 //!
+//! The `Sec-Fetch-Site`/`Origin` half of that is *not* `/control`-specific and
+//! is applied to every path the relay serves — see `install_gate`, which is
+//! where this module's gate stopped being only about its own routes.
+//!
 //! **The gate is applied by path, over the whole application router
 //! (`install_gate`, called from `build_router`), not by which sub-router a
 //! route happens to be registered on.** An earlier version gated only the
@@ -95,36 +99,57 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/control/profile", post(switch_profile))
 }
 
-/// Wraps `router` with the one gate every request under `/control` must
-/// pass, regardless of which route or sub-router it reached through:
+/// The relay's one request gate, in two halves.
+///
+/// **Every path**, `/v1/*` included, must have a trustworthy origin: if a
+/// browser sent this, it must not be a cross-origin page
+/// (`Sec-Fetch-Site`/`Origin`, when present). `/v1/messages` decides its route
+/// from the JSON *body* regardless of content type, and `text/plain` is
+/// CORS-safelisted — so without this, a cross-origin page could POST a body
+/// naming a profile's model and make the relay spend that profile's API key,
+/// with no preflight and no `/control` request anywhere in it (F1,
+/// `docs/decisions.md`). It costs the real client nothing: Claude Code is not
+/// a browser and sends neither header, which `header_is_trustworthy` treats as
+/// acceptable.
+///
+/// **Under `/control` only**, additionally:
 /// - the bind must be loopback (`enabled`);
-/// - `Host` must be a loopback literal or `localhost`;
-/// - if a browser sent this, it must look same-origin (`Sec-Fetch-Site`/
-///   `Origin`, when present).
+/// - `Host` must be a loopback literal or `localhost`.
 ///
 /// Matched on `request.uri().path()`, computed once from `config` (there is
 /// no hot-reload this milestone, so the bind check never changes after
-/// startup) and evaluated fresh per request for the header checks. Every
-/// refusal here is a bare 404: an attacker probing for this surface must not
-/// be able to tell "wrong `Host`" apart from "no such route".
+/// startup) and evaluated fresh per request for the header checks. A `/control`
+/// refusal is a bare 404: an attacker probing for this surface must not be
+/// able to tell "wrong `Host`" apart from "no such route". Off `/control` that
+/// reasoning does not apply — `/v1/messages` is the relay's whole public
+/// purpose and its existence is not a secret — so that refusal is an honest
+/// 403 in the same error envelope the proxy's own refusals use.
 pub(crate) fn install_gate(router: Router<AppState>, config: &Config) -> Router<AppState> {
     let bind_is_loopback = enabled(config);
     router.layer(middleware::from_fn(move |request: Request, next: Next| {
         let bind_is_loopback = bind_is_loopback;
         async move {
-            if !request.uri().path().starts_with(CONTROL_PATH_PREFIX) {
+            let is_control = request.uri().path().starts_with(CONTROL_PATH_PREFIX);
+            if !has_trustworthy_origin(request.headers()) {
+                return if is_control {
+                    StatusCode::NOT_FOUND.into_response()
+                } else {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": "cross_origin_request_refused" })),
+                    )
+                        .into_response()
+                };
+            }
+            if !is_control {
                 return next.run(request).await;
             }
-            if !bind_is_loopback || !passes_control_gate(request.headers()) {
+            if !bind_is_loopback || !is_loopback_host(request.headers()) {
                 return StatusCode::NOT_FOUND.into_response();
             }
             next.run(request).await
         }
     }))
-}
-
-fn passes_control_gate(headers: &HeaderMap) -> bool {
-    is_loopback_host(headers) && has_trustworthy_origin(headers)
 }
 
 fn is_loopback_host(headers: &HeaderMap) -> bool {
