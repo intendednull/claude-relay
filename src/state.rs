@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,6 +32,39 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A request dying at almost exactly this mark is this constant, not the network.
 const READ_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How many consecutive delivered fallback responses re-arm spec §4's
+/// `fallback_error`.
+///
+/// **One is not enough, and that was the specification's defect rather than an
+/// implementation slip.** A 429 or a 5xx is *intermittent* by nature — a provider
+/// throttling the relay lets some requests through by definition — so a
+/// single-success re-arm fires again on the very next failure. Measured on this
+/// branch before the fix: a route alternating success and failure produced one
+/// hook run per failed request, and a real `failover_engaged` reached the hook
+/// 6.79s after detection, behind the backlog.
+///
+/// **Five**, because that is where the two costs cross. Expected requests to reach
+/// *k* consecutive successes is `(1 - q^k) / ((1 - q) q^k)`; at `q = 0.5` that is
+/// ~3 requests for `k = 1` and ~63 for `k = 5`, so five cuts the repeat rate about
+/// twentyfold on the measured shape. Against that, Claude Code sends several
+/// requests per turn, so a route that has genuinely recovered re-arms within a turn
+/// or two and a later, separate outage still fires.
+///
+/// `pub` so the integration tests can express "exactly this many successes"
+/// against the constant rather than against a copy of its value.
+///
+/// The trade taken at this value, stated without the euphemism an earlier draft
+/// used. Against an *intermittently failing* route the cost is a missed **repeat**,
+/// and that is cheap — the first notification already went out. But while the flag
+/// is un-re-armed a **genuinely new** outage's first failure notifies nothing
+/// either, and that is not a repeat of anything. A low-traffic profile, or one whose
+/// fallback traffic stops entirely because Anthropic recovered, can sit un-re-armed
+/// indefinitely. That residual is why this is 5 and not 10 — the higher the number,
+/// the longer the flag survives a quiet period — and it is filed rather than closed
+/// (`follow-ups.md` item 5, with the `recovered`-transition re-arm that would close
+/// it).
+pub const RE_ARM_SUCCESSES: u64 = 5;
+
 /// Shared application state handed to axum handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -56,6 +89,31 @@ pub struct AppState {
     /// untranslatable body, a missing key, an unreachable endpoint — is not
     /// one the fallback served.
     pub fallback_requests_served: Arc<AtomicU64>,
+    /// Whether the fallback route is currently failing in a way the operator has
+    /// already been told about — spec §4's `fallback_error` is edge-triggered on
+    /// this flag rather than fired per failed request, because the failures it
+    /// exists for (a dead key, an unreachable provider, an exhausted balance)
+    /// fail *every* request and one hook run per request is unusable.
+    ///
+    /// Private, unlike almost every other field here, and for the same reason
+    /// `active_profile_override` is: the only way to read or write it is
+    /// `fallback_delivered`/`fallback_failed`/`rearm_fallback_error` below, which
+    /// is what makes "one owner, one decision" a property of this API rather than
+    /// a convention `fallback::forward` has to remember.
+    ///
+    /// Global rather than per profile: the request path only ever has one active
+    /// profile (`policy.active_profile` plus `/control/profile`'s override), so a
+    /// per-profile flag would model a distinction it does not have — but a switch
+    /// *does* change which profile the flag is about, which is why
+    /// `rearm_fallback_error` exists. Per-process rather than persisted to the
+    /// state file: a restart re-arms it, which is also when an operator is most
+    /// likely to be looking.
+    fallback_failing: Arc<AtomicBool>,
+    /// Delivered fallback responses since the last route-attributable failure,
+    /// counted for `RE_ARM_SUCCESSES`. Left to grow past the threshold rather than
+    /// clamped: a `u64` cannot wrap at any request rate a process will live to see,
+    /// and every failure resets it.
+    fallback_successes: Arc<AtomicU64>,
     /// How much of a request body may be read to decide its route. A field
     /// rather than a constant read in place, so a test can drive the over-cap
     /// path — and the hand-rolled stream reassembly behind it — without an
@@ -119,9 +177,63 @@ impl AppState {
             route_updates,
             notifier,
             fallback_requests_served: Arc::new(AtomicU64::new(0)),
+            fallback_failing: Arc::new(AtomicBool::new(false)),
+            fallback_successes: Arc::new(AtomicU64::new(0)),
             routing_body_cap: crate::proxy::ROUTING_BODY_CAP,
             active_profile_override: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// A fallback request delivered a 2xx. Re-arms spec §4's `fallback_error`
+    /// only on the `RE_ARM_SUCCESSES`th consecutive one — one success proves a
+    /// request worked and does not prove the outage ended.
+    pub fn fallback_delivered(&self) {
+        // `>= k - 1` on the value *before* the add, rather than adding again here:
+        // the same test with no arithmetic that could overflow.
+        if self.fallback_successes.fetch_add(1, Ordering::Relaxed) >= RE_ARM_SUCCESSES - 1 {
+            self.fallback_failing.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// A route-attributable fallback failure, returning **whether this is the one
+    /// that notifies** — true exactly once per outage.
+    ///
+    /// `compare_exchange` rather than a load followed by a store: a dead key fails
+    /// every in-flight request at once, and a load-then-store would let several of
+    /// them all read `false` and all fire. An atomic read-modify-write on one
+    /// location always reads the latest value in that location's modification order
+    /// whatever the ordering is, so exactly one of N concurrent callers can observe
+    /// `false`. `Relaxed` suffices because this flag publishes no other memory: the
+    /// event's payload is owned per request and handed over by the notifier's own
+    /// channel send.
+    ///
+    /// **The two atomics are deliberately not updated together.** Nothing reads
+    /// them as a pair — the fire is decided by this one `compare_exchange`, and the
+    /// counter only ever gates a `store(false)` in `fallback_delivered`. So every
+    /// interleaving of a concurrent success and failure costs at most one *extra*
+    /// notification and can never lose one: a success in flight across a failure
+    /// can be counted toward the streak that follows it, which re-arms slightly
+    /// early, and an early re-arm only means the next failure notifies again.
+    /// Packing both into one atomic was considered and would remove that skew; it
+    /// buys exactness far below the statistical noise of `RE_ARM_SUCCESSES` itself,
+    /// at the price of a bit-packed word in place of two named fields.
+    #[must_use]
+    pub fn fallback_failed(&self) -> bool {
+        self.fallback_successes.store(0, Ordering::Relaxed);
+        self.fallback_failing
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Re-arms `fallback_error` outright, for when the thing the flag describes has
+    /// *changed* rather than recovered: `POST /control/profile` (spec §8b) points
+    /// the route at a different provider with different credentials, so the outage
+    /// the operator was told about is no longer the one they are now looking at —
+    /// and the `RELAY_DETAIL` on their screen names a profile that is no longer
+    /// active. Without this, a switch to a second broken profile is silent.
+    pub fn rearm_fallback_error(&self) {
+        self.fallback_successes.store(0, Ordering::Relaxed);
+        self.fallback_failing.store(false, Ordering::Relaxed);
     }
 
     /// The profile a request routes against right now (spec §8b): the
@@ -357,6 +469,144 @@ mod tests {
         let _ = cloned.set_active_profile("deepseek".to_string());
 
         assert_eq!(state.active_profile(), Some("deepseek".to_string()));
+    }
+
+    // --- spec §4's `fallback_error` edge-trigger ---
+    //
+    // Driven through the three methods rather than end to end, because the
+    // sequences that matter here are long and exact: a hook log cannot tell "the
+    // fourth success did not re-arm" from "the fifth event coalesced".
+
+    fn relay() -> AppState {
+        AppState::new(
+            Arc::new(config(DetectConfig::default(), NotifyConfig::default())),
+            None,
+            "digest".to_string(),
+        )
+        .expect("should build")
+    }
+
+    /// The edge itself: the first failure of an outage notifies and the rest do
+    /// not, however many there are.
+    #[test]
+    fn only_the_first_failure_of_an_outage_notifies() {
+        let state = relay();
+        assert!(state.fallback_failed(), "the first failure is the edge");
+        for _ in 0..20 {
+            assert!(
+                !state.fallback_failed(),
+                "a dead key fails every request; the operator is told once"
+            );
+        }
+    }
+
+    /// One 2xx proves a request worked, not that the outage ended — which is the
+    /// whole of fix round 1's specification change. A route alternating success and
+    /// failure used to notify on every failure.
+    #[test]
+    fn one_delivered_response_does_not_re_arm_but_the_kth_does() {
+        let state = relay();
+
+        for short_streak in 1..RE_ARM_SUCCESSES {
+            // A fresh outage per iteration, so the streak below starts from zero
+            // rather than from whatever the previous iteration left behind.
+            state.rearm_fallback_error();
+            assert!(state.fallback_failed(), "a fresh outage to recover from");
+
+            for _ in 0..short_streak {
+                state.fallback_delivered();
+            }
+            assert!(
+                !state.fallback_failed(),
+                "{short_streak} of {RE_ARM_SUCCESSES} successes must not re-arm"
+            );
+        }
+
+        state.rearm_fallback_error();
+        assert!(state.fallback_failed());
+        for _ in 0..RE_ARM_SUCCESSES {
+            state.fallback_delivered();
+        }
+        assert!(
+            state.fallback_failed(),
+            "{RE_ARM_SUCCESSES} consecutive successes are a recovery, and the failure \
+             after one is a new outage"
+        );
+    }
+
+    /// **A lock on the documented value, not on behaviour.** Every other test here is
+    /// written against `RE_ARM_SUCCESSES` rather than against a copy of its number,
+    /// which is deliberate — it keeps them honest across an intended change — and the
+    /// cost is that they are blind to an unintended one. An audit confirmed it: at
+    /// three, all 523 tests still passed, while four documents state five as the
+    /// contract.
+    #[test]
+    fn the_documented_re_arm_threshold_is_the_one_in_the_code() {
+        assert_eq!(
+            RE_ARM_SUCCESSES, 5,
+            "`docs/spec.md` §4, `README.md`, `relay.example.toml` and \
+             `docs/decisions.md` all quote five consecutive delivered responses to the \
+             operator; move them with this constant or not at all"
+        );
+    }
+
+    /// Consecutive, not cumulative. A near-miss streak broken by a failure starts
+    /// over — otherwise a route failing half its requests would re-arm on the
+    /// aggregate and notify forever, which is the defect being fixed.
+    #[test]
+    fn a_failure_resets_a_partial_success_streak() {
+        let state = relay();
+        assert!(state.fallback_failed());
+
+        for _ in 0..40 {
+            for _ in 0..RE_ARM_SUCCESSES - 1 {
+                state.fallback_delivered();
+            }
+            assert!(
+                !state.fallback_failed(),
+                "an interrupted streak must never accumulate into a re-arm"
+            );
+        }
+    }
+
+    // `a_delivered_response_alone_never_notifies` was retired here, deliberately: it
+    // asserted the opposite of its name — that a failure after fifteen deliveries
+    // *does* notify — which `only_the_first_failure_of_an_outage_notifies` already
+    // covers from a healthy start. The property the name promised is not testable at
+    // this seam anyway: "a request-attributable failure does not notify" is the
+    // absence of a call site in `fallback::forward`, which only
+    // `a_request_attributable_failure_between_two_route_failures_does_not_re_arm`
+    // can see.
+
+    /// F6: a switch points the route at different credentials, so the outage the
+    /// operator was told about is not the one in front of them now. Without the
+    /// re-arm, a switch to a second broken profile is silent and the only detail on
+    /// screen names the old profile.
+    #[test]
+    fn a_profile_switch_re_arms_so_the_next_failure_notifies() {
+        let state = relay();
+        assert!(state.fallback_failed());
+        assert!(!state.fallback_failed());
+
+        state.rearm_fallback_error();
+
+        assert!(
+            state.fallback_failed(),
+            "the new profile's own failure has to reach the operator"
+        );
+    }
+
+    /// The flag is shared, not copied by `derive(Clone)` — axum hands a clone to
+    /// every handler, so a per-clone flag would notify once per worker.
+    #[test]
+    fn the_edge_trigger_is_shared_across_cloned_appstates() {
+        let state = relay();
+        let cloned = state.clone();
+        assert!(state.fallback_failed());
+        assert!(
+            !cloned.fallback_failed(),
+            "a clone must see the same outage, not its own"
+        );
     }
 
     /// No profile configured at all and no startup default is a valid state
