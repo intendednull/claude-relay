@@ -1,5 +1,11 @@
 # Milestone 3 implementation plan — name-based routing + fallback to Together AI
 
+**COMPLETE 2026-08-13.** Tasks 1–4 merged (`7a79f4b`); post-merge tasks 6–9B
+and S-1 followed; the §10 item 5 E2E drill was satisfied by production
+traffic during the 2026-08-13→14 limit window
+(`docs/reports/2026-08-13-e2e-drill-evidence.md`). Open follow-ups live in
+`.superpowers/sdd/milestone-3-plan/follow-ups.md` (CI is the largest).
+
 Source of truth: `docs/spec.md` §3 (Router, Translator components), §6
 (Failover policy), §7a (model mapping), §7b (auth/header hygiene —
 security-critical), §7c (wire format, Phase 2 applies — see below), §7d
