@@ -588,6 +588,92 @@ async fn a_non_claude_model_routes_by_name_while_anthropic_is_active() {
     );
 }
 
+/// `start_openai`, plus a `params` table on the profile. Separate rather than a
+/// parameter on `start`: every other test in this file wants the default.
+async fn start_with_params(params: IndexMap<String, IndexMap<String, Value>>) -> Relay {
+    set_profile_keys();
+    let anthropic = Recorder::default();
+    let fallback = Recorder::default();
+    let anthropic_addr = serve(anthropic_upstream(anthropic.clone(), false)).await;
+    let fallback_addr = serve(openai_upstream(fallback.clone(), false)).await;
+    let mut profile = profile(fallback_addr, "openai", OPENAI_KEY_ENV);
+    profile.params = params;
+    let addr = serve_relay_with(config(anthropic_addr, "notify-only", profile), None).await;
+    Relay {
+        addr,
+        anthropic,
+        fallback,
+    }
+}
+
+/// One name-routed request, checked as far as the route marker; the assertions
+/// this file's params test is about are on what the upstream recorded.
+async fn route_by_name(relay: &Relay, model: &str) {
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(session_start(model))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    response.bytes().await.expect("failed to read body");
+    assert_eq!(relay.anthropic.count(), 0, "nothing reached Anthropic");
+}
+
+/// Spec §Testing 3, the primary test for per-model `params`. The tuned model in
+/// the live config is reachable only by name — `serves`-matched, absent from
+/// `model_map` — so the failover path Task 7 covers is not the one production
+/// exercises for it. `notify-only` while `ACTIVE` keeps the limit machinery out
+/// of it entirely (§7d).
+///
+/// The untuned neighbour is compared byte for byte against a relay whose profile
+/// has no `params` table at all, not merely checked for the absence of the key:
+/// a lookup that leaked a set across models inside the profile would still be
+/// caught if it injected some *other* value.
+#[tokio::test]
+async fn params_reach_only_the_tuned_model_on_the_name_routed_path() {
+    let tuned_model = format!("{OPEN_MODEL}-Flash-0731");
+    let mut set = IndexMap::new();
+    set.insert("reasoning_effort".to_string(), Value::from("max"));
+    let mut params = IndexMap::new();
+    params.insert(tuned_model.clone(), set);
+
+    let relay = start_with_params(params).await;
+
+    route_by_name(&relay, &tuned_model).await;
+    let tuned = relay.fallback.only();
+    assert_eq!(tuned.path, "/v1/chat/completions");
+    assert_eq!(
+        tuned.json()["model"],
+        tuned_model.as_str(),
+        "a name-routed request keeps the name the client asked for"
+    );
+    assert_eq!(
+        tuned.json()["reasoning_effort"],
+        "max",
+        "the configured param reached the upstream body"
+    );
+
+    route_by_name(&relay, OPEN_MODEL).await;
+    let untuned = relay.fallback.only();
+
+    let baseline_relay = start_with_params(IndexMap::new()).await;
+    route_by_name(&baseline_relay, OPEN_MODEL).await;
+    let baseline = baseline_relay.fallback.only();
+
+    assert_eq!(
+        untuned.json()["model"],
+        OPEN_MODEL,
+        "the neighbour is the model the client asked for, not the tuned one"
+    );
+    assert_eq!(
+        untuned.body, baseline.body,
+        "a neighbour's tuning must leave this model's body byte-identical to a params-absent baseline"
+    );
+}
+
 /// Global Constraint 7. `all` while `LIMITED` is the configuration under which
 /// every other `claude-*` request leaves for the profile; this one still must
 /// not.
