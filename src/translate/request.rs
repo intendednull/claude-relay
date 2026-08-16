@@ -1,6 +1,7 @@
 //! Anthropic Messages request → OpenAI chat-completions request.
 
 use anyhow::{Context as _, Result, bail};
+use indexmap::IndexMap;
 
 use super::anthropic::{
     Block, ImageSource, KnownBlock, MessageContent, MessagesRequest, SystemPrompt, ToolChoice,
@@ -68,6 +69,7 @@ fn convert(request: MessagesRequest, target_model: &str, stream: bool) -> Result
         tools,
         tool_choice,
         stream,
+        params: IndexMap::new(),
     })
 }
 
