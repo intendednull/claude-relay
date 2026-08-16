@@ -488,6 +488,7 @@ mod tests {
             .to_string()
             .as_bytes(),
             "target/Model",
+            &indexmap::IndexMap::new(),
         )
         .expect("request translation failed");
         let request: Value = serde_json::from_slice(&request.body).unwrap();

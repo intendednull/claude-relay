@@ -25,18 +25,32 @@ pub struct TranslatedRequest {
 /// `target_model` is the *already remapped* upstream model name (spec §7a's
 /// `model_map`): a translator has no business deciding which model a request
 /// runs on, but it must not be possible to forget to substitute it either.
-pub fn request_to_openai(body: &[u8], target_model: &str) -> Result<TranslatedRequest> {
+///
+/// `params` is the operator-configured extra-parameter set already resolved for
+/// `target_model` by the caller — empty when none is configured. Resolving it
+/// here would need the profile, which is the same reason the model name arrives
+/// pre-remapped.
+pub fn request_to_openai(
+    body: &[u8],
+    target_model: &str,
+    params: &IndexMap<String, serde_json::Value>,
+) -> Result<TranslatedRequest> {
     let request: MessagesRequest = serde_json::from_slice(body)
         .map_err(|err| parse_failure("request body is not a valid Anthropic message", &err))?;
     let stream = request.stream.unwrap_or(false);
-    let translated = convert(request, target_model, stream)?;
+    let translated = convert(request, target_model, stream, params)?;
     Ok(TranslatedRequest {
         body: serde_json::to_vec(&translated)?,
         stream,
     })
 }
 
-fn convert(request: MessagesRequest, target_model: &str, stream: bool) -> Result<ChatRequest> {
+fn convert(
+    request: MessagesRequest,
+    target_model: &str,
+    stream: bool,
+    params: &IndexMap<String, serde_json::Value>,
+) -> Result<ChatRequest> {
     let mut messages = Vec::new();
     if let Some(system) = &request.system
         && let Some(text) = system_text(system)?
@@ -69,7 +83,7 @@ fn convert(request: MessagesRequest, target_model: &str, stream: bool) -> Result
         tools,
         tool_choice,
         stream,
-        params: IndexMap::new(),
+        params: params.clone(),
     })
 }
 
@@ -406,17 +420,28 @@ mod tests {
 
     use super::*;
 
+    fn translate_bytes(body: Value, params: &IndexMap<String, Value>) -> Vec<u8> {
+        request_to_openai(body.to_string().as_bytes(), "target/Model", params)
+            .expect("translation failed")
+            .body
+    }
+
+    /// The no-params case, which every test but the params ones is asserting
+    /// about: an empty map is what an unconfigured model resolves to.
     fn translate(body: Value) -> Value {
-        let translated = request_to_openai(body.to_string().as_bytes(), "target/Model")
-            .expect("translation failed");
-        serde_json::from_slice(&translated.body).expect("output is not valid JSON")
+        serde_json::from_slice(&translate_bytes(body, &IndexMap::new()))
+            .expect("output is not valid JSON")
     }
 
     fn error(body: Value) -> String {
         format!(
             "{:#}",
-            request_to_openai(body.to_string().as_bytes(), "target/Model")
-                .expect_err("expected translation to fail")
+            request_to_openai(
+                body.to_string().as_bytes(),
+                "target/Model",
+                &IndexMap::new()
+            )
+            .expect_err("expected translation to fail")
         )
     }
 
@@ -445,6 +470,43 @@ mod tests {
                 "stream": false,
             }),
             "top_k and metadata have no OpenAI equivalent and are dropped"
+        );
+    }
+
+    /// Byte-level rather than `Value`-level on purpose: the empty-params half is
+    /// asserting that an unconfigured model's outbound body is *unchanged* by
+    /// this feature existing, and a parsed comparison would hide a stray key
+    /// ordering change or an emitted-but-empty `params` object.
+    #[test]
+    fn configured_params_append_as_top_level_keys_and_an_empty_set_changes_nothing() {
+        let body = json!({
+            "model": "claude-opus-4",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        const BASELINE: &str = r#"{"model":"target/Model","messages":[{"role":"user","content":"hi"}],"max_tokens":1024,"stream":false}"#;
+
+        assert_eq!(
+            String::from_utf8(translate_bytes(body.clone(), &IndexMap::new())).unwrap(),
+            BASELINE,
+            "an empty params map must serialize byte-identically to the pre-params output"
+        );
+
+        let params: IndexMap<String, Value> = [
+            ("reasoning_effort".to_string(), json!("max")),
+            ("logit_bias".to_string(), json!({"1234": -100})),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            String::from_utf8(translate_bytes(body, &params)).unwrap(),
+            format!(
+                "{},{}}}",
+                BASELINE.strip_suffix('}').unwrap(),
+                r#""reasoning_effort":"max","logit_bias":{"1234":-100}"#
+            ),
+            "params flatten in as top-level keys, after the named fields and in \
+             configured order, with non-scalar values intact"
         );
     }
 
@@ -1189,6 +1251,7 @@ mod tests {
                 .to_string()
                 .as_bytes(),
             "target/Model",
+            &IndexMap::new(),
         )
         .expect("translation failed");
 

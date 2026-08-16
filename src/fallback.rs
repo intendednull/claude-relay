@@ -416,7 +416,9 @@ fn client_retries(status: StatusCode) -> bool {
 /// JSON that has already been serialized.
 fn prepare(body: &[u8], target_model: &str, translated: bool) -> anyhow::Result<Prepared> {
     if translated {
-        let request = translate::request_to_openai(body, target_model)?;
+        // TODO(per-model params): resolve the profile's `params` entry for
+        // `target_model` here instead of always sending an empty set.
+        let request = translate::request_to_openai(body, target_model, &IndexMap::new())?;
         Ok(Prepared {
             body: request.body,
             stream: request.stream,
