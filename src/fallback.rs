@@ -1199,6 +1199,7 @@ mod tests {
             format: "openai".to_string(),
             serves: Vec::new(),
             model_map: IndexMap::new(),
+            params: IndexMap::new(),
         };
         assert_eq!(
             endpoint(&profile, "/v1/messages", true),
@@ -1258,6 +1259,7 @@ mod tests {
             format: "anthropic".to_string(),
             serves: Vec::new(),
             model_map: IndexMap::new(),
+            params: IndexMap::new(),
         };
         assert_eq!(
             endpoint(&profile, "/v1/messages", false),

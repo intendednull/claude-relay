@@ -47,6 +47,7 @@ async fn a_client_controlled_model_cannot_forge_a_log_record() {
             format: "openai".to_string(),
             serves: vec!["nothing-claims-this/".to_string()],
             model_map: IndexMap::new(),
+            params: IndexMap::new(),
         },
     );
     config.profiles = profiles;

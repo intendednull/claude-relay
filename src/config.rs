@@ -58,6 +58,13 @@ pub struct ProfileConfig {
     /// logic something stable to work from.
     #[serde(default)]
     pub model_map: IndexMap<String, String>,
+    /// Extra request-body fields injected for one *resolved upstream* model,
+    /// keyed by the exact model id the request is finally sent as — never a
+    /// prefix, and never the client's `claude-*` name. `openai`-format
+    /// profiles only: the `anthropic` path is a byte passthrough with nowhere
+    /// to put them.
+    #[serde(default)]
+    pub params: IndexMap<String, IndexMap<String, serde_json::Value>>,
 }
 
 impl ProfileConfig {
@@ -990,6 +997,7 @@ mod tests {
             format: format.to_string(),
             serves: vec!["deepseek-ai/".to_string()],
             model_map: IndexMap::new(),
+            params: IndexMap::new(),
         }
     }
 

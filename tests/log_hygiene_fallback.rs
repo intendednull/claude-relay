@@ -116,6 +116,7 @@ async fn no_credential_reaches_the_logs_on_the_fallback_route() {
             format: "openai".to_string(),
             serves: Vec::new(),
             model_map: IndexMap::from([("*".to_string(), "target/Model".to_string())]),
+            params: IndexMap::new(),
         },
     );
     config.profiles = profiles;

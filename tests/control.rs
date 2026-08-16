@@ -58,6 +58,7 @@ fn profile(base: SocketAddr) -> ProfileConfig {
         format: "anthropic".to_string(),
         serves: Vec::new(),
         model_map: IndexMap::new(),
+        params: IndexMap::new(),
     }
 }
 

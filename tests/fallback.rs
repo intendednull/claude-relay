@@ -277,6 +277,7 @@ fn profile(base: SocketAddr, format: &str, api_key_env: &str) -> ProfileConfig {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
+        params: IndexMap::new(),
     }
 }
 

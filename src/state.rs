@@ -389,6 +389,7 @@ mod tests {
             format: "openai".to_string(),
             serves: Vec::new(),
             model_map: IndexMap::new(),
+            params: IndexMap::new(),
         }
     }
 

@@ -36,6 +36,7 @@ fn profile(base_url: String, api_key_env: &str) -> ProfileConfig {
         format: "anthropic".to_string(),
         serves: Vec::new(),
         model_map: IndexMap::new(),
+        params: IndexMap::new(),
     }
 }
 

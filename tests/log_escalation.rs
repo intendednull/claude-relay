@@ -110,6 +110,7 @@ async fn every_escalation_names_both_models_and_never_the_transcript() {
                 .into_iter()
                 .map(|(slot, target)| (slot.to_string(), target.to_string()))
                 .collect(),
+            params: IndexMap::new(),
         },
     );
     config.profiles = profiles;
