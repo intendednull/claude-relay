@@ -9,6 +9,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::detect::DetectConfig;
+use crate::translate::CHAT_REQUEST_FIELD_NAMES;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,7 +86,8 @@ impl ProfileConfig {
     /// `model_map` key (which is the same trap one level down: it prefix-
     /// matches every name and, being a match rather than a fallthrough, beats
     /// the explicit `"*"` catch-all) are all startup-time errors rather than
-    /// silent misrouting.
+    /// silent misrouting. `params` gets the same treatment in
+    /// `validate_params`.
     pub fn validate(&self) -> Result<()> {
         if !matches!(self.format.as_str(), "anthropic" | "openai") {
             bail!(
@@ -105,6 +107,62 @@ impl ProfileConfig {
             bail!(
                 "`profiles.*.model_map` keys must not be empty — an empty prefix matches every model name and shadows the \"*\" catch-all"
             );
+        }
+        self.validate_params()
+    }
+
+    /// Every way a `params` entry can look configured and inject nothing, plus
+    /// the one way it injects something malformed. All of them are silent
+    /// otherwise: an entry no request can resolve to is simply never looked up,
+    /// and a key colliding with a `ChatRequest` field emits that JSON key twice
+    /// through `#[serde(flatten)]` without erroring anywhere on the way out.
+    fn validate_params(&self) -> Result<()> {
+        // The `anthropic` path forwards the client's body through byte for
+        // byte; there is no request struct on it to flatten anything into, so
+        // a `params` table there is not a smaller effect than intended, it is
+        // no effect at all.
+        if self.format == "anthropic" && !self.params.is_empty() {
+            bail!(
+                "`profiles.*.params` is not supported on a `format = \"anthropic\"` profile — that path forwards the request body unchanged and has nowhere to inject them"
+            );
+        }
+        for (model, set) in &self.params {
+            if model.is_empty() {
+                bail!(
+                    "`profiles.*.params` keys must not be empty — a key is matched against the resolved upstream model id, which never is"
+                );
+            }
+            if set.is_empty() {
+                bail!(
+                    "`profiles.*.params` entry {model:?} must not be empty — an empty set injects nothing"
+                );
+            }
+            for name in set.keys() {
+                if name.is_empty() {
+                    bail!(
+                        "`profiles.*.params` entry {model:?} has an empty parameter name — it would serialize a literal \"\" key into the request body"
+                    );
+                }
+                if CHAT_REQUEST_FIELD_NAMES.contains(&name.as_str()) {
+                    bail!(
+                        "`profiles.*.params` entry {model:?} sets {name:?}, which is already a request field — flattening it emits that JSON key twice"
+                    );
+                }
+            }
+            // Partial by construction: `serves` is prefix-matched, so a
+            // misspelled model *name* under a correct provider prefix still
+            // passes. It catches the wrong prefix, which is the case no
+            // request-time signal distinguishes from a provider outage.
+            let reachable = self.model_map.values().any(|target| target == model)
+                || self
+                    .serves
+                    .iter()
+                    .any(|prefix| model.starts_with(prefix.as_str()));
+            if !reachable {
+                bail!(
+                    "`profiles.*.params` entry {model:?} is unreachable — it is neither a `model_map` target nor prefix-matched by any `serves` entry, so no request resolves to it"
+                );
+            }
         }
         Ok(())
     }
@@ -1180,6 +1238,177 @@ mod tests {
         };
         let err = bad.validate().unwrap_err().to_string();
         assert!(err.contains("serves"), "{err}");
+    }
+
+    // --- [profiles.*.params] ---
+
+    /// One `params` table: `{ <model> = { <name> = <string value> } }`.
+    fn params(
+        model: &str,
+        entries: &[(&str, &str)],
+    ) -> IndexMap<String, IndexMap<String, serde_json::Value>> {
+        let set = entries
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), serde_json::Value::from(*value)))
+            .collect();
+        IndexMap::from([(model.to_string(), set)])
+    }
+
+    /// `serves` is prefix-matched, so this key is reachable without any
+    /// `model_map` entry — the baseline the rejection tests below vary from.
+    #[test]
+    fn a_params_entry_on_a_served_model_is_accepted() {
+        let good = ProfileConfig {
+            params: params("deepseek-ai/DeepSeek-V4", &[("reasoning_effort", "max")]),
+            ..profile("openai")
+        };
+        good.validate().expect("a reachable params entry is valid");
+    }
+
+    /// The other half of reachability: a profile reached through
+    /// `active_profile` has no `serves` at all, and its targets are exactly
+    /// the `model_map` values.
+    #[test]
+    fn a_params_entry_reachable_only_through_model_map_is_accepted() {
+        let good = ProfileConfig {
+            serves: Vec::new(),
+            model_map: IndexMap::from([("*".to_string(), "Qwen/Qwen3-Max".to_string())]),
+            params: params("Qwen/Qwen3-Max", &[("reasoning_effort", "max")]),
+            ..profile("openai")
+        };
+        good.validate()
+            .expect("a model_map target is a reachable params key");
+    }
+
+    #[test]
+    fn an_empty_param_set_is_rejected() {
+        let bad = ProfileConfig {
+            params: IndexMap::from([(
+                "deepseek-ai/DeepSeek-V4".to_string(),
+                IndexMap::<String, serde_json::Value>::new(),
+            )]),
+            ..profile("openai")
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("DeepSeek-V4"), "{err}");
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_params_model_key_is_rejected() {
+        let bad = ProfileConfig {
+            params: params("", &[("reasoning_effort", "max")]),
+            ..profile("openai")
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("keys must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_param_name_is_rejected() {
+        let bad = ProfileConfig {
+            params: params("deepseek-ai/DeepSeek-V4", &[("", "max")]),
+            ..profile("openai")
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("empty parameter name"), "{err}");
+    }
+
+    /// `#[serde(flatten)]` emits a colliding key twice and `serde_json`
+    /// returns `Ok`, so nothing downstream of startup catches this.
+    #[test]
+    fn a_param_named_after_a_request_field_is_rejected() {
+        let bad = ProfileConfig {
+            params: params("deepseek-ai/DeepSeek-V4", &[("temperature", "0.7")]),
+            ..profile("openai")
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("temperature"), "{err}");
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn params_on_an_anthropic_profile_are_rejected() {
+        let bad = ProfileConfig {
+            params: params("moonshotai/Kimi-K3", &[("reasoning_effort", "max")]),
+            ..profile("anthropic")
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("anthropic"), "{err}");
+    }
+
+    /// A provider prefix no `serves` entry claims and no `model_map` entry
+    /// targets: the table parses, validates nothing, and silently never fires.
+    #[test]
+    fn an_unreachable_params_model_key_is_rejected() {
+        let bad = ProfileConfig {
+            params: params("Qwen/Qwen3-Max", &[("reasoning_effort", "max")]),
+            ..profile("openai")
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("unreachable"), "{err}");
+    }
+
+    #[test]
+    fn params_parses_from_inline_table_toml() {
+        let raw = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [profiles.deepseek]
+            base_url = "https://deepseek.example"
+            api_key_env = "RELAY_TOGETHER_KEY"
+            format = "openai"
+            serves = ["deepseek-ai/"]
+            params = { "deepseek-ai/DeepSeek-V4" = { reasoning_effort = "max" } }
+        "#;
+        let config = Config::from_toml_str(raw).expect("should parse");
+        let profile = &config.profiles["deepseek"];
+        profile.validate().expect("should validate");
+        assert_eq!(
+            profile.params["deepseek-ai/DeepSeek-V4"]["reasoning_effort"],
+            serde_json::Value::from("max")
+        );
+    }
+
+    /// The nested-table spelling is the one an operator writing a multi-model
+    /// table actually reaches for; it must land in the same structure.
+    #[test]
+    fn params_parses_from_nested_table_toml() {
+        let common = r#"
+            listen = "127.0.0.1:8484"
+
+            [anthropic]
+            base_url = "https://api.anthropic.com"
+
+            [profiles.deepseek]
+            base_url = "https://deepseek.example"
+            api_key_env = "RELAY_TOGETHER_KEY"
+            format = "openai"
+            serves = ["deepseek-ai/"]
+        "#;
+        let nested = Config::from_toml_str(&format!(
+            r#"{common}
+            [profiles.deepseek.params."deepseek-ai/DeepSeek-V4"]
+            reasoning_effort = "max"
+            "#
+        ))
+        .expect("nested form should parse");
+        let inline = Config::from_toml_str(&format!(
+            r#"{common}
+            params = {{ "deepseek-ai/DeepSeek-V4" = {{ reasoning_effort = "max" }} }}
+            "#
+        ))
+        .expect("inline form should parse");
+        assert_eq!(
+            nested.profiles["deepseek"].params,
+            inline.profiles["deepseek"].params
+        );
+        nested.profiles["deepseek"]
+            .validate()
+            .expect("should validate");
     }
 
     #[test]
