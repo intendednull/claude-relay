@@ -22,6 +22,7 @@ use indexmap::IndexMap;
 use serde_json::{Value, json};
 
 use crate::config::{PolicyConfig, ProfileConfig};
+use crate::log_safety::safe_identifier;
 use crate::notify::{FallbackCause, NotifyEvent};
 use crate::provider_error::ProviderError;
 use crate::proxy::{CountingStream, ERROR_BODY_CAP, RequestLog, elapsed_ms, forwardable};
@@ -131,7 +132,7 @@ async fn deliver(
     );
 
     let translated = profile.format == "openai";
-    let mut prepared = match prepare(&body, &target_model, translated) {
+    let mut prepared = match prepare(profile, &body, &target_model, translated) {
         Ok(prepared) => prepared,
         Err(err) => {
             tracing::warn!(
@@ -272,7 +273,7 @@ async fn deliver(
             if failure.error.input_over_limit()
                 && let Some(next) = ladder.next_target()
             {
-                match prepare(&body, &next, translated) {
+                match prepare(profile, &body, &next, translated) {
                     Ok(next_prepared) => {
                         // §9's line for the attempt that just failed, carrying the
                         // model that failed — the same shape the Anthropic route's
@@ -414,9 +415,34 @@ fn client_retries(status: StatusCode) -> bool {
 /// target model is *in* the body — an escalated retry re-emits it through the
 /// same path that produced the first one, instead of patching a model name inside
 /// JSON that has already been serialized.
-fn prepare(body: &[u8], target_model: &str, translated: bool) -> anyhow::Result<Prepared> {
+///
+/// Which is also why the profile's `params` set is resolved here, against *this*
+/// call's `target_model`: an escalated hop runs on a different model, and a set
+/// resolved once per client request would send the rung below's tuning to it.
+fn prepare(
+    profile: &ProfileConfig,
+    body: &[u8],
+    target_model: &str,
+    translated: bool,
+) -> anyhow::Result<Prepared> {
     if translated {
-        let request = translate::request_to_openai(body, target_model)?;
+        // Exact match, never a prefix: `ProfileConfig::validate_params`'
+        // reachability check is written against this lookup, so a fuzzy one here
+        // would make that startup check wrong rather than merely lenient.
+        let params = profile.params.get(target_model);
+        // The signal validation structurally cannot give (spec point 6): a
+        // provider-side model rename leaves the key reachable but no longer
+        // matching, which regresses the model to untuned defaults and otherwise
+        // looks exactly like a profile that configured none.
+        tracing::debug!(
+            // Client text on a name-routed request (§7d), which keeps whatever
+            // model name the client wrote.
+            model = safe_identifier(target_model),
+            params_matched = params.is_some(),
+            "resolved the per-model params for this upstream attempt"
+        );
+        let empty = IndexMap::new();
+        let request = translate::request_to_openai(body, target_model, params.unwrap_or(&empty))?;
         Ok(Prepared {
             body: request.body,
             stream: request.stream,
@@ -1199,6 +1225,7 @@ mod tests {
             format: "openai".to_string(),
             serves: Vec::new(),
             model_map: IndexMap::new(),
+            params: IndexMap::new(),
         };
         assert_eq!(
             endpoint(&profile, "/v1/messages", true),
@@ -1250,6 +1277,46 @@ mod tests {
         );
     }
 
+    /// The whole reason the lookup lives inside `prepare()`: the escalation loop
+    /// calls it a second time with the rung above's model, so a set resolved once
+    /// per client request would carry the rung below's tuning up the ladder. Both
+    /// call sites pass their own `target_model`, and this pins that the result
+    /// follows that argument rather than the profile.
+    #[test]
+    fn params_resolve_against_the_model_this_attempt_is_for() {
+        const BODY: &[u8] =
+            br#"{"model":"claude-opus-4-6","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+
+        let mut tuned = IndexMap::new();
+        tuned.insert("reasoning_effort".to_string(), json!("max"));
+        let mut params = IndexMap::new();
+        params.insert("vendor/Tuned".to_string(), tuned);
+        let profile = ProfileConfig {
+            base_url: "https://api.example.com".to_string(),
+            api_key_env: "RELAY_TEST_KEY".to_string(),
+            format: "openai".to_string(),
+            serves: vec!["vendor/".to_string()],
+            model_map: IndexMap::new(),
+            params,
+        };
+
+        let tuned_body = prepare(&profile, BODY, "vendor/Tuned", true).expect("valid body");
+        let value: Value = serde_json::from_slice(&tuned_body.body).expect("valid json");
+        assert_eq!(value["model"], "vendor/Tuned");
+        assert_eq!(value["reasoning_effort"], "max");
+
+        // Byte-identical to the same model prepared against a profile with no
+        // `params` at all, not merely missing the one key: a neighbour's set must
+        // leave an unconfigured model's request untouched.
+        let untuned = prepare(&profile, BODY, "vendor/Other", true).expect("valid body");
+        let bare = ProfileConfig {
+            params: IndexMap::new(),
+            ..profile.clone()
+        };
+        let baseline = prepare(&bare, BODY, "vendor/Other", true).expect("valid body");
+        assert_eq!(untuned.body, baseline.body);
+    }
+
     #[test]
     fn an_anthropic_profiles_endpoint_mirrors_the_path_the_client_called() {
         let profile = ProfileConfig {
@@ -1258,6 +1325,7 @@ mod tests {
             format: "anthropic".to_string(),
             serves: Vec::new(),
             model_map: IndexMap::new(),
+            params: IndexMap::new(),
         };
         assert_eq!(
             endpoint(&profile, "/v1/messages", false),

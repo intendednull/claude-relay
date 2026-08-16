@@ -9,6 +9,7 @@ mod request;
 mod response;
 mod sse;
 
+pub(crate) use openai::CHAT_REQUEST_FIELD_NAMES;
 pub use request::{TranslatedRequest, request_to_openai};
 pub use response::response_to_anthropic;
 pub use sse::{SseTranslator, sse_stream};

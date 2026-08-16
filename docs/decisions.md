@@ -1692,3 +1692,49 @@ current-thread runtime and there is no `.await` between the load and the store, 
 interleaving exists to find. Under `flavor = "multi_thread"` the mutation is caught 2 runs in
 20. The flavor was left alone and the comment rewritten: an honest weak test beats a flaky
 strong one, and the CAS argument belongs next to the CAS.
+
+## 2026-08-15 — Per-model request-parameter overrides (`params`)
+
+Per-model tuning was added so one model on a shared profile — starting with
+`deepseek-ai/DeepSeek-V4-Flash-0731`, which returns empty content on Together
+when its reasoning consumes the entire `max_tokens` budget — can get extra
+request parameters injected without affecting any other model that profile
+serves. Full design: `docs/specs/2026-08-15-per-model-params-design.md`
+(supersedes `docs/specs/2026-08-13-per-model-passthrough-design.md`, whose
+per-*profile* scope couldn't isolate one model's tuning from its neighbors).
+
+`profiles.<name>.params` is a table keyed by the exact resolved upstream
+model id (never a prefix, never the client's `claude-*` name), each entry an
+arbitrary set of extra fields merged into that model's outbound request:
+
+```toml
+[profiles.together.params."deepseek-ai/DeepSeek-V4-Flash-0731"]
+reasoning_effort = "max"
+```
+
+`reasoning_effort = "max"` is the deployed value, chosen by measurement, not
+assumption: 5 trials each directly against Together AI showed the
+originally-proposed `"low"` (1/5 successes) is actually *worse* than sending
+nothing (2/5), while `"max"` was 5/5. See the spec's "Which parameter value
+actually fixes it" section for the full table.
+
+`openai`-format profiles only — a `format = "anthropic"` profile forwards
+the request body unchanged and has nowhere to inject `params`, so a
+non-empty table there is a startup error, not a silent no-op. Also rejected
+at startup: an empty entry, an empty model-id or parameter-name key, and a
+parameter name colliding with a translated request field (`max_tokens`,
+`temperature`, etc. — colliding would double-emit that JSON key via
+`#[serde(flatten)]` with no error on the way out, so startup is the only
+backstop). `GET /control/profiles` lists each tuned model's parameter *key
+names* only, never the configured values, for the same reason `base_url` is
+already omitted there — an operator-authored value is not guaranteed
+non-secret.
+
+Resolution happens exactly where escalation makes it necessary: inside
+`prepare()`, keyed by that call's own `target_model` argument. `prepare()`
+runs twice per client request on the escalation path with a different
+target model each time — resolving `params` once per client request instead
+would carry the wrong model's tuning up a ladder hop. Proven by a dedicated
+integration test that applies the naive hoist as a mutation and confirms
+only that test (not the unit test, not the name-routed integration test)
+catches it.

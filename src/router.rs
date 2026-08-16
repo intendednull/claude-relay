@@ -80,6 +80,7 @@ mod tests {
             format: "openai".to_string(),
             serves: serves.iter().map(|s| s.to_string()).collect(),
             model_map: IndexMap::new(),
+            params: IndexMap::new(),
         }
     }
 

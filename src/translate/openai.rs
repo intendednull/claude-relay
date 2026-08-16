@@ -1,10 +1,29 @@
 //! OpenAI chat-completions wire types: what the translator writes on the
 //! request side, and what it reads back on the response side.
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::anthropic::null_as_default;
+
+/// Every top-level JSON key `ChatRequest` serializes. A `params` entry using
+/// one of these names would double-emit that key via `#[serde(flatten)]` —
+/// serde_json accepts this silently (last-write-wins is not guaranteed), so
+/// `ProfileConfig::validate()` rejects a colliding key at startup instead.
+/// Keep this list in sync with `ChatRequest`'s fields — the pinning test
+/// below fails if it drifts.
+pub const CHAT_REQUEST_FIELD_NAMES: &[&str] = &[
+    "model",
+    "messages",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "stop",
+    "tools",
+    "tool_choice",
+    "stream",
+];
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct ChatRequest {
@@ -23,6 +42,11 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
     pub stream: bool,
+    /// Operator-configured extra request parameters, merged in as top-level
+    /// keys. Last in the struct so the flattened output appends after the
+    /// named fields.
+    #[serde(flatten, skip_serializing_if = "IndexMap::is_empty")]
+    pub params: IndexMap<String, Value>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -285,4 +309,75 @@ pub struct FunctionDelta {
     pub name: Option<String>,
     #[serde(default)]
     pub arguments: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every named field populated, so nothing is dropped by
+    /// `skip_serializing_if` and the serialized key set is the full one.
+    fn fully_populated(params: IndexMap<String, Value>) -> ChatRequest {
+        ChatRequest {
+            model: "m".to_string(),
+            messages: vec![Message::new("user", Content::Text("hi".to_string()))],
+            max_tokens: Some(1),
+            temperature: Some(0.5),
+            top_p: Some(0.9),
+            stop: vec!["x".to_string()],
+            tools: vec![Tool {
+                kind: "function",
+                function: FunctionDef {
+                    name: "t".to_string(),
+                    description: Some("d".to_string()),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            }],
+            tool_choice: Some(ToolChoice::Mode("auto")),
+            stream: true,
+            params,
+        }
+    }
+
+    fn sorted_keys(request: &ChatRequest) -> Vec<String> {
+        let json = serde_json::to_value(request).expect("serialization failed");
+        let mut keys: Vec<String> = json
+            .as_object()
+            .expect("ChatRequest does not serialize to an object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn chat_request_field_names_const_matches_actual_serialized_keys() {
+        let mut expected: Vec<String> = CHAT_REQUEST_FIELD_NAMES
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(sorted_keys(&fully_populated(IndexMap::new())), expected);
+    }
+
+    #[test]
+    fn params_flatten_into_top_level_keys() {
+        let params = IndexMap::from([
+            ("reasoning_effort".to_string(), Value::from("max")),
+            ("seed".to_string(), Value::from(7)),
+        ]);
+        let request = fully_populated(params);
+        let json = serde_json::to_value(&request).expect("serialization failed");
+        assert_eq!(json["reasoning_effort"], Value::from("max"));
+        assert_eq!(json["seed"], Value::from(7));
+
+        let mut expected: Vec<String> = CHAT_REQUEST_FIELD_NAMES
+            .iter()
+            .map(|name| name.to_string())
+            .chain(["reasoning_effort".to_string(), "seed".to_string()])
+            .collect();
+        expected.sort();
+        assert_eq!(sorted_keys(&request), expected);
+    }
 }

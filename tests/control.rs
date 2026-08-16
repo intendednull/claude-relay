@@ -36,6 +36,15 @@ const BODY_B: &str = r#"{"id":"from-profile-b","type":"message","content":[]}"#;
 /// Claims no `serves` prefix, so routing it depends entirely on
 /// `active_profile` — the property this file is testing.
 const OPEN_MODEL: &str = "some-open-model/ignored";
+/// Prefix-matched by the `serves` entry the `params` test sets, so
+/// `ProfileConfig::validate_params`' reachability check would accept the
+/// fixture as a real config.
+const TUNED_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash-0731";
+const TUNING_VALUE: &str = "max";
+/// A `params` value shaped like the thing that must not escape: a URL whose
+/// query carries a signed token. Nothing in the feature stops an operator
+/// writing this, which is why `ProfileView` lists key names only.
+const SECRET_SHAPED_VALUE: &str = "https://hook.example/cb?sig=DO-NOT-LEAK-THIS-PARAM-SECRET";
 
 static KEY: Once = Once::new();
 
@@ -58,6 +67,7 @@ fn profile(base: SocketAddr) -> ProfileConfig {
         format: "anthropic".to_string(),
         serves: Vec::new(),
         model_map: IndexMap::new(),
+        params: IndexMap::new(),
     }
 }
 
@@ -200,6 +210,70 @@ async fn get_control_profiles_lists_configured_profiles_and_marks_the_active_one
 
     let b = by_name(profiles, "profile-b");
     assert_eq!(b["active"], false);
+}
+
+#[tokio::test]
+async fn get_control_profiles_lists_param_key_names_and_never_their_values() {
+    let anthropic = common::closed_port().await;
+    let a = serve(upstream_ok(BODY_A)).await;
+    let b = serve(upstream_ok(BODY_B)).await;
+    let mut config = config(anthropic, a, b);
+    let tuned = config
+        .profiles
+        .get_mut("profile-a")
+        .expect("profile-a is a fixture of this file");
+    // `params` is refused on a `format = "anthropic"` profile
+    // (`ProfileConfig::validate_params`), so the fixture is switched to the
+    // `openai` shape `params` actually applies to. Nothing here sends a
+    // request through it — only `GET /control/profiles` is exercised.
+    tuned.format = "openai".to_string();
+    tuned.serves = vec!["deepseek-ai/".to_string()];
+    tuned.params = IndexMap::from([(
+        TUNED_MODEL.to_string(),
+        IndexMap::from([
+            ("reasoning_effort".to_string(), json!(TUNING_VALUE)),
+            ("callback_url".to_string(), json!(SECRET_SHAPED_VALUE)),
+        ]),
+    )]);
+    let relay = serve_relay_with(config, None).await;
+
+    let raw = client()
+        .get(format!("http://{relay}/control/profiles"))
+        .send()
+        .await
+        .expect("request failed")
+        .text()
+        .await
+        .expect("failed to read body");
+    let body: Value = serde_json::from_str(&raw).expect("response must be JSON");
+    let profiles = body["profiles"]
+        .as_array()
+        .expect("profiles must be an array");
+
+    assert_eq!(
+        by_name(profiles, "profile-a")["params"],
+        json!({ TUNED_MODEL: ["reasoning_effort", "callback_url"] }),
+        "a tuned model's param key names must be listed, in config order"
+    );
+    assert_eq!(
+        by_name(profiles, "profile-b")["params"],
+        json!({}),
+        "an untuned profile must still carry the field, empty"
+    );
+
+    // The other half, and the reason the field is key names only: a `params`
+    // value is operator-authored and unconstrained, so it can be
+    // credential-shaped — `SECRET_SHAPED_VALUE` is the secret-in-a-URL case
+    // `ProfileView`'s doc comment keeps `base_url` out for, written as a
+    // param. Checked against the raw body rather than the parsed value, so a
+    // leak through any field, key, or nesting this test did not anticipate
+    // still fails it.
+    for value in [TUNING_VALUE, SECRET_SHAPED_VALUE] {
+        assert!(
+            !raw.contains(value),
+            "a params value must never appear in the response: {value:?} found in {raw}"
+        );
+    }
 }
 
 #[tokio::test]

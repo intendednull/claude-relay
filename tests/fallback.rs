@@ -277,6 +277,7 @@ fn profile(base: SocketAddr, format: &str, api_key_env: &str) -> ProfileConfig {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
+        params: IndexMap::new(),
     }
 }
 
@@ -584,6 +585,92 @@ async fn a_non_claude_model_routes_by_name_while_anthropic_is_active() {
         relay.fallback.only().json()["model"],
         OPEN_MODEL,
         "a name-routed request keeps the name the client asked for"
+    );
+}
+
+/// `start_openai`, plus a `params` table on the profile. Separate rather than a
+/// parameter on `start`: every other test in this file wants the default.
+async fn start_with_params(params: IndexMap<String, IndexMap<String, Value>>) -> Relay {
+    set_profile_keys();
+    let anthropic = Recorder::default();
+    let fallback = Recorder::default();
+    let anthropic_addr = serve(anthropic_upstream(anthropic.clone(), false)).await;
+    let fallback_addr = serve(openai_upstream(fallback.clone(), false)).await;
+    let mut profile = profile(fallback_addr, "openai", OPENAI_KEY_ENV);
+    profile.params = params;
+    let addr = serve_relay_with(config(anthropic_addr, "notify-only", profile), None).await;
+    Relay {
+        addr,
+        anthropic,
+        fallback,
+    }
+}
+
+/// One name-routed request, checked as far as the route marker; the assertions
+/// this file's params test is about are on what the upstream recorded.
+async fn route_by_name(relay: &Relay, model: &str) {
+    let response = client()
+        .post(format!("http://{}/v1/messages", relay.addr))
+        .body(session_start(model))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-relay-route"], "fallback");
+    response.bytes().await.expect("failed to read body");
+    assert_eq!(relay.anthropic.count(), 0, "nothing reached Anthropic");
+}
+
+/// Spec §Testing 3, the primary test for per-model `params`. The tuned model in
+/// the live config is reachable only by name — `serves`-matched, absent from
+/// `model_map` — so the failover path Task 7 covers is not the one production
+/// exercises for it. `notify-only` while `ACTIVE` keeps the limit machinery out
+/// of it entirely (§7d).
+///
+/// The untuned neighbour is compared byte for byte against a relay whose profile
+/// has no `params` table at all, not merely checked for the absence of the key:
+/// a lookup that leaked a set across models inside the profile would still be
+/// caught if it injected some *other* value.
+#[tokio::test]
+async fn params_reach_only_the_tuned_model_on_the_name_routed_path() {
+    let tuned_model = format!("{OPEN_MODEL}-Flash-0731");
+    let mut set = IndexMap::new();
+    set.insert("reasoning_effort".to_string(), Value::from("max"));
+    let mut params = IndexMap::new();
+    params.insert(tuned_model.clone(), set);
+
+    let relay = start_with_params(params).await;
+
+    route_by_name(&relay, &tuned_model).await;
+    let tuned = relay.fallback.only();
+    assert_eq!(tuned.path, "/v1/chat/completions");
+    assert_eq!(
+        tuned.json()["model"],
+        tuned_model.as_str(),
+        "a name-routed request keeps the name the client asked for"
+    );
+    assert_eq!(
+        tuned.json()["reasoning_effort"],
+        "max",
+        "the configured param reached the upstream body"
+    );
+
+    route_by_name(&relay, OPEN_MODEL).await;
+    let untuned = relay.fallback.only();
+
+    let baseline_relay = start_with_params(IndexMap::new()).await;
+    route_by_name(&baseline_relay, OPEN_MODEL).await;
+    let baseline = baseline_relay.fallback.only();
+
+    assert_eq!(
+        untuned.json()["model"],
+        OPEN_MODEL,
+        "the neighbour is the model the client asked for, not the tuned one"
+    );
+    assert_eq!(
+        untuned.body, baseline.body,
+        "a neighbour's tuning must leave this model's body byte-identical to a params-absent baseline"
     );
 }
 
@@ -2877,6 +2964,19 @@ fn models_seen(recorder: &Recorder) -> Vec<String> {
         .collect()
 }
 
+/// Every body the fallback profile received, in order. `Recorder::only` covers
+/// the one-request case; an escalated request makes two, and which of them
+/// carried what is the whole question.
+fn bodies_seen(recorder: &Recorder) -> Vec<Value> {
+    recorder
+        .0
+        .lock()
+        .expect("recorder poisoned")
+        .iter()
+        .map(Recorded::json)
+        .collect()
+}
+
 async fn ask(relay: &Relay, model: &str) -> (StatusCode, Value) {
     let response = client()
         .post(format!("http://{}/v1/messages", relay.addr))
@@ -2903,6 +3003,63 @@ async fn a_context_limit_climbs_one_rung_and_succeeds_there() {
     assert_eq!(body["content"][0]["text"], "from the openai profile");
     // Both attempts are counted, because the operator paid for both.
     assert_eq!(status(relay.addr).await["fallback_requests_served"], 2);
+}
+
+/// Spec §Testing 4, and the only test that closes the mutation this feature is
+/// most exposed to. A hop is the one case where a single client request reaches
+/// two *different* upstream models, so it is the only place where resolving
+/// `params` once per client request rather than once per attempt is visible:
+/// hoisting the lookup out of `prepare()` into `deliver()` compiles and passes
+/// every other test in this suite, including the name-routed params test, which
+/// takes no ladder and therefore calls `prepare()` exactly once.
+///
+/// Both rungs are tuned, with disjoint keys, so a set that leaks is caught
+/// whichever way it travels — not only the bottom rung's tuning following the
+/// request upward.
+#[tokio::test]
+async fn params_are_resolved_per_escalation_hop() {
+    let relay = start_laddered(&LIVE_LADDER, &[SMALL], TOGETHER_CONTEXT_LIMIT, |config| {
+        config
+            .profiles
+            .get_mut("fallback")
+            .expect("the fallback profile")
+            .params = IndexMap::from([
+            (
+                SMALL.to_string(),
+                IndexMap::from([("reasoning_effort".to_string(), Value::from("low"))]),
+            ),
+            (
+                MEDIUM.to_string(),
+                IndexMap::from([("seed".to_string(), Value::from(7))]),
+            ),
+        ]);
+    })
+    .await;
+
+    let (code, body) = ask(&relay, HAIKU).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    // The walk first: without two hops there is nothing for the rest to be about.
+    assert_eq!(models_seen(&relay.fallback), [SMALL, MEDIUM]);
+
+    let seen = bodies_seen(&relay.fallback);
+    assert_eq!(
+        seen[0]["reasoning_effort"], "low",
+        "the rung the request landed on carries its own tuning"
+    );
+    assert!(
+        seen[0].get("seed").is_none(),
+        "the rung above's tuning must not reach the rung below: {}",
+        seen[0]
+    );
+    assert_eq!(
+        seen[1]["seed"], 7,
+        "the hop resolved params for the model it actually asked for, not the one it started on"
+    );
+    assert!(
+        seen[1].get("reasoning_effort").is_none(),
+        "the rung below's tuning must not follow the request up the ladder: {}",
+        seen[1]
+    );
 }
 
 /// **The knowing cost of fix round 1's blocker 1, as behaviour.** This body is a

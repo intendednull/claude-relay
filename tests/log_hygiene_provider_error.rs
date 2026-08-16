@@ -107,6 +107,7 @@ async fn a_provider_error_body_is_logged_capped_escaped_and_credential_free() {
             format: "openai".to_string(),
             serves: vec!["deepseek-ai/".to_string()],
             model_map: IndexMap::new(),
+            params: IndexMap::new(),
         },
     );
     config.profiles = profiles;

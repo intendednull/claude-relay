@@ -1,7 +1,12 @@
 # Per-model parameter passthrough — design brief
 
 **Date:** 2026-08-13
-**Status:** draft
+**Status:** SUPERSEDED by `2026-08-15-per-model-params-design.md` — this
+brief's per-profile table cannot isolate one model's tuning from others
+sharing a profile, which is a hard requirement. It also named the wrong file
+(`src/state.rs`; config parsing is in `src/config.rs`) and missed that
+`prepare()` runs twice per request on the escalation path. Kept for history;
+do not implement from this document.
 **Related:** follow-ups.md item 3 (DeepSeek-V4-Flash rescue)
 
 ## Problem
