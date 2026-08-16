@@ -252,6 +252,15 @@ struct ProfileView<'a> {
     /// `config::reject_userinfo`), a second, independent way this response
     /// must not leak one.
     api_key_env: &'a str,
+    /// Model id → that model's configured `params` **key names**, never their
+    /// values, for exactly the reason `base_url` is absent above: a `params`
+    /// value is operator-authored and nominally not a secret, but nothing in
+    /// the feature constrains what goes there — a callback URL with a signed
+    /// query param, a gated-model token — so the values stay out of this
+    /// response entirely rather than being redacted case by case. The key
+    /// names are what an operator needs to answer "is this model tuned, and
+    /// with what?" from `/control` instead of by reading the config file.
+    params: IndexMap<String, Vec<String>>,
     active: bool,
 }
 
@@ -269,6 +278,11 @@ async fn list_profiles(State(state): State<AppState>) -> Json<serde_json::Value>
             serves: &profile.serves,
             model_map: &profile.model_map,
             api_key_env: &profile.api_key_env,
+            params: profile
+                .params
+                .iter()
+                .map(|(model, table)| (model.clone(), table.keys().cloned().collect()))
+                .collect(),
             active: active.as_deref() == Some(name.as_str()),
         })
         .collect();
