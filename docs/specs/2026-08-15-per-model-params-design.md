@@ -26,11 +26,18 @@ stop |len=729|reasoning_tok=358
 length|len=0  |reasoning_tok=500   <- hit budget on reasoning, zero content
 ```
 
-2 of 5 runs of an ordinary, non-trivial prompt returned **zero** content with
-`finish_reason: "length"` — the reasoning consumed the entire budget before
-any answer was emitted. This is the failure the ticket described, reproduced
-directly against the provider with no relay code involved, so the fix belongs
-in what parameters the relay can send, not in relay routing logic.
+2 of these 5 runs returned **zero** content with `finish_reason: "length"` —
+the reasoning consumed the entire budget before any answer was emitted. This
+is the failure the ticket described, reproduced directly against the
+provider with no relay code involved, so the fix belongs in what parameters
+the relay can send, not in relay routing logic.
+
+(Scoring note, since "N of 5" appears with opposite polarity in this section
+and the table below: a run counts as a **success** only when
+`finish_reason: "stop"` *and* non-empty content — i.e. it actually answered.
+`length|len=160` above is scored a failure even though it emitted some
+content, because it was truncated mid-answer, not because it emitted
+nothing.)
 
 ## Why the prior brief doesn't work
 
@@ -153,9 +160,12 @@ is named `params`.
      preventing a malformed body from reaching the provider. To avoid this
      list drifting from `ChatRequest`'s actual fields, define it as a `const`
      in `src/translate/openai.rs` next to the struct, and add a test that
-     serializes a fully-populated `ChatRequest` and asserts its top-level
-     JSON keys equal that const — so a future field addition to `ChatRequest`
-     fails a test instead of silently reopening the collision hole.
+     serializes a `ChatRequest` with every *named* field populated but
+     `params` left empty, and asserts its top-level JSON keys equal that
+     const exactly (a non-empty `params` would add its own keys at the top
+     level via flatten and break this exact-equality assertion by
+     construction) — so a future field addition to `ChatRequest` fails a
+     test instead of silently reopening the collision hole.
    - a `params` entry on a `format = "anthropic"` profile (see point 5 below)
    - a `params` key that cannot be reached by this profile's routing at all —
      reject a key that is neither a `model_map` value nor prefix-matched by
