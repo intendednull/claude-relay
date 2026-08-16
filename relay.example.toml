@@ -70,12 +70,22 @@ format = "unix-seconds"
 # Nothing the client sent reaches a profile — not its auth headers, not its
 # `anthropic-*` headers, not `accept-encoding` (spec §7b).
 #
+# `params` injects extra request-body fields for one *resolved upstream*
+# model — never a prefix, never the client's `claude-*` name — without
+# affecting any other model this profile serves. `openai`-format profiles
+# only: the `anthropic` path forwards the request body unchanged and has
+# nowhere to inject them, so `format = "anthropic"` with a non-empty `params`
+# fails at startup. Keys colliding with a translated request field
+# (`max_tokens`, `temperature`, etc.) also fail at startup, rather than
+# silently double-emitting that JSON key.
+#
 # [profiles.deepseek]
 # base_url = "https://<provider-anthropic-compat-endpoint>"
 # api_key_env = "RELAY_TOGETHER_KEY"      # read from env, never stored here
-# format = "anthropic"                    # or "openai" (enables the translator)
+# format = "openai"                       # "params" below requires this (or "anthropic" without params)
 # serves = ["deepseek-ai/", "Qwen/"]      # §7d: model-name prefixes this profile claims
 # model_map = { "claude-opus" = "deepseek-ai/DeepSeek-V4", "*" = "deepseek-ai/DeepSeek-V4-Flash" }
+# params."deepseek-ai/DeepSeek-V4-Flash-0731" = { reasoning_effort = "max" }
 #
 # [profiles.kimi]
 # base_url = "https://<other-endpoint>"

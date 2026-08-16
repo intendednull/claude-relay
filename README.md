@@ -431,10 +431,11 @@ why; a plain `curl -d` without `-H` defaults to a different content type and
 gets rejected.
 
 `GET /control/profiles` lists every configured profile's `name`, `format`,
-`serves`, `model_map` and `api_key_env` (the env var *name*, never its
-value), marking which one is active. `POST /control/profile` returns 404 on
-a name nothing configured claims, and leaves the active profile untouched
-when it does.
+`serves`, `model_map`, `api_key_env` (the env var *name*, never its value)
+and `params` (per-model tuned keys, e.g. `reasoning_effort` — key names
+only, never the configured values), marking which one is active.
+`POST /control/profile` returns 404 on a name nothing configured claims, and
+leaves the active profile untouched when it does.
 
 - **Ephemeral by design.** A switch lives only in the running process; a
   restart goes back to `policy.active_profile`. Edit the config file if you
