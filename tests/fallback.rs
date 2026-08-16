@@ -2964,6 +2964,19 @@ fn models_seen(recorder: &Recorder) -> Vec<String> {
         .collect()
 }
 
+/// Every body the fallback profile received, in order. `Recorder::only` covers
+/// the one-request case; an escalated request makes two, and which of them
+/// carried what is the whole question.
+fn bodies_seen(recorder: &Recorder) -> Vec<Value> {
+    recorder
+        .0
+        .lock()
+        .expect("recorder poisoned")
+        .iter()
+        .map(Recorded::json)
+        .collect()
+}
+
 async fn ask(relay: &Relay, model: &str) -> (StatusCode, Value) {
     let response = client()
         .post(format!("http://{}/v1/messages", relay.addr))
@@ -2990,6 +3003,63 @@ async fn a_context_limit_climbs_one_rung_and_succeeds_there() {
     assert_eq!(body["content"][0]["text"], "from the openai profile");
     // Both attempts are counted, because the operator paid for both.
     assert_eq!(status(relay.addr).await["fallback_requests_served"], 2);
+}
+
+/// Spec §Testing 4, and the only test that closes the mutation this feature is
+/// most exposed to. A hop is the one case where a single client request reaches
+/// two *different* upstream models, so it is the only place where resolving
+/// `params` once per client request rather than once per attempt is visible:
+/// hoisting the lookup out of `prepare()` into `deliver()` compiles and passes
+/// every other test in this suite, including the name-routed params test, which
+/// takes no ladder and therefore calls `prepare()` exactly once.
+///
+/// Both rungs are tuned, with disjoint keys, so a set that leaks is caught
+/// whichever way it travels — not only the bottom rung's tuning following the
+/// request upward.
+#[tokio::test]
+async fn params_are_resolved_per_escalation_hop() {
+    let relay = start_laddered(&LIVE_LADDER, &[SMALL], TOGETHER_CONTEXT_LIMIT, |config| {
+        config
+            .profiles
+            .get_mut("fallback")
+            .expect("the fallback profile")
+            .params = IndexMap::from([
+            (
+                SMALL.to_string(),
+                IndexMap::from([("reasoning_effort".to_string(), Value::from("low"))]),
+            ),
+            (
+                MEDIUM.to_string(),
+                IndexMap::from([("seed".to_string(), Value::from(7))]),
+            ),
+        ]);
+    })
+    .await;
+
+    let (code, body) = ask(&relay, HAIKU).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    // The walk first: without two hops there is nothing for the rest to be about.
+    assert_eq!(models_seen(&relay.fallback), [SMALL, MEDIUM]);
+
+    let seen = bodies_seen(&relay.fallback);
+    assert_eq!(
+        seen[0]["reasoning_effort"], "low",
+        "the rung the request landed on carries its own tuning"
+    );
+    assert!(
+        seen[0].get("seed").is_none(),
+        "the rung above's tuning must not reach the rung below: {}",
+        seen[0]
+    );
+    assert_eq!(
+        seen[1]["seed"], 7,
+        "the hop resolved params for the model it actually asked for, not the one it started on"
+    );
+    assert!(
+        seen[1].get("reasoning_effort").is_none(),
+        "the rung below's tuning must not follow the request up the ladder: {}",
+        seen[1]
+    );
 }
 
 /// **The knowing cost of fix round 1's blocker 1, as behaviour.** This body is a
